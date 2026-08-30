@@ -1,0 +1,100 @@
+# ============================================================================
+# mantou 提交排除清单
+#
+# release.sh 是用 `git add -A` 提交的，所以这份文件直接决定上传到 GitHub 的内容。
+# 与 .dockerignore 成对维护：同一类文件在两处都要挡住。
+#
+# 只有 README 会带上去，其余 md（含 docs/ 下的报告）一律留在本地。
+# ============================================================================
+
+# ---- 凭据（一律不得提交） ----
+# 自更新包的 Ed25519 签名私钥（由 cmd/updsign 生成，与 package.bat 配套）。
+# 泄露即等价于可为任意二进制伪造一份合法的更新包签名。
+update-signing.key
+# 配置主密钥：解开 data/config.json 里 DNS token、ACME 账户私钥、会话签名密钥的唯一钥匙。
+# 已被下面的 /data/ 覆盖，此处再列一次，防它被移出 data 目录后失去保护。
+data/master.key
+master.key
+# 本地环境配置，可能含凭据
+.env
+.env.*
+# 兜底：任何私钥/证书文件都不上传。源码里唯一命中的是 update-signing.key，
+# 真实证书都在 /data/ 内，因此这几条不会误伤任何需要提交的文件。
+*.key
+*.pem
+*.crt
+*.p12
+*.pfx
+
+# ---- 运行期数据 ----
+# 配置、日志、上传、证书
+/data/
+# 本地灌测试数据用的脚本与数据
+.devrun/
+*.log
+
+# ---- 构建产物 ----
+/bin/
+/dist/
+# 前导 / 限定根目录，避免误伤 cmd/mantou 源码目录
+/mantou
+*.exe
+*.test
+*.out
+go.sum.bak
+# 版本注入文件：构建脚本在编译前写入、编译后删除，不该进仓库
+internal/version/gen.go
+# 本地打出来的自更新包
+mantou-*.tar.gz
+mantou-*.zip
+# 发布脚本用的提交信息草稿：release.sh 提交前生成、提交后删除。跑到一半中断时会留在
+# 这里供重跑复用，任何情况下都不该进仓库——它若被 git 看见，工作区就永远"有改动"，
+# release.sh 里那套"干净则改写、脏则新建提交"的判断会整个失效。
+commit-message.txt
+
+# ---- 文档：除 README 外一律不上传 ----
+# 不带斜杠的模式在任意层级生效，所以这一条已经把 docs/ 下的 md 全挡住了。
+*.md
+!README.md
+# README.md 顶部链到这份英文版，一并保留，否则那是个死链。
+!README.en.md
+# 显式重复一次 docs/ 下的 md，便于核对（规则上被上面的 *.md 覆盖）。
+docs/*.md
+# docs/ 整个不上传：里面只有留在本地的报告文档，和两张没有任何文件引用的截图。
+# 注意这条生效后 docs/ 下就再也放行不了单个文件了（父目录一旦被排除，
+# 放行规则就不起作用）。将来要往仓库里放图，换个目录，别放这儿。
+/docs/
+
+# ---- 测试文件 ----
+# internal/stress 是纯测试包（8 个文件全是 _test.go）：跑压测与端到端，
+# 会起子进程、编译二进制、耗时以分钟计，不适合放进公开 CI。
+# 其余单元测试照常提交——ci.yml 与 release.yml 里的 go test ./... 靠它们才有意义。
+internal/stress/
+
+# ---- 前端 ----
+web/node_modules/
+web/.vite/
+web/*.local
+# dist 是构建产物，只保留一个占位文件：后端用 //go:embed all:dist 内嵌它，
+# 目录为空会导致编译失败。占位用 .gitkeep 而不是 index.html——后者每次 vite build
+# 都会被改写，既留一份常年的无意义 diff，内容又指向没有提交的 assets 哈希文件。
+web/dist/*
+!web/dist/.gitkeep
+# vite 切目录时的残留与临时配置
+web/dist_old_swap*/
+web/*.timestamp-*.mjs
+# vue-tsc 的增量编译缓存，内含本机绝对路径
+*.tsbuildinfo
+
+# ---- 本地工作文件 ----
+# 审计前的源码备份
+.audit-backup/
+# 编码助手的本地配置（launch.json / settings.local.json）
+.claude/
+.workbuddy-ai/
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

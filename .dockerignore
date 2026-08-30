@@ -1,0 +1,85 @@
+# ============================================================================
+# mantou 构建上下文排除清单
+#
+# 本地 `docker build` 与 release.yml 里的远程 buildx 构建都读这一份文件。
+# 目标是让上下文里只剩 Dockerfile 真正 COPY 的东西：
+#   go.mod / go.sum、cmd/、internal/、web/（含 scripts/，build:only 要用它）
+#
+# 语法与 .gitignore 不同，这点最容易写错：
+#   不带 ** 的 *.md 只匹配根层，要覆盖所有层级必须写 **/*.md。
+# ============================================================================
+
+# ---- 版本控制与 CI 配置 ----
+.git
+.gitignore
+.gitattributes
+.github
+.dockerignore
+
+# ---- 文档：除 README 外一律不进镜像 ----
+**/*.md
+!README.md
+!README.en.md
+docs
+
+# ---- 测试文件：镜像构建只跑 go build，不跑 go test ----
+**/*_test.go
+# 纯测试包，去掉测试文件后本就是空目录
+internal/stress
+
+# ---- 凭据（绝不能进镜像层，镜像层是可被任何人解包读取的） ----
+update-signing.key
+master.key
+.env
+.env.*
+**/*.key
+**/*.pem
+**/*.crt
+**/*.p12
+**/*.pfx
+
+# ---- 运行期数据 ----
+data
+.devrun
+**/*.log
+
+# ---- 构建产物（镜像内会重新构建） ----
+bin
+dist
+mantou
+**/*.exe
+**/*.test
+**/*.out
+mantou-*.tar.gz
+mantou-*.zip
+# 版本注入文件由 Dockerfile 自己写（见 ARG VERSION 那一段），本地的残留不要带进去
+internal/version/gen.go
+go.sum.bak
+
+# ---- 前端依赖与产物（阶段 1 重新 npm ci + build） ----
+web/node_modules
+web/dist
+web/.vite
+web/*.local
+**/*.tsbuildinfo
+# vite 切目录时的残留与它自己生成的临时配置，都只在本机出现
+web/dist_old_swap*
+web/*.timestamp-*.mjs
+
+# ---- 本地脚本与工作文件（构建镜像用不到） ----
+Makefile
+package.bat
+release.bat
+release.sh
+docker-compose.yml
+# release.sh 的提交信息草稿，中断时会留在盘上
+commit-message.txt
+.audit-backup
+.claude
+.workbuddy-ai
+
+# ---- 编辑器 / 系统 ----
+.idea
+.vscode
+.DS_Store
+Thumbs.db

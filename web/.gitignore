@@ -1,0 +1,9 @@
+node_modules
+*.local
+.DS_Store
+.vite
+
+# dist 的规则统一写在仓库根的 .gitignore 里（那里放行了一个 .gitkeep 占位文件，
+# 供后端 //go:embed all:dist 使用）。这里不能再写一行 dist：
+# 子目录的 .gitignore 优先级更高，写了会把整个目录挡掉，
+# 而父目录一旦被排除，根目录里的放行规则就再也生效不了。

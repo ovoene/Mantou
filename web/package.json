@@ -1,0 +1,30 @@
+{
+  "name": "mantou-web",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "mantou 控制面板前端（Vue 3 + Vite + TypeScript）",
+  "scripts": {
+    "dev": "vite",
+    "build": "node scripts/lint-i18n.mjs && vue-tsc --noEmit && vite build && node scripts/keep-dist.mjs",
+    "build:only": "node scripts/lint-i18n.mjs && vite build && node scripts/keep-dist.mjs",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@element-plus/icons-vue": "^2.3.1",
+    "axios": "^1.7.2",
+    "echarts": "^5.5.0",
+    "element-plus": "^2.7.6",
+    "pinia": "^2.1.7",
+    "vue": "^3.4.31",
+    "vue-i18n": "^9.13.1",
+    "vue-router": "^4.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "@vitejs/plugin-vue": "^5.0.5",
+    "typescript": "^5.4.5",
+    "vite": "^5.3.3",
+    "vue-tsc": "^2.0.26"
+  }
+}

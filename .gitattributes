@@ -1,0 +1,25 @@
+# ============================================================================
+# 行尾由仓库说了算，不受各人机器上的 core.autocrlf 影响
+#
+# 缺这份文件时，Windows 上 core.autocrlf=true 会在签出时把所有文本文件转成 CRLF，
+# 实测出来的后果有两个：
+#   1. gofmt 只认 LF，新克隆里 `gofmt -l ./cmd ./internal` 会把 215 个文件全部列出来，
+#      也就是 CI 的 gofmt 门禁指着一堆谁都没编辑过的文件报错。
+#   2. release.sh 变成 CRLF，Git Bash 跑它会在第一行就报 $'\r': command not found，
+#      一键发布脚本在新克隆里直接不可用。
+# GitHub Actions 跑在 ubuntu 上、不设 autocrlf，所以这两个问题只在 Windows 克隆里出现。
+# ============================================================================
+
+# 文本文件一律以 LF 存、以 LF 签出（.go / .sh / .yml / .vue / .ts / .json 等）
+* text=auto eol=lf
+
+# 例外：Windows 批处理保持 CRLF，cmd.exe 对只有 LF 的 .bat 有已知的解析问题
+*.bat text eol=crlf
+
+# 二进制文件不做行尾转换。git 本能自动识别，这里显式钉住以防识别失误。
+*.png binary
+*.ico binary
+*.gz binary
+*.zip binary
+*.sig binary
+*.exe binary

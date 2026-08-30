@@ -1,0 +1,144 @@
+# ============================================================================
+# mantou 持续集成门禁（GitHub Actions）
+#
+# 这条流水线只做一件事：**在代码合进主线之前，把能自动发现的问题挡住**。
+# 它刻意与 release.yml 分开——发布流水线只在打标签时跑，而回归通常是在日常推送里引入的。
+#
+# 触发：任意分支的 push、任意针对 main/master 的 pull_request、以及手动触发。
+#
+# 四道门禁（任一失败即阻断）：
+#   1. gofmt   —— 格式不一致会让后续 diff 充满噪声，也说明提交前没跑过 gofmt。
+#                  用 `test -z "$(gofmt -l ...)"` 而不是 `gofmt -l`：后者即便有文件不合规
+#                  也返回 0，在 CI 里等于不设防。
+#   2. go vet  —— 标准库自带的静态检查（Printf 参数、结构体 tag、锁复制等）。
+#   3. go build / go test —— 全量编译 + 全量单测。
+#                  注：本项目 CGO_ENABLED=0，`-race` 依赖 cgo，因此无法在此启用竞态检测；
+#                  并发相关的正确性由各包自己的确定性测试覆盖（见 module / cert / webservice）。
+#   4. vue-tsc —— 前端类型检查。release.yml 走 `build:only`（跳过类型检查）以缩短发布耗时，
+#                  类型错误必须在这里被拦下，否则会一路带到发布产物里。
+#
+# 依赖漏洞扫描（govulncheck）单列一个非阻断作业：它的结论会随上游漏洞库更新而变化，
+# 让它阻断合并等于把「今天能过的代码明天突然过不了」变成常态。结果需人工看一眼。
+# ============================================================================
+
+name: ci
+
+on:
+  push:
+    # 排除标签推送：打标签会触发 release.yml，而它自己第一个作业（checks）就跑同一套
+    # Go 门禁。不排除的话每次发布都要把检查跑两遍。
+    tags-ignore: ['**']
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# 同一分支上新的推送会取消上一次仍在跑的检查，避免排队浪费额度。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: Go 门禁（gofmt / vet / build / test）
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Go
+        uses: actions/setup-go@v5
+        with:
+          # 与 release.yml、Dockerfile 保持一致。
+          go-version: '1.26'
+          cache-dependency-path: go.sum
+
+      - name: 校验依赖清单
+        run: |
+          # 与发布流水线同样刻意不跑 go mod tidy：构建期改写清单会让 go.sum 的校验失去意义。
+          go mod download -x
+          go mod verify
+
+      - name: 确保 embed 占位文件存在
+        run: |
+          # 后端用 `//go:embed all:dist` 内嵌 web/dist，目录为空会导致编译失败。
+          # 仓库已提交 web/dist/.gitkeep 作为占位（.gitignore 里有 `!web/dist/.gitkeep`），
+          # 正常情况下这一步什么也不做；只在占位文件被误删时补一个，避免报出难以定位的 embed 错误。
+          # 本作业只检查 Go 侧，不需要真实前端产物（那是 web 作业的事）。
+          mkdir -p web/dist
+          [ -e web/dist/.gitkeep ] || touch web/dist/.gitkeep
+
+      - name: gofmt 检查
+        run: |
+          # 输出不合规文件清单再失败，便于直接看到要格式化哪些文件。
+          #
+          # 排除 internal/version/gen.go：它是构建脚本在编译前临时写入、编译后立刻删除的
+          # 版本注入文件（Makefile 的 write-version / package.bat / release.yml 各写一份），
+          # 已被 .gitignore 忽略，因此正常 checkout 里根本不存在，这里只是兜底。
+          # 之所以要兜底：构建被中途打断时它会残留在盘上，而 package.bat 用 `echo x > file`
+          # 生成，行尾必然带一个空格、缩进也是空格而非制表符——gofmt 必报。那种情况下门禁
+          # 会指着一个开发者从未编辑过、也不该提交的文件报错，极易让人以为是自己改坏了。
+          unformatted="$(gofmt -l ./cmd ./internal | grep -vE 'internal[\\/]version[\\/]gen\.go$' || true)"
+          if [ -n "$unformatted" ]; then
+            echo "以下文件未经 gofmt 格式化：" >&2
+            echo "$unformatted" >&2
+            echo "请在本地执行：gofmt -w ./cmd ./internal" >&2
+            exit 1
+          fi
+          echo "gofmt 通过"
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: CGO_ENABLED=0 go build -trimpath -mod=readonly ./...
+
+      - name: go test
+        run: go test ./... -count=1
+
+  web:
+    name: 前端门禁（类型检查 + 构建）
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 安装依赖
+        run: npm ci --prefix web
+
+      - name: 类型检查并构建
+        # npm run build == vue-tsc --noEmit && vite build，两件事一起做。
+        run: npm run build --prefix web
+
+  vuln:
+    name: 依赖漏洞扫描（不阻断）
+    runs-on: ubuntu-latest
+    # 结论随上游漏洞库变化，仅作提示；真正需要处置时再手动升级依赖。
+    continue-on-error: true
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache-dependency-path: go.sum
+
+      - name: 确保 embed 占位文件存在
+        run: |
+          mkdir -p web/dist
+          [ -e web/dist/.gitkeep ] || touch web/dist/.gitkeep
+
+      - name: govulncheck
+        run: |
+          go run golang.org/x/vuln/cmd/govulncheck@latest ./... || true

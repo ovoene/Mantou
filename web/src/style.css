@@ -1,0 +1,239 @@
+/* ============================================================
+   mantou 主题系统
+   全部外观通过 CSS 变量驱动；外观 store 在 :root 上动态写入这些变量，
+   实现设置页的「实时预览」与登录后从服务端同步的持久化外观。
+   变量命名与后端 config.Appearance 字段一一对应。
+   ============================================================ */
+
+:root {
+  /* 主题色（可自定义）。这几个值是 JS 接手之前的那一帧用的，取默认外观里的同名颜色
+   * （见 stores/appearanceTypes.ts 与后端 config 的 defaultAppearance）；
+   * 与那边不一致会让首屏先闪一下另一套颜色。 */
+  --mt-primary: #4f7cff;
+  --mt-accent: #22c1a6;
+  --mt-success: #22c55e;
+
+  /* 访问日志着色：IP 用淡蓝（区别于主色蓝），规则名用琥珀（区别于蓝）。 */
+  --ws-ip-color: #2b8fc4;
+  --ws-rule-color: #c2720a;
+  /* 被 IP 规则拒绝：红色高亮（区别于正常连接/错误）。 */
+  --ws-denied-color: #d93025;
+  --mt-warning: #f59e0b;
+  --mt-danger: #ef4444;
+
+  /* 背景层：图片/颜色/渐变 + 模糊 + 遮罩 */
+  --mt-bg-color: #eef1f8;
+  --mt-bg-image: none;
+  --mt-bg-fit: cover;
+  --mt-bg-position: center;
+  /* 背景模糊：默认不模糊，于是 filter 是 none、边缘外扩是 0（见 .mt-backdrop 的说明）。
+   * 用户在「设置 → 外观」调大模糊时由 stores/appearance.ts 写成 blur(Npx) + 外扩 3N px。 */
+  --mt-bg-filter: none;
+  --mt-bg-bleed: 0px;
+  --mt-overlay: rgba(255, 255, 255, 0);
+
+  /* 贴合式卡片 */
+  --mt-card-bg: rgba(255, 255, 255, 0.72);
+  --mt-card-radius: 16px;
+  --mt-card-border: rgba(20, 27, 45, 0.08);
+  --mt-card-shadow: 0 8px 30px rgba(20, 27, 45, 0.12);
+
+  /* 文本 */
+  --mt-text: #1f2733;
+  --mt-text-soft: #5a6472;
+  --mt-font-family: system-ui, -apple-system, 'Segoe UI', 'PingFang SC',
+    'Microsoft YaHei', Roboto, Helvetica, Arial, sans-serif;
+  --mt-font-scale: 1;
+  --mt-font-weight: 400;
+
+  /* 布局 */
+  --mt-sidebar-w: 232px;
+  --mt-radius-sm: 10px;
+  /* 弹窗与视口上下各留的空隙。弹窗高度上限由它算出（见文末 .el-dialog 规则）。 */
+  --mt-dialog-gap: 5vh;
+
+  /* only light 而不是 light：多写这个 only 是为了关掉浏览器的「自动深色」。
+   *
+   * 手机开着系统深色时，不少安卓浏览器会自己把网页染成深色（Chromium 内核里这套机制
+   * 对只声明 light 的页面照样生效）。染的是浏览器算出来的颜色，而本站同时还在按自己的
+   * 浅色主题上色，两层叠起来就是「网站是浅色的、手机上却是深色底」。
+   * only 的意思是「就这一种，别再自动换」，浏览器于是完全放手。
+   *
+   * 深浅切换由下面的 data-theme 负责（外观 store 写在 :root 上），不受这里影响。
+   * iOS 与桌面端本来就不做这种自动染色，所以此前只在部分安卓浏览器上看得到。 */
+  color-scheme: only light;
+}
+
+/* 深色模式：仅调整中性色，主题色沿用用户设定。 */
+:root[data-theme='dark'] {
+  --ws-ip-color: #6cc4f0;
+  --ws-rule-color: #f0b34d;
+  --ws-denied-color: #f87171;
+  --mt-bg-color: #10141c;
+  --mt-card-bg: rgba(28, 34, 46, 0.66);
+  --mt-card-border: rgba(255, 255, 255, 0.08);
+  --mt-card-shadow: 0 10px 34px rgba(0, 0, 0, 0.42);
+  --mt-text: #e6ebf2;
+  --mt-text-soft: #9aa6b6;
+  --mt-overlay: rgba(0, 0, 0, 0);
+  /* 同样加 only，理由见上：本站已经是深色了，不需要浏览器再"帮忙"调一次。 */
+  color-scheme: only dark;
+}
+
+/* 将 Element Plus 主色接入我们的变量，保证组件跟随自定义主题。 */
+:root {
+  --el-color-primary: var(--mt-primary);
+  --el-border-radius-base: var(--mt-radius-sm);
+  --el-font-size-base: calc(14px * var(--mt-font-scale));
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+/* 预留滚动条槽位。本站用的是占布局宽度的经典滚动条（见文末 ::-webkit-scrollbar，宽 10px），
+ * 不预留的话：从「设置」这类超出视口的长页切到短页时滚动条消失，整个布局横向挪 10px；
+ * 首次进入有数据的页面时表格从「暂无数据」长到满屏、滚动条又回来，再挪一次。
+ * 这两下横向位移就是切页时看到的「抖一下」，与切页动画无关，纯粹是布局问题。
+ * stable 让这条槽位始终存在，页面长短变化不再引起横向位移。 */
+html {
+  scrollbar-gutter: stable;
+  /* 给根元素一个底色，让浏览器的画布用它，而不是浏览器自己那张（系统深色下是黑的）。
+   * 背景层 .mt-backdrop 是 fixed 定位，铺不到手机上下拉回弹拽出来的那一段——
+   * 那一段露的就是画布。颜色取的是同一个变量，深浅切换时跟着一起变。 */
+  background-color: var(--mt-bg-color);
+}
+
+body {
+  font-family: var(--mt-font-family);
+  font-weight: var(--mt-font-weight);
+  font-size: calc(14px * var(--mt-font-scale));
+  color: var(--mt-text);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 背景层：固定铺满，承载纯色/渐变/图片 + 模糊，再叠一层遮罩以保证可读性。
+ *
+ * filter 走变量、默认给 none（由 stores/appearance.ts 按背景模糊值写入），而不是常年
+ * 写 blur(0px)：只要 filter 不是 none，浏览器就得为这一整屏单独开一张合成层，此后每次
+ * 重绘都要重新光栅化它——而默认设置下它模糊的是 0 像素，白付一份代价。切页与菜单
+ * hover 时那一点顿就有这一份。
+ *
+ * 抵消模糊边缘留白的办法是**按模糊半径向四周外扩**（--mt-bg-bleed），不是固定放大一档。
+ * 固定 scale(1.04) 有个肉眼可见的毛病：模糊从 0 调到 1，图片会"啪"地跳大 4%，
+ * 而这一步本该只是稍微糊一点。外扩量随半径线性增长，0 就是 0，1px 只外扩 3px
+ * （一张 1920 宽的图 ≈ 0.3%，看不出来）。3 倍是因为 CSS blur(R) 的 R 就是高斯标准差，
+ * 可见扩散约 3σ。 */
+.mt-backdrop {
+  position: fixed;
+  /* 负 inset：把这一层撑到视口之外，让模糊糊掉的边缘落在视口外面。
+   * 固定定位的盒子不参与文档滚动溢出，所以不会因此多出滚动条。 */
+  inset: calc(-1 * var(--mt-bg-bleed, 0px));
+  z-index: -2;
+  background-color: var(--mt-bg-color);
+  background-image: var(--mt-bg-image);
+  background-size: var(--mt-bg-fit);
+  background-position: var(--mt-bg-position);
+  background-repeat: no-repeat;
+  filter: var(--mt-bg-filter, none);
+  transition: background-color 0.3s ease;
+}
+.mt-backdrop::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: var(--mt-overlay);
+}
+
+/* 贴合式卡片：实底 + 细边框，不再悬浮/毛玻璃，整页与主题色统一。 */
+.mt-glass {
+  background: var(--mt-card-bg);
+  border: 1px solid var(--mt-card-border);
+  border-radius: var(--mt-card-radius);
+  box-shadow: var(--mt-card-shadow);
+}
+
+.mt-title {
+  font-size: calc(20px * var(--mt-font-scale));
+  font-weight: 650;
+  letter-spacing: 0.2px;
+  margin: 0;
+}
+.mt-subtle {
+  color: var(--mt-text-soft);
+}
+
+/* 「最近收到 / 最近唤醒」这类两行格：第一行是时间，第二行是次数与结果。
+ *
+ * 两行都不换行。时间被折成两截时，"2026/8/27" 和 "14:30:25" 分踞两行，看着像两条记录；
+ * 第二行的结果文本长度由对端决定，放开换行能把一格顶成四五行高，把整张表撑得很散。
+ * 装不下时截断，完整内容由各处自己挂 title——不静默丢字。 */
+.mt-cell-2row > div {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Element Plus 卡片/表格在玻璃背景上应保持通透。 */
+.mt-glass .el-card,
+.mt-glass .el-table,
+.mt-glass .el-table tr,
+.mt-glass .el-table th.el-table__cell {
+  background: transparent;
+}
+
+/* 让 Element 弹层文字继承主题文本色。 */
+.el-overlay-dialog .el-dialog {
+  border-radius: var(--mt-card-radius);
+}
+
+/* 弹窗必须自己装得下自己：改成「头尾钉住、正文滚动」。
+ *
+ * Element 默认的弹窗没有高度上限，正文一长就整体顶出视口，而 .el-overlay-dialog
+ * 那层的滚动会把标题栏一起卷走。更糟的是弹窗里若有 overflow:hidden 的中间层
+ *（如 .el-tabs__content），超出的部分不会计入任何祖先的 scrollHeight——
+ * 于是滚动条根本不出现，那段内容既看不见也滚不到，看上去就是「页面无法滑动」。
+ * 这里把 .el-dialog 变成竖向 flex，正文自己滚，头尾各自固定。
+ * 全屏弹窗自带满屏布局，排除在外。 */
+.el-overlay-dialog .el-dialog:not(.is-fullscreen) {
+  display: flex;
+  flex-direction: column;
+  margin-top: var(--mt-dialog-gap);
+  margin-bottom: var(--mt-dialog-gap);
+  max-height: calc(100vh - var(--mt-dialog-gap) * 2);
+}
+.el-overlay-dialog .el-dialog:not(.is-fullscreen) > .el-dialog__header,
+.el-overlay-dialog .el-dialog:not(.is-fullscreen) > .el-dialog__footer {
+  flex: 0 0 auto;
+}
+.el-overlay-dialog .el-dialog:not(.is-fullscreen) > .el-dialog__body {
+  flex: 1 1 auto;
+  /* min-height:0 是关键：flex 子项默认 min-height:auto，会撑到内容高度而不肯收缩，
+   * overflow:auto 就永远不触发。 */
+  min-height: 0;
+  overflow: auto;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+    animation: none !important;
+  }
+}
+
+/* 细滚动条 */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(120, 130, 150, 0.35);
+  border-radius: 8px;
+}

@@ -1,0 +1,346 @@
+# ============================================================================
+# mantou 构建与发布流水线（GitHub Actions）
+#
+# 触发方式：
+#   1. 推送版本标签（推荐）：
+#        git tag v1.0.0 && git push origin v1.0.0
+#      → 自动构建多平台二进制 + 自更新包签名 + Docker 多架构镜像 + 创建 GitHub Release
+#   2. 手动触发（workflow_dispatch）：
+#       重跑一次构建并覆盖 ghcr 上的 latest 镜像，不创建 Release。
+#       用途是「上一次构建卡住或推送失败，再来一遍」。
+#
+# 产出：
+#   - GitHub Release 附件（多平台二进制）：
+#       mantou-linux-amd64.tar.gz      （含 mantou；配置签名密钥则附 mantou.sig）
+#       mantou-linux-arm64.tar.gz      （同上，两个 Linux 包都签名）
+#       mantou-darwin-amd64.tar.gz     （macOS Intel）
+#       mantou-darwin-arm64.tar.gz     （macOS Apple Silicon）
+#       mantou-windows-amd64.zip       （Windows 10/11 x64）
+#   - Docker 镜像（多架构 amd64 + arm64）→ ghcr.io/<owner>/<repo>:latest
+#       ghcr 上**只有 latest 这一个标签**，不发版本号标签，见 docker 作业里的说明。
+#
+# 需要的仓库 Secrets（Settings → Secrets and variables → Actions）：
+#   UPDATE_SIGNING_KEY   可选。自更新签名【私钥】（seed），即本地 update-signing.key 文件内容（64 位 hex）。
+#                        ⚠️ 注意区分：这里填「私钥」，不是「公钥」。
+#                            - 私钥（secret）= update-signing.key 文件内容，形如 fb32d5...（64 位 hex）
+#                            - 公钥（配置到 mantou 面板「设置→在线更新→自更新包签名公钥」）= base64 串
+#                        配置后 Linux 更新包会自动附带 mantou.sig；不配置则产出未签名包。
+#   DOCKERHUB_USERNAME   可选。Docker Hub 用户名（要同时推送 Docker Hub 时才配置）。
+#   DOCKERHUB_TOKEN      可选。Docker Hub Access Token。
+# ============================================================================
+
+name: build-and-release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  # --------------------------------------------------------------------------
+  # 0) 门禁：复用 ci.yml 的 Go 检查作为发布前提。
+  #
+  # 为什么发布流水线要再跑一遍：ci.yml 跑在日常推送上，而标签可以打在任意提交上
+  # （包括从未推送过、或推送后又被强推覆盖的提交）。没有这道门禁，一个未经检查的
+  # 提交打上 v* 标签就会直接产出 Release 与 latest 镜像。
+  # 这里只跑 Go 侧的快检查（约 1~2 分钟）：前端类型错误会在下面的 web 作业里
+  # 由 tsc/vite 自己暴露，不必重复。
+  # --------------------------------------------------------------------------
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache-dependency-path: go.sum
+
+      - name: 确保 embed 占位文件存在
+        run: |
+          # 后端用 `//go:embed all:dist` 内嵌 web/dist；本作业不构建前端，占位文件足够编译。
+          # 占位文件是仓库里跟踪的 web/dist/.gitkeep，这里只兜底它被误删的情况。
+          mkdir -p web/dist
+          [ -e web/dist/.gitkeep ] || touch web/dist/.gitkeep
+
+      - name: gofmt / vet / test
+        run: |
+          # gofmt -l 发现不合规文件时仍返回 0，必须显式判空，否则这道门禁形同虚设。
+          unformatted="$(gofmt -l ./cmd ./internal)"
+          if [ -n "$unformatted" ]; then
+            echo "以下文件未经 gofmt 格式化：" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
+          go vet ./...
+          go test ./... -count=1
+
+  # --------------------------------------------------------------------------
+  # 1) 前端：只构建一次 web/dist，通过 artifact 传给后续作业
+  # --------------------------------------------------------------------------
+  web:
+    needs: checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Node.js
+        uses: actions/setup-node@v4
+        with:
+          # Node 20 已于 2026-04 结束维护；22 为 LTS（维护至 2027-04），与 Dockerfile 保持一致。
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 安装前端依赖
+        run: npm ci --prefix web
+
+      - name: 构建前端
+        run: npm run build:only --prefix web
+
+      - name: 上传前端产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+          retention-days: 1
+
+  # --------------------------------------------------------------------------
+  # 2) 交叉编译多平台二进制（Linux / macOS / Windows）
+  # --------------------------------------------------------------------------
+  binaries:
+    needs: web
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Go
+        uses: actions/setup-go@v5
+        with:
+          # Go 1.22 已结束维护；版本下限由 go.mod 的 go 指令（1.25.0）约束，此处取更高的 1.26
+          # 以获得最新标准库安全补丁，并与 Dockerfile 的 golang:1.26-alpine 保持一致。
+          go-version: '1.26'
+          cache-dependency-path: go.sum
+
+      - name: 校验依赖清单
+        run: |
+          # go.sum 已随仓库提交：按清单精确下载并校验模块哈希。
+          # 刻意不执行 go mod tidy——构建期改写清单会让同一份源码在不同时间链接进
+          # 不同的依赖版本，go.sum 的校验意义随之失效。清单不一致时此处显式失败。
+          go mod download -x
+          go mod verify
+
+      - name: 下载前端产物
+        uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+
+      - name: 计算版本号
+        id: version
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            VERSION="Ver ${GITHUB_REF_NAME#v}"
+          else
+            VERSION="Ver dev-${GITHUB_SHA::8}"
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "版本号：$VERSION"
+
+      - name: 注入版本号与编译时间
+        run: |
+          printf 'package version\n\n// Code generated by GitHub Actions. DO NOT EDIT.\nfunc init() {\n\tVersion = "%s"\n\tBuildTime = "%s"\n}\n' \
+            "${{ steps.version.outputs.VERSION }}" "$(date -u '+%Y-%m-%d %H:%M:%S')" > internal/version/gen.go
+
+      - name: 交叉编译
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          EXE: ${{ matrix.goos == 'windows' && '.exe' || '' }}
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 go build -trimpath -mod=readonly -ldflags "-s -w" \
+            -o "dist/mantou${EXE}" ./cmd/mantou
+
+      - name: 签名（仅 Linux，需配置 UPDATE_SIGNING_KEY）
+        if: matrix.goos == 'linux'
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          if [ -n "$UPDATE_SIGNING_KEY" ]; then
+            printf '%s' "$UPDATE_SIGNING_KEY" > update-signing.key
+            mkdir -p bin
+            go build -trimpath -mod=readonly -o bin/updsign ./cmd/updsign
+            bin/updsign sign -key update-signing.key dist/mantou dist/mantou.sig
+          else
+            echo "未配置 UPDATE_SIGNING_KEY，生成未签名更新包（自更新验签将被跳过）"
+          fi
+
+      - name: 打包
+        run: |
+          cd dist
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            zip -j "../mantou-${{ matrix.goos }}-${{ matrix.goarch }}.zip" mantou.exe
+          else
+            FILES="mantou"
+            [ -f mantou.sig ] && FILES="mantou mantou.sig"
+            tar -czf "../mantou-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz" $FILES
+          fi
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: mantou-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: mantou-${{ matrix.goos }}-${{ matrix.goarch }}.*
+          retention-days: 7
+
+  # --------------------------------------------------------------------------
+  # 3) Docker：构建多架构镜像并推送到 GitHub Container Registry (ghcr.io)
+  # --------------------------------------------------------------------------
+  docker:
+    needs: checks
+    runs-on: ubuntu-latest
+    # 兜底：不设的话作业默认能跑满 360 分钟。多架构构建一旦退化成 QEMU 模拟
+    # （某个构建阶段忘了钉 --platform=$BUILDPLATFORM），表现就是长时间不结束而非报错，
+    # 6 小时后才被掐掉。正常情况下这个作业几分钟就完事，40 分钟足够留余量。
+    timeout-minutes: 40
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          # 取全部历史与标签：下面「计算版本号」在手动触发时要靠 git describe 找最近的
+          # 版本标签。默认的浅检出（depth=1）拿不到标签，只能退回 dev-<sha>，
+          # 而 ghcr 上只有 latest 一个标签，那就意味着一次手动重跑会把 latest
+          # 换成一个「关于」页显示 dev 版本号的镜像。
+          fetch-depth: 0
+
+      - name: 计算镜像名（转小写）
+        run: |
+          echo "IMAGE_NAME=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+
+      - name: 计算版本号（注入 Dockerfile）
+        id: version
+        run: |
+          # 版本号只进镜像里的二进制（「关于」页显示的那个），不进镜像标签。
+          # 手动触发时没有 GITHUB_REF_NAME 可用，退回到仓库里最近的一个版本标签：
+          # 手动重跑的语义是「同一份代码再推一次」，产出的镜像应当和标签触发时一模一样。
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            VERSION="Ver ${GITHUB_REF_NAME#v}"
+          else
+            LAST_TAG="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+            if [ -n "$LAST_TAG" ]; then
+              VERSION="Ver ${LAST_TAG#v}"
+            else
+              VERSION="Ver dev-${GITHUB_SHA::8}"
+            fi
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "版本号：$VERSION"
+
+      - name: 设置 QEMU（支持 arm64 交叉构建）
+        uses: docker/setup-qemu-action@v3
+
+      - name: 设置 Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 可选：同时推送到 Docker Hub。
+      # 1) 取消下面注释；2) 在仓库 Secrets 配置 DOCKERHUB_USERNAME / DOCKERHUB_TOKEN；
+      # 3) 在下方 build-push 的 tags 追加 docker.io/<用户名>/mantou 相关标签。
+      # - name: 登录 Docker Hub
+      #   uses: docker/login-action@v3
+      #   with:
+      #     username: ${{ secrets.DOCKERHUB_USERNAME }}
+      #     password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: 生成镜像标签
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          # ghcr 上**永远只有 latest 这一个标签**：不发版本号标签，也不再发 dev。
+          #
+          # 为什么不留版本号：容器这一侧没人靠拉旧镜像回退——要回退是去 Release 里下
+          # 对应版本的二进制包。留着版本号标签只换来三样东西：包页面上一长串谁也不会拉的
+          # 标签、每个版本一份多架构清单长期占着仓库、以及「latest 和某个版本号标签是不是同一份」
+          # 这种问不出答案的问题。一个移动标签指向当前发布的那一份，语义最少也最清楚。
+          #
+          # 手动触发同样推 latest 而不是 dev：手动触发的唯一用途就是「上次推挂了，再来一遍」，
+          # 那本来就该覆盖 latest；多出一个 dev 标签则与上面那条自相矛盾。
+          #
+          # 版本号没有丢，只是不在标签上：它随 build-arg 注入进二进制（面板「关于」页可见），
+          # 并额外落成下面这个 OCI 标签，docker image inspect 就能看出 latest 现在是哪一版。
+          tags: |
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.version=${{ steps.version.outputs.VERSION }}
+
+      - name: 构建并推送镜像
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            VERSION=${{ steps.version.outputs.VERSION }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # --------------------------------------------------------------------------
+  # 4) Release：仅对版本标签创建 GitHub Release 并挂载产物
+  # --------------------------------------------------------------------------
+  release:
+    needs: binaries
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: 下载全部产物
+        uses: actions/download-artifact@v4
+        with:
+          pattern: mantou-*
+          path: dist
+          merge-multiple: true
+
+      - name: 创建 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 同名 tag 重新发布时，先删除已存在的 Release（不存在则忽略），
+          # 避免 gh release create 报 "already exists" 导致覆盖失败。
+          gh release delete "$GITHUB_REF_NAME" --yes --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "mantou ${GITHUB_REF_NAME}" \
+            --generate-notes \
+            dist/*
