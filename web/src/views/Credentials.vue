@@ -4,10 +4,15 @@ import { useI18n } from 'vue-i18n'
 import { ElMessage } from 'element-plus'
 import { Plus } from '@element-plus/icons-vue'
 import PageCard from '@/components/PageCard.vue'
+import RowActions from '@/components/RowActions.vue'
+import { useNarrow } from '@/composables/useNarrow'
 import { useResource } from '@/composables/useResource'
 import { actions, type ProviderInfo } from '@/api/resources'
 
 const { t, te } = useI18n()
+
+// 窄屏时操作列只剩一个「更多」按钮，列宽跟着收窄，省下的宽度留给前面几列。
+const narrow = useNarrow()
 
 interface Credential {
   id?: string
@@ -89,12 +94,14 @@ onActivated(() => {
       <el-table-column :label="t('cred.fields')" min-width="220">
         <template #default="{ row }"><span class="mt-subtle">{{ fieldSummary(row) }}</span></template>
       </el-table-column>
-      <el-table-column :label="t('common.actions')" width="180" align="right">
+      <el-table-column :label="t('common.actions')" :width="narrow ? 90 : 180" align="right">
         <template #default="{ row }">
-          <el-button size="small" @click="r.openEdit(row)">{{ t('common.edit') }}</el-button>
-          <el-button size="small" type="danger" text @click="r.remove(row, t('common.confirmDelete'))">
-            {{ t('common.delete') }}
-          </el-button>
+          <RowActions>
+            <el-button size="small" @click="r.openEdit(row)">{{ t('common.edit') }}</el-button>
+            <el-button size="small" type="danger" text @click="r.remove(row, t('common.confirmDelete'))">
+              {{ t('common.delete') }}
+            </el-button>
+          </RowActions>
         </template>
       </el-table-column>
     </el-table>

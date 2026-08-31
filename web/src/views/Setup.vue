@@ -52,7 +52,7 @@ async function submit() {
     <div class="auth-top"><LangSwitch /></div>
     <div class="mt-glass auth-card">
       <div class="brand">
-        <div class="logo">馒</div>
+        <div class="logo">M</div>
         <div>
           <h1 class="mt-title">{{ t('setup.title') }}</h1>
           <p class="mt-subtle">{{ t('setup.subtitle') }}</p>

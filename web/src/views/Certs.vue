@@ -4,13 +4,18 @@ import { useI18n } from 'vue-i18n'
 import { ElMessage } from 'element-plus'
 import { Plus, Key, Upload } from '@element-plus/icons-vue'
 import PageCard from '@/components/PageCard.vue'
+import RowActions from '@/components/RowActions.vue'
 import TagInput from '@/components/TagInput.vue'
+import { useNarrow } from '@/composables/useNarrow'
 import { useResource } from '@/composables/useResource'
 import { useCloseOnLeave } from '@/composables/useCloseOnLeave'
 import { actions, credentialsApi } from '@/api/resources'
 import { currentLocale } from '@/i18n'
 
 const { t } = useI18n()
+
+// 窄屏时操作列只剩一个「更多」按钮，列宽跟着收窄，省下的宽度留给前面几列。
+const narrow = useNarrow()
 
 interface OperationStatus {
   state: string
@@ -430,23 +435,25 @@ useCloseOnLeave(importVisible, acmeManageVisible)
           </div>
         </template>
       </el-table-column>
-      <el-table-column :label="t('common.actions')" width="320" align="right">
+      <el-table-column :label="t('common.actions')" :width="narrow ? 90 : 320" align="right">
         <template #default="{ row }">
-          <el-button
-            v-if="row.method === 'acme'"
-            size="small"
-            :loading="isIssuing(row)"
-            :disabled="isIssuing(row)"
-            @click="issue(row)"
-          >
-            {{ t('cert.issue') }}
-          </el-button>
-          <el-button v-if="row.method === 'file'" size="small" @click="openImport(row)">{{ t('cert.importPem') }}</el-button>
-          <el-button size="small" @click="exportCert(row)">{{ t('cert.export') }}</el-button>
-          <el-button size="small" @click="r.openEdit(row)">{{ t('common.edit') }}</el-button>
-          <el-button size="small" type="danger" text @click="r.remove(row, t('common.confirmDelete'))">
-            {{ t('common.delete') }}
-          </el-button>
+          <RowActions>
+            <el-button
+              v-if="row.method === 'acme'"
+              size="small"
+              :loading="isIssuing(row)"
+              :disabled="isIssuing(row)"
+              @click="issue(row)"
+            >
+              {{ t('cert.issue') }}
+            </el-button>
+            <el-button v-if="row.method === 'file'" size="small" @click="openImport(row)">{{ t('cert.importPem') }}</el-button>
+            <el-button size="small" @click="exportCert(row)">{{ t('cert.export') }}</el-button>
+            <el-button size="small" @click="r.openEdit(row)">{{ t('common.edit') }}</el-button>
+            <el-button size="small" type="danger" text @click="r.remove(row, t('common.confirmDelete'))">
+              {{ t('common.delete') }}
+            </el-button>
+          </RowActions>
         </template>
       </el-table-column>
     </el-table>
@@ -589,12 +596,14 @@ useCloseOnLeave(importVisible, acmeManageVisible)
         <el-table-column :label="t('cert.email')" min-width="150">
           <template #default="{ row }"><span class="mt-subtle">{{ row.email || '—' }}</span></template>
         </el-table-column>
-        <el-table-column :label="t('common.actions')" width="140" align="right">
+        <el-table-column :label="t('common.actions')" :width="narrow ? 90 : 140" align="right">
           <template #default="{ row }">
-            <el-button size="small" @click="acme.openEdit(row)">{{ t('common.edit') }}</el-button>
-            <el-button size="small" type="danger" text @click="acme.remove(row, t('common.confirmDelete'))">
-              {{ t('common.delete') }}
-            </el-button>
+            <RowActions>
+              <el-button size="small" @click="acme.openEdit(row)">{{ t('common.edit') }}</el-button>
+              <el-button size="small" type="danger" text @click="acme.remove(row, t('common.confirmDelete'))">
+                {{ t('common.delete') }}
+              </el-button>
+            </RowActions>
           </template>
         </el-table-column>
       </el-table>

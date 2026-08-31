@@ -5,6 +5,8 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Setting, Refresh, CopyDocument } from '@element-plus/icons-vue'
 import api from '@/api/client'
 import PageCard from '@/components/PageCard.vue'
+import RowActions from '@/components/RowActions.vue'
+import { useNarrow } from '@/composables/useNarrow'
 import { useResource, fmtTime, fmtTimeMs, fmtBytes } from '@/composables/useResource'
 import { useCloseOnLeave } from '@/composables/useCloseOnLeave'
 import ReceiverDialog from '@/components/webhook/ReceiverDialog.vue'
@@ -37,6 +39,9 @@ import type {
 // 规则排在最后是因为它要引用前面三样——先有入口、模板和目标，才配得出一条规则。
 
 const { t } = useI18n()
+
+// 窄屏时操作列只剩一个「更多」按钮，列宽跟着收窄，省下的宽度留给前面几列。
+const narrow = useNarrow()
 
 interface CertOption {
   id?: string
@@ -1022,12 +1027,14 @@ useCloseOnLeave(serverVisible, sourceVisible, dryVisible, testVisible, ruleVisib
           <el-table-column :label="t('mroute.note')" min-width="130" show-overflow-tooltip>
             <template #default="{ row }">{{ row.note || '—' }}</template>
           </el-table-column>
-          <el-table-column :label="t('common.actions')" width="170" align="right">
+          <el-table-column :label="t('common.actions')" :width="narrow ? 90 : 170" align="right">
             <template #default>
-              <el-button size="small" :icon="Setting" @click="openServer">{{ t('common.edit') }}</el-button>
-              <el-button size="small" type="danger" text :loading="deletingServer" @click="removeServer">
-                {{ t('common.delete') }}
-              </el-button>
+              <RowActions>
+                <el-button size="small" :icon="Setting" @click="openServer">{{ t('common.edit') }}</el-button>
+                <el-button size="small" type="danger" text :loading="deletingServer" @click="removeServer">
+                  {{ t('common.delete') }}
+                </el-button>
+              </RowActions>
             </template>
           </el-table-column>
         </el-table>
@@ -1114,17 +1121,19 @@ useCloseOnLeave(serverVisible, sourceVisible, dryVisible, testVisible, ruleVisib
           <el-table-column :label="t('mroute.note')" min-width="100" show-overflow-tooltip>
             <template #default="{ row }">{{ row.note || '—' }}</template>
           </el-table-column>
-          <el-table-column :label="t('common.actions')" width="190" align="right">
+          <el-table-column :label="t('common.actions')" :width="narrow ? 90 : 190" align="right">
             <template #default="{ row }">
-              <!-- 只有一个「试运行」：等真实消息还是贴一段样本，都在面板里选，
-                   列表上不再重复放实时试运行的开关（那会看着像两个功能）。 -->
-              <el-button size="small" type="primary" @click="openDryRun(row)">
-                {{ t('mroute.dry.sampleBtn') }}
-              </el-button>
-              <el-button size="small" @click="openEditReceiver(row)">{{ t('common.edit') }}</el-button>
-              <el-button size="small" type="danger" text @click="recv.remove(row, t('common.confirmDelete'))">
-                {{ t('common.delete') }}
-              </el-button>
+              <RowActions>
+                <!-- 只有一个「试运行」：等真实消息还是贴一段样本，都在面板里选，
+                     列表上不再重复放实时试运行的开关（那会看着像两个功能）。 -->
+                <el-button size="small" type="primary" @click="openDryRun(row)">
+                  {{ t('mroute.dry.sampleBtn') }}
+                </el-button>
+                <el-button size="small" @click="openEditReceiver(row)">{{ t('common.edit') }}</el-button>
+                <el-button size="small" type="danger" text @click="recv.remove(row, t('common.confirmDelete'))">
+                  {{ t('common.delete') }}
+                </el-button>
+              </RowActions>
             </template>
           </el-table-column>
         </el-table>
@@ -1154,20 +1163,22 @@ useCloseOnLeave(serverVisible, sourceVisible, dryVisible, testVisible, ruleVisib
           <el-table-column :label="t('mroute.note')" min-width="110" show-overflow-tooltip>
             <template #default="{ row }">{{ row.note || '—' }}</template>
           </el-table-column>
-          <el-table-column :label="t('common.actions')" width="200" align="right">
+          <el-table-column :label="t('common.actions')" :width="narrow ? 90 : 200" align="right">
             <template #default="{ row }">
-              <el-button size="small" @click="tmpl.openEdit(row)">{{ t('common.edit') }}</el-button>
-              <!-- 复制只给消息模板和发送规则：这两样没有脱敏字段。接收器的令牌、通知目标的地址
-                   读回来是 ****** 占位符，复制出来的那条会把占位符当真值存下去（见 openCopy）。 -->
-              <el-button
-                size="small"
-                @click="tmpl.openCopy(row, (r) => t('mroute.tmpl.copyName', { name: r.name }))"
-              >
-                {{ t('mroute.tmpl.duplicate') }}
-              </el-button>
-              <el-button size="small" type="danger" text @click="tmpl.remove(row, t('common.confirmDelete'))">
-                {{ t('common.delete') }}
-              </el-button>
+              <RowActions>
+                <el-button size="small" @click="tmpl.openEdit(row)">{{ t('common.edit') }}</el-button>
+                <!-- 复制只给消息模板和发送规则：这两样没有脱敏字段。接收器的令牌、通知目标的地址
+                     读回来是 ****** 占位符，复制出来的那条会把占位符当真值存下去（见 openCopy）。 -->
+                <el-button
+                  size="small"
+                  @click="tmpl.openCopy(row, (r) => t('mroute.tmpl.copyName', { name: r.name }))"
+                >
+                  {{ t('mroute.tmpl.duplicate') }}
+                </el-button>
+                <el-button size="small" type="danger" text @click="tmpl.remove(row, t('common.confirmDelete'))">
+                  {{ t('common.delete') }}
+                </el-button>
+              </RowActions>
             </template>
           </el-table-column>
         </el-table>
@@ -1212,15 +1223,17 @@ useCloseOnLeave(serverVisible, sourceVisible, dryVisible, testVisible, ruleVisib
               <span v-else class="mt-subtle">—</span>
             </template>
           </el-table-column>
-          <el-table-column :label="t('common.actions')" width="200" align="right">
+          <el-table-column :label="t('common.actions')" :width="narrow ? 90 : 200" align="right">
             <template #default="{ row }">
-              <el-button size="small" @click="openTest(row)">
-                {{ t('mroute.target.test') }}
-              </el-button>
-              <el-button size="small" @click="targ.openEdit(row)">{{ t('common.edit') }}</el-button>
-              <el-button size="small" type="danger" text @click="targ.remove(row, t('common.confirmDelete'))">
-                {{ t('common.delete') }}
-              </el-button>
+              <RowActions>
+                <el-button size="small" @click="openTest(row)">
+                  {{ t('mroute.target.test') }}
+                </el-button>
+                <el-button size="small" @click="targ.openEdit(row)">{{ t('common.edit') }}</el-button>
+                <el-button size="small" type="danger" text @click="targ.remove(row, t('common.confirmDelete'))">
+                  {{ t('common.delete') }}
+                </el-button>
+              </RowActions>
             </template>
           </el-table-column>
         </el-table>
@@ -1317,19 +1330,29 @@ useCloseOnLeave(serverVisible, sourceVisible, dryVisible, testVisible, ruleVisib
               </template>
             </template>
           </el-table-column>
-          <el-table-column :label="t('common.actions')" width="210" align="right">
+          <el-table-column :label="t('common.actions')" :width="narrow ? 90 : 210" align="right">
             <template #default="{ row }">
-              <el-button size="small" @click="openEditRule(row)">{{ t('common.edit') }}</el-button>
-              <!-- 复制：一条规则只装得下「一组条件 → 一个模板 → 一批目标」，多分支只能拆成多条，
-                   而它们往往只差条件和模板。规则里没有脱敏字段，整条拷贝是安全的（见 openCopyRule）。 -->
-              <el-tooltip :content="t('mroute.rule.copyHint')" placement="top" :show-after="400">
-                <el-button size="small" @click="openCopyRule(row)">
-                  {{ t('mroute.rule.duplicate') }}
+              <RowActions>
+                <el-button size="small" @click="openEditRule(row)">{{ t('common.edit') }}</el-button>
+                <!-- 复制：一条规则只装得下「一组条件 → 一个模板 → 一批目标」，多分支只能拆成多条，
+                     而它们往往只差条件和模板。规则里没有脱敏字段，整条拷贝是安全的（见 openCopyRule）。 -->
+                <!-- 窄屏关掉这个提示：那时按钮在「更多」菜单里，点完菜单就收起，
+                     提示的触发元素跟着被隐藏、收不到 mouseleave，于是它会一直挂在弹窗前面。
+                     触屏本来也没有悬停，关掉不少任何东西。 -->
+                <el-tooltip
+                  :content="t('mroute.rule.copyHint')"
+                  placement="top"
+                  :show-after="400"
+                  :disabled="narrow"
+                >
+                  <el-button size="small" @click="openCopyRule(row)">
+                    {{ t('mroute.rule.duplicate') }}
+                  </el-button>
+                </el-tooltip>
+                <el-button size="small" type="danger" text @click="removeRule(row)">
+                  {{ t('common.delete') }}
                 </el-button>
-              </el-tooltip>
-              <el-button size="small" type="danger" text @click="removeRule(row)">
-                {{ t('common.delete') }}
-              </el-button>
+              </RowActions>
             </template>
           </el-table-column>
         </el-table>

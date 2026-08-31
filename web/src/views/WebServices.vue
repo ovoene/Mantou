@@ -4,13 +4,19 @@ import { useI18n } from 'vue-i18n'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Delete, Edit } from '@element-plus/icons-vue'
 import PageCard from '@/components/PageCard.vue'
+import RowActions from '@/components/RowActions.vue'
 import TagInput from '@/components/TagInput.vue'
 import { useResource } from '@/composables/useResource'
 import { useCloseOnLeave } from '@/composables/useCloseOnLeave'
+import { useNarrow } from '@/composables/useNarrow'
 import { maxCountOf } from '@/api/limits'
 import { webServicesApi, actions, type WebAccessLog } from '@/api/resources'
 
 const { t } = useI18n()
+
+// 窄屏时子项表的操作列只剩一个「更多」按钮，列宽跟着收窄。
+// 父项那一行的三个操作也收进「更多」，不过那件事由 RowActions 自己判宽度。
+const narrow = useNarrow()
 
 interface Upstream {
   url: string
@@ -567,24 +573,35 @@ useCloseOnLeave(logsVisible)
       <div v-for="p in (r.list.value as Parent[])" :key="p.id" class="parent-block mt-glass">
         <div class="parent-head">
           <el-switch v-model="p.enabled" @change="toggleParent(p)" />
-          <strong class="pname">{{ p.name || t('common.unnamed') }}</strong>
-          <el-tag size="small" effect="light" type="primary">{{ t('webservice.port') }} {{ p.port }}</el-tag>
-          <el-tag size="small" effect="plain">{{ familyLabel(p.ipFamily) }}</el-tag>
+          <!-- title 不分宽窄都挂：名字在任何宽度下都可能被截断，看不全时靠它补上。 -->
+          <strong class="pname" :title="p.name || t('common.unnamed')">
+            {{ p.name || t('common.unnamed') }}
+          </strong>
+          <div class="parent-meta">
+            <el-tag size="small" effect="light" type="primary">{{ t('webservice.port') }} {{ p.port }}</el-tag>
+            <el-tag size="small" effect="plain">{{ familyLabel(p.ipFamily) }}</el-tag>
+          </div>
           <span class="spacer" />
-          <el-button size="small" :icon="Edit" @click="openEditParent(p)">{{ t('common.edit') }}</el-button>
-          <el-button
-            size="small"
-            type="primary"
-            :icon="Plus"
-            :disabled="childrenFull(p)"
-            :title="childrenFull(p) ? t('webservice.childrenFull', { n: maxChildren }) : ''"
-            @click="addChildToParent(p)"
-          >
-            {{ t('webservice.addChild') }}
-          </el-button>
-          <el-button size="small" type="danger" text @click="r.remove(p as any, t('common.confirmDelete'))">
-            {{ t('common.delete') }}
-          </el-button>
+          <!-- 三个操作包成一组：宽度不够时要整组落到第二行，散着放会各自单独换行，
+               操作被拆到两三行上。窄屏由 RowActions 收进「更多」（全站列表同一个菜单）。 -->
+          <div class="parent-actions">
+            <RowActions>
+              <el-button size="small" :icon="Edit" @click="openEditParent(p)">{{ t('common.edit') }}</el-button>
+              <el-button
+                size="small"
+                type="primary"
+                :icon="Plus"
+                :disabled="childrenFull(p)"
+                :title="childrenFull(p) ? t('webservice.childrenFull', { n: maxChildren }) : ''"
+                @click="addChildToParent(p)"
+              >
+                {{ t('webservice.addChild') }}
+              </el-button>
+              <el-button size="small" type="danger" text @click="r.remove(p as any, t('common.confirmDelete'))">
+                {{ t('common.delete') }}
+              </el-button>
+            </RowActions>
+          </div>
         </div>
 
         <p v-if="!p.enabled" class="mt-subtle disabled-hint">{{ t('webservice.parentDisabledHint') }}</p>
@@ -643,28 +660,30 @@ useCloseOnLeave(logsVisible)
               <span>{{ row.note || '—' }}</span>
             </template>
           </el-table-column>
-          <el-table-column :label="t('common.actions')" min-width="180" align="right">
+          <el-table-column :label="t('common.actions')" :min-width="narrow ? 90 : 180" align="right">
             <template #default="{ row }">
-              <el-button size="small" text type="primary" @click="editChild(p, row)">
-                {{ t('common.edit') }}
-              </el-button>
-              <el-button
-                v-if="row.proxy && row.proxy.accessLog"
-                size="small"
-                text
-                type="primary"
-                @click="openLogs(p, row)"
-              >
-                {{ t('webservice.viewLogs') }}
-              </el-button>
-              <el-button
-                size="small"
-                text
-                type="danger"
-                @click="deleteChild(p, row)"
-              >
-                {{ t('common.delete') }}
-              </el-button>
+              <RowActions>
+                <el-button size="small" text type="primary" @click="editChild(p, row)">
+                  {{ t('common.edit') }}
+                </el-button>
+                <el-button
+                  v-if="row.proxy && row.proxy.accessLog"
+                  size="small"
+                  text
+                  type="primary"
+                  @click="openLogs(p, row)"
+                >
+                  {{ t('webservice.viewLogs') }}
+                </el-button>
+                <el-button
+                  size="small"
+                  text
+                  type="danger"
+                  @click="deleteChild(p, row)"
+                >
+                  {{ t('common.delete') }}
+                </el-button>
+              </RowActions>
             </template>
           </el-table-column>
         </el-table>
@@ -1023,9 +1042,33 @@ useCloseOnLeave(logsVisible)
   display: flex;
   align-items: center;
   gap: 10px;
+  /* 允许换行，且不挑阈值：这一行平铺开要 590 像素上下，宽度不够时最后那组操作自己落到
+   * 第二行。不放开的话，标签和按钮都是 nowrap、压不动，先被压扁的是名字——它会缩成
+   * 一个字宽的竖条，而操作照样溢出到屏幕外。 */
+  flex-wrap: wrap;
 }
+/* 名字是这一行里唯一压得动的东西，长了就截断。
+ * min-width: 0 必须写：flex 项默认不会小于自身内容宽度，少了它截断根本不生效。 */
 .pname {
   font-size: 15px;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* 两个标签包一层：窄屏要把它们整组挪到第二行，散着放只会各自单独换行。 */
+.parent-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+/* 换到第二行时靠右，跟宽屏时按钮所在的位置一致。 */
+.parent-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: auto;
 }
 .spacer {
   flex: 1;
@@ -1166,6 +1209,34 @@ useCloseOnLeave(logsVisible)
   align-items: flex-start;
   align-content: flex-start;
   padding-top: 8px;
+}
+
+/* 窄屏：父项那一行排成两行——第一行「开关 + 名字 + 更多」，第二行两个标签。
+ * 平铺时这一行要 531 像素，而窄屏下它只有 200 上下。换行本身由基础样式那边的
+ * flex-wrap 负责，这里只管这一档特有的两件事：三个按钮换成一个「更多」（那一步在
+ * RowActions 里，300 像素的三联排在 200 里塞不下），以及把标签组整组挪到第二行——
+ * 纯靠自然换行的话第一行只放得下开关和名字，标签和「更多」各占一行，一共三行。
+ * 改这里的 640 要一并改 useNarrow 的阈值。 */
+@media (max-width: 640px) {
+  .parent-block {
+    /* 左右各让出 6 像素给内容：两个标签并排正好差这么点就要折成两行。 */
+    padding: 12px 10px;
+  }
+  /* 名字占满第一行的剩余宽度（截断规则在基础样式里）。
+   * 基准宽度必须写 0：flex 换行是按基准宽度排的，写 auto 就等于按名字的完整文字宽去排，
+   * 「更多」当场被挤到第二行、还只能靠左，父项行凭空多出一行。 */
+  .pname {
+    flex: 1 1 0;
+  }
+  /* order 把标签组排到「更多」之后，width 让它独占第二行。 */
+  .parent-meta {
+    order: 1;
+    width: 100%;
+  }
+  /* 名字已经在撑开剩余宽度，占位符多余；留着它会把「更多」挤下去。 */
+  .spacer {
+    display: none;
+  }
 }
 
 /* 窄屏两档：列越多越早收。三联排与四联排里塞的是端口、协议这类短字段，

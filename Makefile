@@ -12,7 +12,7 @@
 # ============================================================================
 
 APP        := mantou
-VERSION    ?= Ver 1.0.0
+VERSION    ?= Ver 1.0.1
 DATA_DIR   ?= ./data
 # 编译时间（默认本地时间），构建时写入 internal/version/gen.go，供「关于」页展示；
 # 可覆盖：make build BUILD_TIME="2026-08-13 12:00:00"

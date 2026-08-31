@@ -4,10 +4,15 @@ import { useI18n } from 'vue-i18n'
 import { ElMessage } from 'element-plus'
 import { Plus } from '@element-plus/icons-vue'
 import PageCard from '@/components/PageCard.vue'
+import RowActions from '@/components/RowActions.vue'
+import { useNarrow } from '@/composables/useNarrow'
 import { useResource, fmtTime } from '@/composables/useResource'
 import { actions, type WOLInterface } from '@/api/resources'
 
 const { t } = useI18n()
+
+// 窄屏时操作列只剩一个「更多」按钮，列宽跟着收窄，省下的宽度留给前面几列。
+const narrow = useNarrow()
 
 // Schedule 两种触发方式各自只用到一部分字段（与后端 config.WOLSchedule 一致）：
 //   - fixed（固定时间）：time + count —— 每天在 time 这一个时间点，于 1 秒内发 count 个包。
@@ -272,13 +277,15 @@ onBeforeUnmount(stopRefresh)
       <el-table-column :label="t('wol.note')" min-width="100" show-overflow-tooltip>
         <template #default="{ row }"><span class="mt-subtle">{{ row.note || '—' }}</span></template>
       </el-table-column>
-      <el-table-column :label="t('common.actions')" width="180" align="right">
+      <el-table-column :label="t('common.actions')" :width="narrow ? 90 : 180" align="right">
         <template #default="{ row }">
-          <el-button size="small" type="primary" @click="wake(row)">{{ t('wol.wake') }}</el-button>
-          <el-button size="small" @click="openEditDevice(row)">{{ t('common.edit') }}</el-button>
-          <el-button size="small" type="danger" text @click="r.remove(row, t('common.confirmDelete'))">
-            {{ t('common.delete') }}
-          </el-button>
+          <RowActions>
+            <el-button size="small" type="primary" @click="wake(row)">{{ t('wol.wake') }}</el-button>
+            <el-button size="small" @click="openEditDevice(row)">{{ t('common.edit') }}</el-button>
+            <el-button size="small" type="danger" text @click="r.remove(row, t('common.confirmDelete'))">
+              {{ t('common.delete') }}
+            </el-button>
+          </RowActions>
         </template>
       </el-table-column>
     </el-table>

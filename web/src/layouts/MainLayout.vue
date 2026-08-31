@@ -270,7 +270,7 @@ async function submitAccount() {
   <div class="layout" :class="{ collapsed }">
     <aside class="sidebar mt-glass">
       <div class="brand">
-        <div class="logo">馒</div>
+        <div class="logo">M</div>
         <span v-show="!collapsed" class="brand-name">{{ t('app.name') }}</span>
       </div>
       <nav class="menu">
