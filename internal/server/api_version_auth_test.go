@@ -41,6 +41,7 @@ func versionAuthEngine(t *testing.T, basePath string) (*Server, *gin.Engine) {
 	if err := manager.Load(); err != nil {
 		t.Fatal(err)
 	}
+	firewallOff(t, manager)
 	hash, err := auth.HashPassword(testLoginPass)
 	if err != nil {
 		t.Fatal(err)

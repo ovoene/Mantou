@@ -15,8 +15,9 @@ import (
 //
 // 两处顺序都是有意为之：
 //
-//   - 限流先于 Basic 认证：Basic 认证要算 bcrypt，把限流放在它前面才能挡住
-//     "用海量错口令消耗 CPU"这类请求（见 basicauth.go 的说明）。
+//   - 限流先于 Basic 认证：Basic 认证要算 bcrypt，把限流放在它前面，开了限流的子项
+//     就能在更早的位置把"用海量错口令消耗 CPU"这类请求挡掉。没开限流的子项也不至于
+//     裸奔——Basic 认证自己还有一道"算 bcrypt 的预算"（见 basicAuthComputeRPS）。
 //   - HTTPS 跳转先于 Basic 认证：反过来的话，明文请求会先收到 401 挑战，
 //     浏览器把账号口令**以明文发出来**之后才被跳到 HTTPS——那次跳转要防的事
 //     已经发生了。跳转必须在任何凭证被索取之前完成。
@@ -30,7 +31,7 @@ func applyMiddleware(m *Module, service string, ch config.WebChild, next http.Ha
 			"service", service, "childId", ch.ID)
 	}
 	h := next
-	h = withBasicAuth(ch, h)
+	h = withBasicAuth(m, ch, h)
 	h = withSecurityHeaders(ch, h)
 	h = withRateLimit(m, ch, h)
 	h = withIPFilter(m, service, ch, h)
@@ -117,10 +118,30 @@ func withRateLimit(m *Module, ch config.WebChild, next http.Handler) http.Handle
 	})
 }
 
-// withSecurityHeaders 视配置附加 HSTS 与 HTTPS 跳转。
+// withSecurityHeaders 视配置附加 HSTS 与 HTTPS 跳转，并给每个响应带上禁止 MIME 嗅探。
 func withSecurityHeaders(ch config.WebChild, next http.Handler) http.Handler {
 	trustProxy := ch.TrustProxyHeaders
+	frameDeny := ch.FrameDeny
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		// 禁止 MIME 嗅探。无条件加、不给开关：
+		//
+		// 静态站点的根目录常常同时放着用户上传的东西，而浏览器的嗅探会把一个
+		// text/plain 的上传文件当 HTML 执行——于是"能上传文件"直接变成"能在这个域名下
+		// 执行脚本"，同域的 Cookie 与已登录会话跟着一起丢。反代那侧同理：后端把附件
+		// 原样吐回来时，是不是安全的类型由后端决定，而这道头不需要它配合。
+		//
+		// 代价基本为零：会被它拦下的只有"类型标错了的脚本与样式表"，而浏览器对样式表
+		// 本来就在严格模式下拒收错类型。Go 的 .js 在 Windows 上还额外挡过一层
+		// 注册表把它写成 text/plain 的老毛病（mime/type_windows.go 里有专门的例外）。
+		// 面板自己的错误页（internal/errpage）一直带着这道头，托管的站点此前反而没有。
+		h.Set("X-Content-Type-Options", "nosniff")
+		if frameDeny {
+			// 两个头一起发：CSP 的 frame-ancestors 是现行标准且优先级更高，
+			// X-Frame-Options 留给老浏览器兜底。理由与取值见 config.WebChild.FrameDeny。
+			h.Set("X-Frame-Options", "SAMEORIGIN")
+			h.Set("Content-Security-Policy", "frame-ancestors 'self'")
+		}
 		secure := r.TLS != nil || (trustProxy && forwardedHTTPS(r))
 		if ch.RedirectHTTPS && !secure {
 			target := "https://" + httpsRedirectHost(r.Host) + r.URL.RequestURI()
@@ -128,7 +149,7 @@ func withSecurityHeaders(ch config.WebChild, next http.Handler) http.Handler {
 			return
 		}
 		if ch.HSTS && secure {
-			w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+			h.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 		}
 		next.ServeHTTP(w, r)
 	})

@@ -81,6 +81,9 @@ type Server struct {
 	setupLimiter *loginLimiter    // 初始化接口限流，防止面板暴露期间被抢注管理员
 	wakeLimiter  *wakeLimiter     // 手动网络唤醒限流，按设备计量（见 wakelimit.go）
 	sessions     *sessionRegistry // 服务端会话状态（"关闭才退、刷新保活"）
+	// firewall 面板入站防火墙：连接层拦截 + 请求层限速/自动封禁（见 firewall.go）。
+	// 它自己每次都从配置快照读策略，因此改设置立刻生效、不需要重启面板。
+	firewall     *panelFirewall
 	dnsProviders []dnsprovider.Info
 	basePath     string // 规范化后的访问路径前缀（""或"/xxx"）
 	indexHTML    []byte // 注入 base 前缀后的前端入口页（basePath 非空时使用）
@@ -121,6 +124,7 @@ func New(deps Deps) *Server {
 		setupLimiter: newLoginLimiter(10, 10*time.Minute, 10*time.Minute),
 		wakeLimiter:  newWakeLimiter(),
 		sessions:     newSessionRegistry(),
+		firewall:     newPanelFirewall(deps.Config, deps.Log),
 		dnsProviders: dnsprovider.Infos(),
 		basePath:     normalizeBasePath(cfg.Panel.BasePath),
 		panelHTTPS:   cfg.Panel.HTTPS.Enabled,
@@ -141,6 +145,16 @@ func New(deps Deps) *Server {
 	// （防爆破、防抢注），并污染审计日志中的来源 IP。置 nil 后 ClientIP() 只取真实对端地址。
 	_ = r.SetTrustedProxies(nil)
 	r.Use(gin.CustomRecovery(s.recoverPanic))
+	// 面板入站防火墙：来源名单 / 访问范围 / 限速 / 自动封禁。
+	//
+	// 紧跟恢复中间件之后，排在其余一切之前。恢复必须留在最外层（它要兜住这里面的
+	// 任何 panic），除此之外没有东西该排在访问控制前面——被拒的来源不该有机会
+	// 触发日志、压缩、CSRF 判定等任何工作。
+	//
+	// 连接层还有更早的一道（见 Start 里的 wrapListener）：那一道在 TLS 握手之前
+	// 就把连接关掉，是真正能消掉握手告警的位置。这里管的是握手之后的事——
+	// 限速要按请求计数，且 keep-alive 上的旧连接绕得过 Accept。
+	r.Use(s.firewallGuard())
 	// 面板访问控制（域名限制 / HTTPS 证书域名校验）始终生效。
 	r.Use(s.requirePanelCertificateHost())
 	r.Use(s.requestLogger())
@@ -249,6 +263,9 @@ func (s *Server) registerRoutes(r *gin.Engine) {
 
 			authed.GET("/settings/logs/info", s.handleGetLogInfo)
 			authed.POST("/settings/logs/clear", s.handleClearLogs)
+
+			authed.GET("/settings/firewall/bans", s.handleGetFirewallBans)
+			authed.POST("/settings/firewall/bans/clear", s.handleClearFirewallBans)
 
 			authed.POST("/settings/restart-now", s.handleRestartNow)
 
@@ -456,20 +473,33 @@ func (s *Server) requirePanelCertificateHost() gin.HandlerFunc {
 }
 
 // Start 启动面板监听（阻塞直至服务器关闭）。
+//
+// 自己 net.Listen 而不用 ListenAndServe，是为了在监听器外面包一层入站防火墙
+// （见 firewall.go）。这一层必须在 TLS 之前：被拒的连接直接 Close，
+// 于是既不会产出「TLS handshake error from …」这类告警，也不用为一个注定被拒的
+// 来源付一次完整的密钥协商。
 func (s *Server) Start() error {
+	s.logFirewallState()
 	s.deps.Log.Info("面板服务启动", "addr", s.http.Addr, "https", s.panelHTTPS)
-	var err error
+	ln, err := net.Listen("tcp", s.http.Addr)
+	if err != nil {
+		return err
+	}
+	ln = s.firewall.wrapListener(ln)
 	if s.panelHTTPS {
 		if _, certErr := s.panelCertificate(); certErr != nil {
+			_ = ln.Close()
 			return fmt.Errorf("面板 HTTPS 已启用，但所选证书无法加载: %w", certErr)
 		}
 		s.http.TLSConfig, err = s.panelTLSConfig()
 		if err != nil {
+			_ = ln.Close()
 			return err
 		}
-		err = s.http.ListenAndServeTLS("", "")
+		// 证书路径传空串：TLSConfig 里已经有 GetCertificate，标准库据此跳过从文件加载。
+		err = s.http.ServeTLS(ln, "", "")
 	} else {
-		err = s.http.ListenAndServe()
+		err = s.http.Serve(ln)
 	}
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil

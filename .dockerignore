@@ -21,6 +21,9 @@
 !README.md
 !README.en.md
 docs
+# README 里引用的界面截图。Dockerfile 不 COPY 任何图片，它只会白白进构建上下文
+# （400 KB 起，远程 buildx 是要连着上下文一起传的）。
+ui.png
 
 # ---- 测试文件：镜像构建只跑 go build，不跑 go test ----
 **/*_test.go

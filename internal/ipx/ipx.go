@@ -179,13 +179,61 @@ func ClientIP(r *http.Request) net.IP {
 	if err != nil {
 		host = r.RemoteAddr
 	}
-	return net.ParseIP(host)
+	return net.ParseIP(stripZone(host))
 }
 
-// RemoteHost 返回请求对端 IP 字符串（去掉端口）；解析失败时回退为原始 RemoteAddr。
+// stripZone 去掉 IPv6 地址字面量上的 %zone 后缀（如 fe80::1%eth0 → fe80::1）。
+//
+// 这一步不是美化，缺了它会把链路本地的对端整个判成"地址解析不出来"：
+// Go 从内核拿到的 sin6_scope_id 会进到 net.TCPAddr.Zone，于是 RemoteAddr 长成
+// `[fe80::1%eth0]:1234`，而 net.ParseIP("fe80::1%eth0") 返回 nil——所有按来源做的
+// 判定（面板入站防火墙的范围判定、反向代理与消息路由的 IP 名单、每 IP 限流分桶）
+// 都会因此把一个合法的局域网来源当成 nil 处理。
+//
+// 面板入站防火墙上这个缺陷最明显：连接层拿到的是 *net.TCPAddr，取 .IP 得到不带 zone 的
+// fe80::1，按局域网放行；请求层解析字符串却得到 nil，按失败关闭回 403。同一个来源
+// 在两层上判得不一样，而"仅局域网"恰恰是默认模式。
+//
+// 丢掉 zone 会让不同网卡上的同一个链路本地地址归成一个：对拒绝名单是收紧，
+// 对允许名单是放宽一点点。相比"所有带 zone 的对端一律拒绝"，这个取舍明显更该要。
+func stripZone(host string) string {
+	if i := strings.IndexByte(host, '%'); i >= 0 {
+		return host[:i]
+	}
+	return host
+}
+
+// IsLAN 判断 ip 是否属于「局域网 / 本机」这一侧：回环、私有网段（10/8、172.16/12、
+// 192.168/16、fc00::/7）、链路本地单播（169.254/16、fe80::/10）。
+//
+// 它是「面板只允许局域网访问」这条策略的唯一判定，因此边界要说清楚：
+//
+//   - **失败关闭**：ip 为 nil（对端地址解析不出来）返回 false，即按外网处理。
+//     反过来写就等于一个畸形的 RemoteAddr 能把整道策略绕过去。
+//   - **先归一到 4 字节**：不这么做的话 ::ffff:203.0.113.9 会走 IPv6 侧判定，
+//     既不是私有也不是回环——但它同样也不会被误判成局域网，所以这一步防的是相反方向：
+//     将来若有人往这里补 IPv4 网段判断，忘了归一就会漏掉映射地址那一种写法。
+//   - **不含运营商级 NAT（100.64.0.0/10）**：那是 ISP 的网，不是用户的局域网。
+//     把它算进来等于对整个运营商的用户池开门，与 netguard.IsPrivateOrReserved 的取舍不同——
+//     那边判的是「出站目标是否敏感」，宁可多算；这里判的是「谁可以进来」，只能少算。
+//   - **不含多播 / 未指定地址**：它们不会作为 TCP 对端出现，列进来只是噪声。
+func IsLAN(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	if v4 := ip.To4(); v4 != nil {
+		ip = v4
+	}
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
+}
+
+// RemoteHost 返回请求对端 IP 字符串（去掉端口与 IPv6 的 %zone）；解析失败时回退为原始 RemoteAddr。
+//
+// 与 ClientIP 同口径去掉 zone（理由见 stripZone）：这个函数的结果会当限流分桶键、
+// 会话粘滞的哈希键与日志里的来源用，同一个对端在这几处必须得出同一个字符串。
 func RemoteHost(remoteAddr string) string {
 	if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
-		return host
+		return stripZone(host)
 	}
 	return remoteAddr
 }

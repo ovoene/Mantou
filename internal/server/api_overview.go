@@ -1,6 +1,7 @@
 package server
 
 import (
+	"fmt"
 	"math"
 	"net/http"
 	"os"
@@ -116,6 +117,7 @@ func (s *Server) handleGetSettings(c *gin.Context) {
 		},
 		"security": gin.H{
 			"blockPrivateNetwork": cfg.Settings.Security.BlockPrivateNetwork,
+			"firewall":            firewallSettings(cfg.Settings.Security.Firewall),
 		},
 		"restart": restartSettings(cfg.Settings.Restart),
 		"certs":   s.certOptions(cfg),
@@ -197,9 +199,96 @@ type updateSettingsReq struct {
 		LoginLockMinutes   *int `json:"loginLockMinutes"`
 	} `json:"auth"`
 	Security *struct {
-		BlockPrivateNetwork bool `json:"blockPrivateNetwork"`
+		BlockPrivateNetwork bool         `json:"blockPrivateNetwork"`
+		Firewall            *firewallReq `json:"firewall"`
 	} `json:"security"`
 	Restart *restartReq `json:"restart"`
+}
+
+// firewallReq 面板入站防火墙的提交体。
+//
+// 数值字段一律用指针：0 在「每秒请求数」上是"不限速"这个有效选择，
+// 而在阈值/时长上则代表"没填"（由 normalize 回落到默认值）——两种含义都要求
+// 能区分"用户填了 0"与"这次提交没带这个字段"，按值接收就分不出来。
+type firewallReq struct {
+	Enabled          bool     `json:"enabled"`
+	Mode             string   `json:"mode"`
+	AllowIPs         []string `json:"allowIps"`
+	DenyIPs          []string `json:"denyIps"`
+	RateLimit        *int     `json:"rateLimit"`
+	AutoBan          bool     `json:"autoBan"`
+	AutoBanThreshold *int     `json:"autoBanThreshold"`
+	AutoBanMinutes   *int     `json:"autoBanMinutes"`
+
+	// Force 表示用户已经在界面上确认过「这会切断我自己的访问」。
+	//
+	// 有这个字段是因为自锁校验必须能被越过：一个正从公网管理面板的用户，完全可能
+	// 明知会失去当前入口也要切成"只允许局域网"（接下来改走 VPN / SSH 隧道）。
+	// 拦死等于替他做决定，而这个决定他有权做。默认拦下、确认后放行，
+	// 让"意外锁死"与"有意锁死"分开——前者是这道校验要防的，后者不是。
+	Force bool `json:"force"`
+}
+
+// policy 把提交体转成配置结构。指针字段缺省时沿用 cur（当前生效值），
+// 于是一次只带部分字段的提交不会把没带的那些重置掉。
+func (r *firewallReq) policy(cur config.PanelFirewall) config.PanelFirewall {
+	out := config.PanelFirewall{
+		Enabled:          r.Enabled,
+		Mode:             strings.TrimSpace(r.Mode),
+		AllowIPs:         r.AllowIPs,
+		DenyIPs:          r.DenyIPs,
+		AutoBan:          r.AutoBan,
+		RateLimit:        cur.RateLimit,
+		AutoBanThreshold: cur.AutoBanThreshold,
+		AutoBanMinutes:   cur.AutoBanMinutes,
+	}
+	if r.RateLimit != nil {
+		out.RateLimit = *r.RateLimit
+	}
+	if r.AutoBanThreshold != nil {
+		out.AutoBanThreshold = *r.AutoBanThreshold
+	}
+	if r.AutoBanMinutes != nil {
+		out.AutoBanMinutes = *r.AutoBanMinutes
+	}
+	return out
+}
+
+// checkLimits 在规范化之前拦下超限的名单。
+//
+// 必须在 normalize 之前：normalize 会把超长名单直接截断到上限，截完 Valid 就再也
+// 看不到超限，用户多填的那些条目会被静默丢掉（同 restartReq.checkLimits 的理由）。
+func (r *firewallReq) checkLimits() error {
+	if len(r.AllowIPs) > config.MaxFirewallIPs || len(r.DenyIPs) > config.MaxFirewallIPs {
+		return fmt.Errorf("名单最多 %d 条", config.MaxFirewallIPs)
+	}
+	return nil
+}
+
+// firewallSettings 把配置结构转成设置页需要的形状。
+func firewallSettings(fw config.PanelFirewall) gin.H {
+	allow := fw.AllowIPs
+	if allow == nil {
+		allow = []string{}
+	}
+	deny := fw.DenyIPs
+	if deny == nil {
+		deny = []string{}
+	}
+	return gin.H{
+		"enabled":          fw.Enabled,
+		"mode":             fw.Mode,
+		"allowIps":         allow,
+		"denyIps":          deny,
+		"rateLimit":        fw.RateLimit,
+		"autoBan":          fw.AutoBan,
+		"autoBanThreshold": fw.AutoBanThreshold,
+		"autoBanMinutes":   fw.AutoBanMinutes,
+		// 计数窗口是固定值，随设置一起下发，好让界面上那句「N 分钟内超限 M 次」
+		// 与服务端真正用的那个数同源，而不是前端自己抄一个。
+		"autoBanWindowMinutes": config.FirewallAutoBanWindowMinutes(),
+		"maxIps":               config.MaxFirewallIPs,
+	}
 }
 
 // handleUpdateSettings 更新通用设置。端口/路径前缀变更需重启方可生效，响应中以 restartRequired 标记。
@@ -319,6 +408,35 @@ func (s *Server) handleUpdateSettings(c *gin.Context) {
 		}
 	}
 
+	// 面板入站防火墙：同样先按加载期的规则规范化，再校验，最后确认它不会把
+	// 提交这次改动的人本人关在门外（见 checkFirewallLockout）。
+	//
+	// 三步的顺序不能换：checkLimits 要看未截断的原始名单，Valid 要看未被 normalize
+	// 改写的原始数值（否则用户填的负数会被悄悄夹成别的数、界面上却显示保存成功），
+	// 而自锁判断必须基于**规范化之后**的那份——真正生效的是它。
+	var firewallPolicy config.PanelFirewall
+	if req.Security != nil && req.Security.Firewall != nil {
+		fr := req.Security.Firewall
+		if verr := fr.checkLimits(); verr != nil {
+			respondError(c, http.StatusBadRequest, verr.Error())
+			return
+		}
+		firewallPolicy = fr.policy(before.Settings.Security.Firewall)
+		if verr := firewallPolicy.Valid(); verr != nil {
+			respondError(c, http.StatusBadRequest, verr.Error())
+			return
+		}
+		config.NormalizePanelFirewall(&firewallPolicy)
+		if !fr.Force {
+			if verr := checkFirewallLockout(firewallPolicy, c.Request); verr != nil {
+				// 409 而不是 400：这不是"参数写错了"，而是"参数没错，但后果需要你确认一次"。
+				// 前端据此弹确认框，确认后带 force 重提（见 firewallReq.Force）。
+				respondError(c, http.StatusConflict, verr.Error())
+				return
+			}
+		}
+	}
+
 	err := s.deps.Config.Update(func(cfg *config.Config) {
 		if req.Language != nil && (*req.Language == "zh-CN" || *req.Language == "en-US") {
 			cfg.Settings.Language = *req.Language
@@ -395,6 +513,9 @@ func (s *Server) handleUpdateSettings(c *gin.Context) {
 		}
 		if req.Security != nil {
 			cfg.Settings.Security.BlockPrivateNetwork = req.Security.BlockPrivateNetwork
+			if req.Security.Firewall != nil {
+				cfg.Settings.Security.Firewall = firewallPolicy
+			}
 		}
 		if req.Restart != nil {
 			// 执行记录沿用现值：它不来自请求（见 restartReq.policy 的说明）。
@@ -443,6 +564,9 @@ func (s *Server) handleUpdateSettings(c *gin.Context) {
 		before.Panel.HTTPS.Enabled != after.Panel.HTTPS.Enabled ||
 		before.Panel.HTTPS.CertID != after.Panel.HTTPS.CertID ||
 		before.Panel.HTTPS.Domain != after.Panel.HTTPS.Domain
+	// 入站防火墙**不在**这个清单里：它每次判定都现取配置快照（见 firewall.go 的
+	// panelFirewall.current），保存完下一个连接与下一个请求就按新规则走。
+	// 把它算进重启项只会让一次"加个白名单"变成一次面板重启。
 
 	respondOK(c, gin.H{"ok": true, "restartRequired": restartRequired})
 

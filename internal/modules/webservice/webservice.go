@@ -67,6 +67,9 @@ type Module struct {
 	// rateLimiter 每 IP 限流的桶表，全部子项共用一张（桶键 = 子项 ID + 来源 IP）。
 	// 与上面几项同理：跨 servers 重建保留，保存一次配置不该把所有来源的令牌加满。
 	rateLimiter *ipx.IPLimiter
+	// scanBan 公网扫描自动封禁的记账表（见 scanban.go）。同样跨 Reload 存活：
+	// 一次保存配置不该把正在封禁中的扫描器统统放出来。
+	scanBan *scanBanner
 	// 全局访问日志写速令牌桶：每秒至多记录 logGlobalRPS 条，防海量不同 IP 时写盘/CPU 被打爆。
 	logRate *logRateLimiter
 
@@ -140,37 +143,54 @@ func groupSignature(g *wsGroup) string {
 // New 创建 Web 服务模块。
 func New(log *logx.Logger) *Module {
 	m := &Module{
-		log:               log,
-		servers:           make(map[string]*listenServer),
-		conns:             make(map[string]*int64),
-		accessCap:         logx.DefaultLogEntries, // Reload / SetAccessCap 会按实际配置覆盖
-		linkStatus:        make(map[string]linkState),
-		linkLogState:      make(map[string]bool),
-		suppressor:        newLogSuppressor(),
-		logRate:           newLogRateLimiter(),
-		rateLimiter:       ipx.NewIPLimiter(),
-		probeStop:         make(chan struct{}),
-		probeKick:         make(chan struct{}, 1),
-		probeNext:         make(map[string]time.Time),
-		probeClientSecure: &http.Client{Timeout: probeTimeout},
-		probeClientInsecure: &http.Client{
-			Timeout: probeTimeout,
-			Transport: &http.Transport{
-				Proxy:                 http.ProxyFromEnvironment,
-				DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-				ForceAttemptHTTP2:     true,
-				MaxIdleConns:          10,
-				IdleConnTimeout:       90 * time.Second,
-				TLSHandshakeTimeout:   10 * time.Second,
-				ExpectContinueTimeout: 1 * time.Second,
-				TLSClientConfig:       &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // 由用户显式开启
-			},
-		},
+		log:                 log,
+		servers:             make(map[string]*listenServer),
+		conns:               make(map[string]*int64),
+		accessCap:           logx.DefaultLogEntries, // Reload / SetAccessCap 会按实际配置覆盖
+		linkStatus:          make(map[string]linkState),
+		linkLogState:        make(map[string]bool),
+		suppressor:          newLogSuppressor(),
+		logRate:             newLogRateLimiter(),
+		rateLimiter:         ipx.NewIPLimiter(),
+		scanBan:             newScanBanner(),
+		probeStop:           make(chan struct{}),
+		probeKick:           make(chan struct{}, 1),
+		probeNext:           make(map[string]time.Time),
+		probeClientSecure:   newProbeClient(false),
+		probeClientInsecure: newProbeClient(true),
 	}
 	// 启动周期主动探测（独立于真实流量与日志限速），Close 时通过 probeStop 退出并等待。
 	m.probeWG.Add(1)
 	go m.runProbe()
 	return m
+}
+
+// newProbeClient 造一个用于主动探测后端的 HTTP 客户端。insecure 为真时不校验后端证书
+// （由用户在子项上显式开启）。
+//
+// 两个客户端都刻意不用 http.ProxyFromEnvironment，理由与反代那条 Transport 完全一样
+// （见 handler.go 里 Proxy: nil 处的说明）：探测的目标就是反代要转发过去的那个后端地址，
+// 多半在内网，而宿主机上的 HTTP_PROXY / HTTPS_PROXY / ALL_PROXY 通常是给别的用途设的。
+// 采信它的话，界面上「后端连接正常」这句话说的其实是"那个第三方代理还活着"——
+// 后端早停了也照样显示绿的，而这一栏正是用来判断后端死活的。
+//
+// 从前这里两侧还各错一半：忽略证书那一版显式写着 ProxyFromEnvironment，另一版没给
+// Transport、于是用了同样采信环境变量的 http.DefaultTransport。合成一个构造函数之后，
+// 这条红线只有一处、两边不可能再走散。
+func newProbeClient(insecure bool) *http.Client {
+	tr := &http.Transport{
+		Proxy:                 nil,
+		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          10,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+	if insecure {
+		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // 由用户显式开启
+	}
+	return &http.Client{Timeout: probeTimeout, Transport: tr}
 }
 
 // SetCertResolver 注入证书解析器（由证书模块提供）。
@@ -390,6 +410,20 @@ func (m *Module) Close() error {
 	close(m.probeStop) // 通知探测 goroutine 退出
 	m.mu.Unlock()
 	m.probeWG.Wait() // 等待探测 goroutine 完全退出后再返回
+	// 主动探测那两个客户端的连接池同样要自己关（与 listener.close 里同一个道理：Go 不会
+	// 因为 Transport 没人引用了就关掉它池子里的空闲 socket，得等 IdleConnTimeout 90 秒到期）。
+	// 这里比监听那处更该收：自更新路径会先关模块再 exec 新二进制，留着的话新老进程会
+	// 在那 90 秒里同时握着连向同一批后端的连接。
+	//
+	// 从前这一步做不了：那时 probeClientSecure 没给 Transport，用的是共享的
+	// http.DefaultTransport，在它上面调 CloseIdleConnections 会把在线更新、通知推送、
+	// DDNS 正在复用的连接一并关掉，是净损失。现在两个客户端各有自己的 Transport
+	// （见 newProbeClient），关的只是自己那一份。
+	//
+	// 位置必须在 probeWG.Wait() 之后——那笔"往后变空闲的也关掉"的标记会被新请求清掉，
+	// 探测 goroutine 还活着就等于这一步可能白做。
+	m.probeClientSecure.CloseIdleConnections()
+	m.probeClientInsecure.CloseIdleConnections()
 	return nil
 }
 

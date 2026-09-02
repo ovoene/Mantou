@@ -34,6 +34,7 @@ func initSetupEnv(t *testing.T, mutate func(cfg *config.Config)) (*config.Manage
 	if err := manager.Load(); err != nil {
 		t.Fatal(err)
 	}
+	firewallOff(t, manager)
 	if mutate != nil {
 		// Update 刻意不跑 migrate，所以这里能造出「标记为假但账户仍在」这种
 		// 只有外部配置才带得进来的状态——否则这个测试根本没有被测对象。

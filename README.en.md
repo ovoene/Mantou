@@ -6,6 +6,8 @@ English · [简体中文](./README.md)
 
 > What you get is **one executable file**: the web interface is already packed inside it, so there's no separate database or middleware to install. Docker works too.
 
+![The mantou admin panel](./ui.png)
+
 ## Features
 
 - **Overview** — see this machine's processor / memory / disk usage at a glance, plus upload and download speed with trend charts, and basic system info.

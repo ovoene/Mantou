@@ -31,6 +31,7 @@ func panelEngineWithWeb(t *testing.T, extra map[string][]byte) (*Server, *gin.En
 	if err := manager.Load(); err != nil {
 		t.Fatal(err)
 	}
+	firewallOff(t, manager)
 	s := New(Deps{Config: manager, Log: logx.New(logx.Options{}), WebFS: web})
 	engine, ok := s.http.Handler.(*gin.Engine)
 	if !ok {
@@ -233,6 +234,7 @@ func TestAssetCacheHeadersUnderBasePath(t *testing.T) {
 	if err := manager.Update(func(cfg *config.Config) { cfg.Panel.BasePath = "/mymantou" }); err != nil {
 		t.Fatal(err)
 	}
+	firewallOff(t, manager)
 	web := fstest.MapFS{
 		"index.html":               &fstest.MapFile{Data: []byte("<html><head></head><body></body></html>")},
 		"assets/index-CzWb1vaS.js": &fstest.MapFile{Data: []byte("console.log(1)")},

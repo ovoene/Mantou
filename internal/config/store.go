@@ -18,7 +18,7 @@ import (
 )
 
 // CurrentVersion 是当前配置结构版本，用于将来做迁移。
-const CurrentVersion = 9
+const CurrentVersion = 10
 
 // Manager 负责配置的加载、持久化与线程安全访问。
 type Manager struct {
@@ -510,6 +510,7 @@ func Default() *Config {
 				HomeLimit:  DefaultLogHomeLimit, // 总览页日志默认显示最近 50 条
 			},
 			Appearance: defaultAppearance(),
+			Security:   Security{Firewall: defaultPanelFirewall()},
 			Restart:    defaultRestart(),
 		},
 		Credentials:  []Credential{},
@@ -663,6 +664,26 @@ func migrate(c *Config) {
 		// 而设置页上只会显示一个 0，看不出发生过什么。
 		c.Auth.SessionIdleMinutes = DefaultSessionIdleMinutes
 	}
+	if c.Version < 10 {
+		// v10 升级：新增面板入站防火墙（settings.security.firewall）。
+		//
+		// 这一块把它显式置为**关闭**，而全新安装（Default）是**开启 + 只允许局域网**。
+		// 两边不一致是有意的，也是这次改动里唯一一处刻意的偏离，理由：
+		//
+		// 从公网管理面板是一种正当且常见的部署（VPS 上装一台就是这样）。如果升级把
+		// "只允许局域网"一并打开，这批用户会在重启后**立刻失去唯一的入口**，
+		// 而失去的方式还特别难查——不是报错页，是连接直接被关掉，看起来就像服务没起来。
+		// 一次版本升级不该有能力做这个决定。
+		//
+		// 反过来对全新安装启用默认值则没有这个问题：那台机器还没有人在用它，
+		// 装完第一件事本来就是打开面板做初始化，此刻发现"外网进不来"是一条明确的信息，
+		// 而不是一次失联。启动日志也会把放开的办法直接写出来（server.logFirewallState）。
+		//
+		// 其余字段仍写入默认值：开关关着的时候它们不影响任何行为，
+		// 但用户进设置页打开这个开关时，看到的应该是一组合理的初值而不是一排 0。
+		c.Settings.Security.Firewall = defaultPanelFirewall()
+		c.Settings.Security.Firewall.Enabled = false
+	}
 	if c.Version < CurrentVersion {
 		c.Version = CurrentVersion
 	}
@@ -791,6 +812,11 @@ func migrate(c *Config) {
 		c.Settings.Restart = defaultRestart()
 	}
 	normalizeRestart(&c.Settings.Restart)
+	// 面板入站防火墙：统一模式取值、夹住数值、整理名单（见 firewall.go 顶部说明）。
+	// 无条件执行的理由同上，但这一处更要紧——它是访问控制：
+	// 一个手改成 "Lan" 的 mode、一个负数限速、或一份两万条的名单，
+	// 都不该让「谁能进面板」这件事变成未定义行为。
+	normalizePanelFirewall(&c.Settings.Security.Firewall)
 }
 
 // clampInt 把 v 夹到 [lo, hi] 区间内。

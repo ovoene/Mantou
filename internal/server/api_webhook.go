@@ -1331,8 +1331,9 @@ func (s *Server) handleNotifyTest(c *gin.Context) {
 		if !config.ValidMarkdownTitleStyle(body.TitleStyle) {
 			body.TitleStyle = config.DefaultMarkdownTitleStyle
 		}
-		// 与真实投递走同一个拼法，否则用户用测试调出来的样式，真发时又变了。
-		msg = webhook.MarkdownTitled(msg, title, body.TitleStyle)
+		// 与真实投递走同一个拼法（换行补空行 → 拼标题），
+		// 否则用户用测试调出来的样式，真发时又变了。
+		msg = webhook.MarkdownTitled(webhook.MarkdownBreaks(msg), title, body.TitleStyle)
 	}
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), time.Duration(config.MaxNotifyTimeoutSec)*time.Second)

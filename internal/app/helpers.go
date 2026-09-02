@@ -12,6 +12,7 @@ import (
 
 	"mantou/internal/config"
 	"mantou/internal/modules/notify"
+	"mantou/internal/modules/webhook"
 	"mantou/internal/modules/wol"
 	"mantou/internal/netguard"
 	"mantou/internal/strutil"
@@ -174,11 +175,19 @@ func sendNotifyAction(ctx context.Context, mod *notify.Module, action config.Cro
 		return "", fmt.Errorf("未选择通知目标")
 	}
 
+	format := strings.TrimSpace(action.Params["format"])
+	if format == "markdown" {
+		// 与消息路由那侧同一条规矩：markdown 里单个换行是软换行，发出去会被折成空格。
+		// 计划任务的正文是在一个多行输入框里手写的，用户按下回车得到的就是单个 \n，
+		// 不补的话一份巡检报告到群里会挤成一行（见 webhook.MarkdownBreaks）。
+		msg = webhook.MarkdownBreaks(msg)
+	}
+
 	results, err := mod.Send(ctx, notify.Request{
 		TargetIDs: ids,
 		Title:     strings.TrimSpace(action.Params["title"]),
 		Message:   msg,
-		Format:    strings.TrimSpace(action.Params["format"]),
+		Format:    format,
 		Source:    "计划任务",
 	})
 	if err != nil {

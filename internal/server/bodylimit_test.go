@@ -23,6 +23,7 @@ func panelEngine(t *testing.T, basePath string) (*Server, *gin.Engine) {
 	if err := manager.Load(); err != nil {
 		t.Fatal(err)
 	}
+	firewallOff(t, manager)
 	if basePath != "" {
 		if err := manager.Update(func(cfg *config.Config) { cfg.Panel.BasePath = basePath }); err != nil {
 			t.Fatal(err)

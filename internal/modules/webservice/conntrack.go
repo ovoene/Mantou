@@ -6,11 +6,13 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-// 本文件是监听层的两道收尾保护：连接台账（停机时能真正把连接关掉）与请求体停滞超时。
-// 两件事都只在 listenServer 内部用（见 listener.go 的 start / close / handler）。
+// 本文件是监听层的三道收尾保护：连接台账（停机时能真正把连接关掉）、请求体停滞超时，
+// 以及对称的响应体写入停滞超时。前两件只在 listenServer 内部用（见 listener.go 的
+// start / close / handler），第三件由 statusWriter 驱动（见 handler.go）。
 
 // bodyStallTimeout 请求体两次「读到了东西」之间允许的最长间隔。
 //
@@ -179,3 +181,87 @@ func (b *progressBody) Close() error {
 }
 
 func (b *progressBody) clear() { _ = b.rc.SetReadDeadline(time.Time{}) }
+
+// writeStallTimeout 一次写操作允许卡住多久。
+//
+// 这道闸补的是 bodyStallTimeout 的对称缺口。请求体那侧已经看住了「发一半就不动」，
+// 响应体这侧此前什么都没有：客户端发一个完全正常的请求要一个大文件，然后**不读**
+// （或者每分钟读一个字节），服务端的写就卡在满掉的发送缓冲上，无限期地占着
+// 一条连接、一个 goroutine 与它的读写缓冲。这条监听的并发连接数是有上限的
+// （maxConnsPerListener = 2000），而 LimitListener 超限时是让 Accept **阻塞**——
+// 于是两千条赖着不读的连接就能让正常访客一个都连不进来。这类手法有现成的名字
+// （slow read / slowloris 的下行版本），成本对攻击方近乎为零：只要不调用 recv。
+//
+// 取值与 bodyStallTimeout 一致（60 秒），语义也一致：不是总时长上限，而是
+// 「一段之内必须有进展」。整段逻辑见 statusWriter.Write 与 statusWriter.ReadFrom。
+const writeStallTimeout = 60 * time.Second
+
+// writeChunkBytes 委托给底层 ReaderFrom（sendfile 零拷贝）时，一次最多交出去多少字节。
+//
+// 为什么必须分段：写超时是**绝对时刻**，而 sendfile 一次调用可以把整个文件推完。
+// 不分段就等于给整次下载设了 60 秒总时限，一个 2 GB 的备份包必然被掐断。
+// 分段之后每段之前重设一次超时，于是"有进展就续期"这个语义在零拷贝路径上也成立。
+//
+// 段长的另一面是它给传输速率划了一条下限：一段必须在 writeStallTimeout 内走完，
+// 因此持续速率低于 64 KiB / 60 s ≈ 1.1 KB/s（约 9 kbps）的连接会被切掉。
+// 这条线刻意压得比任何还能用的网络都低——2G 都在它十倍以上——所以它切掉的
+// 只会是"故意不读"的那一类。段长同时也就是 Write 那侧的天然粒度
+// （io.CopyBuffer 与 ReverseProxy 的复制缓冲都是 32 KiB），两侧口径因此一致。
+const writeChunkBytes = 64 << 10
+
+// writeGuard 给一次响应的写入装上停滞超时。
+//
+// 用法是「每次写之前 arm、写完 disarm」，而不是一开始设一个总时限：
+// 两次写**之间**的空闲不该被管——那是服务端自己的事（反代在等上游、SSE 在等下一个
+// 事件），而这道闸要防的是"写不出去"。把空闲也算进来会把长轮询与 SSE 一并切掉。
+//
+// 零值不可用；nil 接收者表示"这次响应不设这道闸"，全部方法都对 nil 安全。
+type writeGuard struct {
+	rc *http.ResponseController
+	// off 底层 ResponseWriter 不支持写超时（httptest.ResponseRecorder 就是），
+	// 第一次失败之后就不再重试——否则每个写都要白跑一次穿透 Unwrap 链的查找。
+	off atomic.Bool
+}
+
+// newWriteGuard 为这次响应造一道写停滞超时。
+//
+// w 必须是 Server 交给最外层处理器的那个原始 ResponseWriter：超时要落到连接
+// （HTTP/2 下是这条流）上。返回 nil 表示这次请求不设这道闸。
+func newWriteGuard(w http.ResponseWriter, r *http.Request) *writeGuard {
+	// 协议升级（WebSocket）跳过，理由同 guardBodyRead：握手成功后连接被 Hijack 走，
+	// 之后的收发不再经过 ResponseWriter，而设在连接上的超时会留在那条连接上，
+	// 把之后每一次安静超过一分钟的长连接切掉。
+	if isUpgradeRequest(r) {
+		return nil
+	}
+	return &writeGuard{rc: http.NewResponseController(w)}
+}
+
+// arm 把写超时设到 now + writeStallTimeout。紧贴着一次会阻塞的写调用之前。
+func (g *writeGuard) arm() {
+	if g == nil || g.off.Load() {
+		return
+	}
+	if err := g.rc.SetWriteDeadline(time.Now().Add(writeStallTimeout)); err != nil {
+		g.off.Store(true)
+	}
+}
+
+// disarm 撤掉写超时。写调用返回后立刻撤，让两次写之间的空闲不受管辖。
+//
+// 撤这一步不能省：超时设在连接上，留着就会管到后面的事情上去——最直接的后果是
+// keep-alive 的下一个请求刚开始就带着一个已经过期的写超时。
+func (g *writeGuard) disarm() {
+	if g == nil || g.off.Load() {
+		return
+	}
+	if err := g.rc.SetWriteDeadline(time.Time{}); err != nil {
+		g.off.Store(true)
+	}
+}
+
+// writeOnly 只暴露 Write，用来阻断 io.Copy 挑中 ReadFrom 造成的递归。
+// （internal/errpage 里有一个同名的同款，两处都只在自己包内用，不值得为它再起一个包。）
+type writeOnly struct{ w io.Writer }
+
+func (o writeOnly) Write(b []byte) (int, error) { return o.w.Write(b) }

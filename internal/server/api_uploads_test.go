@@ -43,6 +43,7 @@ func uploadsEnv(t *testing.T, basePath string, files map[string][]byte) (*gin.En
 	if err := manager.Load(); err != nil {
 		t.Fatal(err)
 	}
+	firewallOff(t, manager)
 	hash, err := auth.HashPassword(testLoginPass)
 	if err != nil {
 		t.Fatal(err)

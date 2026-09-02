@@ -37,13 +37,29 @@ export function setUnauthorizedHandler(fn: () => void) {
   onUnauthorized = fn
 }
 
+// ApiError 在 Error 之外多带一个 HTTP 状态码。
+//
+// 之前拦截器只把错误消息包成 Error 抛出，状态码就此丢掉——于是调用方只能靠比对
+// 报错文案来区分错误种类，而那串文案是会被翻译、会被改写的。
+// 需要区分的场合确实存在：入站防火墙保存时的 409 表示「参数没错，但后果要你确认一次」，
+// 界面据此弹确认框；同一处的 400 是「参数写错了」，只该直接把消息显示出来。
+// 仍然继承 Error，因此所有只读 e.message 的既有代码不受影响。
+export class ApiError extends Error {
+  status: number
+  constructor(message: string, status: number) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+  }
+}
+
 http.interceptors.response.use(
   (resp) => resp,
   (err) => {
     const status = err?.response?.status
     if (status === 401 && onUnauthorized) onUnauthorized()
     const msg = err?.response?.data?.error || err?.message || '请求失败'
-    return Promise.reject(new Error(msg))
+    return Promise.reject(new ApiError(msg, typeof status === 'number' ? status : 0))
   },
 )
 

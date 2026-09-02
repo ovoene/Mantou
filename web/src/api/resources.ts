@@ -32,6 +32,15 @@ export interface StorageItem {
   note?: string
 }
 
+// 入站防火墙的一条自动封禁记录。时间为 Unix 秒。
+// rounds 是该地址累计被封的次数，用来在界面上区分"偶发误伤"与"一直在敲门的那个"。
+export interface FirewallBan {
+  ip: string
+  bannedAt: number
+  until: number
+  rounds: number
+}
+
 // DNS 服务商元信息（供前端动态渲染凭证表单）。
 export interface ProviderField {
   key: string
@@ -179,4 +188,11 @@ export const actions = {
   // 立即重启整个程序（换掉进程，不是面板内部重启）。
   // 响应先回、进程后换，因此这个请求会正常返回，随后连接才断开。
   restartNow: () => api.post<{ ok: boolean; restarting: boolean }>(`/settings/restart-now`),
+  // 入站防火墙当前仍在生效的自动封禁。只读内存（封禁不落盘），total 是实际总数，
+  // items 最多 limit 条——攻击规模上去之后不会把整张表都发给设置页。
+  firewallBans: () =>
+    api.get<{ items: FirewallBan[]; total: number; limit: number }>(`/settings/firewall/bans`),
+  // 解除封禁：带 ip 解除单个，不带则全部解除。
+  clearFirewallBans: (ip?: string) =>
+    api.post<{ ok: boolean; cleared: number }>(`/settings/firewall/bans/clear`, ip ? { ip } : {}),
 }

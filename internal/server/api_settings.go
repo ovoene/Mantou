@@ -247,6 +247,23 @@ func (s *Server) handleImportConfig(c *gin.Context) {
 			target.Panel.Port = before.Panel.Port
 		}
 	}
+	// 入站防火墙：与面板端口同一类风险，而且更隐蔽。备份里那份策略是在**另一台机器**上
+	// 定下的——"只允许局域网"在做备份的那台上完全成立，在这台上就可能等于"把正在导入的人
+	// 关在门外"。落盘之后的下一个请求就按新策略判（防火墙每次判定现取配置快照），
+	// 于是用户看到的是"导入成功"，然后再也打不开面板。
+	//
+	// 处置与端口那一支同口径，理由也一样：不报错。用户手上只有一份加密备份，改不动里面的
+	// 策略，报错等于让他彻底导不进来。保留本机当前的防火墙策略、其余照常导入，并记一条日志。
+	//
+	// 保存设置那条路径上，同样的判定是回 409 让用户确认（见 checkFirewallLockout 与
+	// firewallReq.Force）——那里用户手里有输入框，能改；这里没有，所以只能替他保守处理。
+	if scope[modPanel] {
+		if verr := checkFirewallLockout(target.Settings.Security.Firewall, c.Request); verr != nil {
+			s.deps.Log.Warn("备份里的入站防火墙策略会切断你当前的访问，已保留本机现有策略",
+				"reason", verr.Error())
+			target.Settings.Security.Firewall = before.Settings.Security.Firewall
+		}
+	}
 	// 导入的配置没经过任何接口层校验：备份可能来自另一台机器、也可能被手工改过。
 	// 发送参数非法的网络唤醒设备在这里就地禁用（口径与启动时的 app.SanitizeWOLDevices 同源），
 	// 免得一份带病的备份导入完就开始每拍发一次注定失败、甚至打到公网的包。

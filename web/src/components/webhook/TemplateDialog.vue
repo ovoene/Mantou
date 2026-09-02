@@ -284,6 +284,10 @@ function pickList(m: FieldMapping) {
 
 // 换行按各家的规矩插：钉钉 markdown 里单个 \n 不换行，得空一行；
 // 企业微信 markdown 与纯文本单个 \n 就够。用户不该去记这个差别。
+//
+// 后端在发出前还会把正文里剩下的单个 \n 补成空行（webhook.MarkdownBreaks，
+// 载荷自带的换行只能在那边补）。这里插的 \n\n 两侧已经是空行，那一步不会再动它，
+// 所以两者叠在一起也不会多出空行。
 function insertBreak() {
   insert(br())
 }

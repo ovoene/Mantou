@@ -82,11 +82,23 @@ func (m *Module) instrument(service string, ch config.WebChild, counter *int64, 
 		atomic.AddInt64(counter, 1)
 		defer atomic.AddInt64(counter, -1)
 		start := time.Now()
-		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK, wg: newWriteGuard(w, r)}
+		// 兜底撤闸：Write / ReadFrom 里每段都是"上闸—写—撤闸"配对的，唯一漏掉的可能是
+		// 中途 panic。写超时设在连接上，带着它离场会让这条 keep-alive 连接上的下一个请求
+		// 一开始就撞到一个已经过期的超时。
+		defer sw.wg.disarm()
 		next.ServeHTTP(sw, r)
 		dur := time.Since(start).Milliseconds()
 		now := time.Now()
 		ip := remoteIP(r)
+		// 扫描封禁记账（见 scanban.go）。必须放在下面那条 403 的提前 return 之前——
+		// IP 规则拒绝正好是扫描器最常撞上的一种 403，从这里漏掉它等于把最该记的那批放过去。
+		// 闸门本身在监听层（见 listenServer.handler），这里只负责记账。
+		if scanBanCountable(sw) {
+			if until, newly := m.scanBan.strike(r, now); newly {
+				m.recordScanBan(service, childID, ip, until)
+			}
+		}
 		// 判定事件类型：客户端主动挂断 → 断开；状态码 ≥400 → 错误；其余 → 连接（新连接 / 在途活动）。
 		kind := eventConnect
 		status := 0
@@ -612,12 +624,16 @@ func redirectHandler(ch config.WebChild) http.Handler {
 
 // statusWriter 包裹 ResponseWriter 以捕获状态码，同时透传 Flush/Hijack，
 // 保证流式响应与 WebSocket 升级（反向代理）不受影响。
+// 另外它是响应体写入停滞超时的落点（见 wg 与 conntrack.go 的 writeGuard）。
 type statusWriter struct {
 	http.ResponseWriter
 	status        int
 	wrote         bool
 	clientAborted bool   // 反向代理过程中客户端主动断开（context canceled 等）
 	errMsg        string // 上游错误原文（ErrorHandler 捕获的 err.Error()），供 instrument 写入 AccessEntry.Reason
+	// wg 写入停滞超时。nil 表示这次响应不设（协议升级请求，或直接组装 statusWriter 的测试），
+	// 它的全部方法都对 nil 安全，所以下面不必逐处判空。
+	wg *writeGuard
 }
 
 func (s *statusWriter) WriteHeader(code int) {
@@ -632,19 +648,43 @@ func (s *statusWriter) Write(b []byte) (int, error) {
 	if !s.wrote {
 		s.wrote = true
 	}
-	return s.ResponseWriter.Write(b)
+	// 写之前上闸、写完立刻撤（见 conntrack.go 的 writeGuard）。故意不写成 defer：
+	// 这是每个响应体分片都会走一遍的热路径，而 defer 在这里除了排版好看没有别的用处
+	// ——真正需要兜住 panic 的那一处在 instrument 里（那里有一条 defer sw.wg.disarm()）。
+	s.wg.arm()
+	n, err := s.ResponseWriter.Write(b)
+	s.wg.disarm()
+	return n, err
 }
 
+// Flush 同样要上闸。这不是为了对称好看，而是补一个真实的缺口：
+//
+// net/http 的 *response 先把小块写进一个 2 KB 的 bufio，只有攒够或显式 Flush 时才真正
+// 往 socket 上写。于是「小块 + Flush」这种形态（SSE、以及 ReverseProxy 给流式响应装的
+// maxLatencyWriter）里，那次**会阻塞的**写落在 Flush 里而不是 Write 里——只管 Write 的话，
+// 一个订了 SSE 之后就不再 recv 的客户端照样能把一条连接和一个 goroutine 无限期占住，
+// 正是 writeGuard 要防的那件事。大块写（≥2 KB，静态文件与反代的 32 KiB 复制缓冲）绕过
+// 缓冲直接下到 socket，那一侧由 Write 管着。
+//
+// 撤闸之后两次 Flush 之间的空闲照旧不受管辖，SSE 干等下一个事件不会被切。
 func (s *statusWriter) Flush() {
-	if f, ok := s.ResponseWriter.(http.Flusher); ok {
-		f.Flush()
+	f, ok := s.ResponseWriter.(http.Flusher)
+	if !ok {
+		return
 	}
+	s.wg.arm()
+	f.Flush()
+	s.wg.disarm()
 }
 
 // ReadFrom 把响应体复制委托给底层 ResponseWriter 的 io.ReaderFrom 实现。
 // 这对静态文件服务至关重要：net/http 的 *response 实现了 io.ReaderFrom，当源是 *os.File
 // 时会走 sendfile(2) 零拷贝；若包装层只提供 Write，http.ServeContent 内部的 io.Copy 就会
 // 退化为「用户态 32 KB 缓冲循环」，大文件下载的吞吐与 CPU 占用都明显变差。
+//
+// 分段是写入停滞超时的需要：sendfile 一次调用能把整个文件推完，不分段就等于给整次下载
+// 设了一个总时限（见 writeChunkBytes）。分段之后每段之前重新上闸，"有进展就续期"这个
+// 语义在零拷贝路径上同样成立，而每段仍然是一次真正的 sendfile。
 func (s *statusWriter) ReadFrom(src io.Reader) (int64, error) {
 	if !s.wrote {
 		s.wrote = true
@@ -652,10 +692,61 @@ func (s *statusWriter) ReadFrom(src io.Reader) (int64, error) {
 			s.status = http.StatusOK
 		}
 	}
-	if rf, ok := s.ResponseWriter.(io.ReaderFrom); ok {
-		return rf.ReadFrom(src)
+	rf, ok := s.ResponseWriter.(io.ReaderFrom)
+	if !ok {
+		// 底层没有 ReaderFrom：退回逐块写，让每块都经过上面那个带闸的 Write。
+		// 必须套一层只有 Write 的壳——io.Copy 会优先挑 dst 的 ReadFrom，
+		// 直接传 s 进去就是自己调自己，无限递归。
+		return io.Copy(writeOnly{w: s}, src)
 	}
-	return io.Copy(s.ResponseWriter, src)
+	if s.wg == nil {
+		return rf.ReadFrom(src) // 这次响应没有这道闸，原样委托，一次推完
+	}
+	// src 已经是 *io.LimitedReader 时**借用**它、只改 N，不再往外包一层。
+	//
+	// 这一步是零拷贝能不能成立的关键：net.sendFile 只认得剥掉**一层**
+	// *io.LimitedReader 之后是不是 *os.File，多包一层它就认不出来，于是静默退化成
+	// 用户态复制循环。而 http.ServeContent 一律走 io.CopyN，所以这条路上传进来的
+	// 正是 *io.LimitedReader{R: *os.File}——恰好是必须小心的那种形态。
+	// 另外 sendfile 自己会把 lr.N 减掉已写的字节数，所以每段之后要按 full 重新算。
+	if lr, isLimited := src.(*io.LimitedReader); isLimited {
+		var total int64
+		for lr.N > 0 {
+			full := lr.N
+			if full > writeChunkBytes {
+				lr.N = writeChunkBytes
+			}
+			s.wg.arm()
+			n, err := rf.ReadFrom(lr)
+			s.wg.disarm()
+			total += n
+			lr.N = full - n
+			if err != nil {
+				return total, err
+			}
+			if n == 0 {
+				return total, nil // 源提前枯竭：再转一圈也拿不到东西，避免空转
+			}
+		}
+		return total, nil
+	}
+	// 其余来源（反代已由自己的复制循环走 Write，这里主要是测试与将来的调用方）：
+	// 复用同一个 LimitedReader，每段重设额度，避免每段一次分配。
+	lr := &io.LimitedReader{R: src}
+	var total int64
+	for {
+		lr.N = writeChunkBytes
+		s.wg.arm()
+		n, err := rf.ReadFrom(lr)
+		s.wg.disarm()
+		total += n
+		if err != nil {
+			return total, err
+		}
+		if n < writeChunkBytes {
+			return total, nil // 没把这一段填满 == 源到底了
+		}
+	}
 }
 
 // Unwrap 供 http.ResponseController 穿透包装层访问底层 ResponseWriter，

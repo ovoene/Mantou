@@ -149,15 +149,70 @@ func renderBranch(ev *event, ru *branchRT) (title, body string, missing int, tru
 			err = terr
 		}
 	}
-	// markdown 的标题要真正写进正文（钉钉的 markdown.title 只显示在会话列表里，
-	// 企业微信连这个字段都没有）。样式由模板上的选项决定，见 MarkdownTitled。
 	if ru.format == "markdown" {
+		// 先把正文里的单个换行补成 markdown 真正认的换行，再拼标题。
+		// 顺序不能反：MarkdownTitled 自己加的那个空行已经是正确形态，
+		// 不该再进一遍扫描（见 MarkdownBreaks）。
+		body = MarkdownBreaks(body)
+		// markdown 的标题要真正写进正文（钉钉的 markdown.title 只显示在会话列表里，
+		// 企业微信连这个字段都没有）。样式由模板上的选项决定，见 MarkdownTitled。
 		body = MarkdownTitled(body, title, ru.titleStyle)
 	}
 	if body == "" && err == nil {
 		err = errors.New("模板渲染结果为空，未投递")
 	}
 	return title, body, missing, truncated, err
+}
+
+// MarkdownBreaks 把正文里的单个换行补成 markdown 真正认的换行（空行）。
+//
+// # 为什么必须做
+//
+// 钉钉与企业微信都按 markdown 解析正文，而 markdown 里段落内的单个换行是**软换行**，
+// 渲染时会被折成一个空格。于是一段本来分了五行的正文发出去挤成一行——这不是"样式
+// 不好看"，是内容读不了。这个坑项目里早就知道：MarkdownTitled 给标题后面加的那个
+// 空行、界面上「换行」按钮在 markdown 下插的 \n\n（见 TemplateDialog.vue 的 br），
+// 都是同一件事的手工版。少的那一块是**正文自己带进来的换行**：
+// {{.body.text}} 这类取值，换行是上游 JSON 里的 \r\n，用户没有地方去手动加空行。
+//
+// # 规则
+//
+// 先把 \r\n 与单独的 \r 归一成 \n（Windows 侧的来源系统发的就是 \r\n），
+// 然后在**前后两行都有内容**时补一个空行。一侧已经是空行（或只有空白）说明这里本来
+// 就断开了，再补只会多出一整段空白。
+//
+// 这条规则是幂等的，这正是它能与界面上那个「换行」按钮共存的原因：按钮插的 \n\n
+// 两侧看到的是一个空行，不满足"前后都有内容"，原样留下。已经调好的模板不会因为
+// 这次改动多出空行，重复跑多少遍结果也一样。
+//
+// # 为什么是空行而不是行尾两个空格
+//
+// 两个空格 + 换行是 CommonMark 的硬换行写法，但钉钉与企业微信的 markdown 都只实现了
+// 一个子集，项目里一贯按"空行"这条来（三处文案与 MarkdownTitled 都是），
+// 换一种写法等于让同一个界面上出现两套换行规矩。
+//
+// 表格与围栏代码块这两种"必须逐行紧挨"的语法不作特例：钉钉与企业微信的 markdown
+// 都不支持它们，为一个渲染不出来的东西留特例，只会把这里唯一的一条规则变成两条。
+func MarkdownBreaks(s string) string {
+	if !strings.ContainsAny(s, "\n\r") {
+		return s
+	}
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	lines := strings.Split(s, "\n")
+	var b strings.Builder
+	// 最坏情况是每一行之间都要补一个字节。
+	b.Grow(len(s) + len(lines))
+	for i, line := range lines {
+		if i > 0 {
+			b.WriteByte('\n')
+			if strings.TrimSpace(lines[i-1]) != "" && strings.TrimSpace(line) != "" {
+				b.WriteByte('\n')
+			}
+		}
+		b.WriteString(line)
+	}
+	return b.String()
 }
 
 // MarkdownTitled 把标题按 style 拼到正文前面。

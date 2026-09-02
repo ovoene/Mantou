@@ -202,6 +202,96 @@ type Security struct {
 	//
 	// 默认关闭，以兼容目标本就位于内网的自建取址 / 回调场景。
 	BlockPrivateNetwork bool `json:"blockPrivateNetwork"`
+
+	// Firewall 面板入站防火墙。与 BlockPrivateNetwork 正好是相反的两个方向：
+	// 那个管「本机能往哪儿发」，这个管「谁能连进面板」。
+	Firewall PanelFirewall `json:"firewall"`
+}
+
+// 面板入站防火墙的取值边界。数字都写成常量，是因为它们要在三处保持一致：
+// normalizePanelFirewall 的夹取、API 层的入参校验、前端输入框的 min/max。
+const (
+	// MaxFirewallIPs 单张名单（允许 / 拒绝各一张）最多多少条。
+	// 这是一条内存与解析成本的护栏：一条「a-b」范围在 ipx.ParseCIDRs 里最多展开成
+	// 4096 个单 IP，256 条全写成范围就是百万级条目，而名单是每次配置变更时全量重建的。
+	MaxFirewallIPs = 256
+	// DefaultFirewallRateLimit 每个来源 IP 每秒允许的请求数。
+	//
+	// 60 是照着「面板正常使用」定的：首屏会并发拉十来个接口，仪表盘还有若干秒级轮询，
+	// 突发几十次很常见；令牌桶按秒补充，持续 60 QPS 的正常人类操作不存在。
+	DefaultFirewallRateLimit = 60
+	// MaxFirewallRateLimit 每秒请求数上限。10000 远超任何面板的真实用量，
+	// 设上限只是为了让「限速」不会被填成一个溢出后变负数的值。
+	MaxFirewallRateLimit = 10000
+	// DefaultFirewallAutoBanThreshold 触发自动封禁所需的「超限次数」。
+	//
+	// 计的是被限速拦下的次数，不是请求总数：正常客户端偶尔撞一两次上限很常见
+	// （刷新过猛、浏览器并发预取），20 次意味着对方在持续超速而不是抖了一下。
+	DefaultFirewallAutoBanThreshold = 20
+	// MaxFirewallAutoBanThreshold 超限次数阈值上限。
+	MaxFirewallAutoBanThreshold = 100000
+	// DefaultFirewallAutoBanMinutes 自动封禁时长（分钟）。
+	DefaultFirewallAutoBanMinutes = 60
+	// MaxFirewallAutoBanMinutes 自动封禁时长上限，30 天。
+	//
+	// 不提供「永久」：自动封禁是靠机器判断下的手，判错的代价是把人关在门外，
+	// 而这道门后面没有别的入口。有限期意味着任何误判都会自己愈合。
+	// 真要永久封，请写进拒绝名单——那是人做的决定。
+	MaxFirewallAutoBanMinutes = 43200
+)
+
+// PanelFirewall 面板入站防火墙：只管「谁能连到面板」，不涉及本机其他端口，
+// 也不改动系统防火墙——它是本进程自己在监听器与请求入口上的判断。
+//
+// 决策顺序是这份设计的核心，实现见 server.panelFirewall.decide，顺序为：
+//
+//	回环放行（仅豁免 Mode 与自动封禁）→ 拒绝名单 → 自动封禁表 → 允许名单 → Mode → 限速
+//
+// 三处细节值得在类型上就写明：
+//
+//   - **拒绝优先于允许**，与 WebAccess 的 withIPFilter 同向：名单相互矛盾时，
+//     「拦下」是那个可以事后放开的选择。
+//   - **允许名单先于 Mode 生效**，因此 Mode=lan 且允许名单里写着办公室出口 IP，
+//     等于「局域网 + 这个外网地址」。没有这一条，「只允许局域网」就无法表达
+//     「再加一个我信任的外网地址」，用户只能整个改成 all。
+//   - **回环永远进得来**（除非被显式写进拒绝名单），这是最后的自救通道：
+//     配置写错时还能从本机 SSH 隧道进面板改回来。
+type PanelFirewall struct {
+	// Enabled 防火墙总开关。关闭时整道逻辑完全不参与，连监听器包装都不做。
+	//
+	// 全新安装默认开启且 Mode=lan；**升级**上来的旧配置默认关闭（见 store.go 的 v10 迁移块）——
+	// 一个本来从外网管理面板的用户，不该因为升了个版本就把自己关在门外。
+	Enabled bool `json:"enabled"`
+
+	// Mode 允许的来源范围：
+	//   - "lan"：只允许局域网（回环 / 私有网段 / 链路本地，判定见 ipx.IsLAN）
+	//   - "all"：不限来源（仍然受名单、限速、自动封禁约束）
+	// 空值按 "lan" 处理，即未知取值一律往严的方向落。
+	Mode string `json:"mode"`
+
+	// AllowIPs 允许名单。命中即放行，并**跳过 Mode 判定**（见类型注释）。
+	// 写法同 ipx.ParseCIDRs：单 IP / CIDR / a-b 范围。
+	AllowIPs []string `json:"allowIps"`
+	// DenyIPs 拒绝名单。命中即拒绝，优先于其他一切规则（包括回环与允许名单）。
+	DenyIPs []string `json:"denyIps"`
+
+	// RateLimit 每个来源 IP 每秒允许的请求数，0 表示不限速。
+	//
+	// 注意它约束的是**已建立连接上的 HTTP 请求**，不是 TCP 连接数：
+	// 连接层的拦截发生在更早的监听器上，那一层只看名单不看速率（见 server.firewallListener）。
+	RateLimit int `json:"rateLimit"`
+
+	// AutoBan 是否在来源持续超限时自动把它加入临时封禁。
+	AutoBan bool `json:"autoBan"`
+	// AutoBanThreshold 多少次「被限速拦下」触发封禁。计数窗口固定 10 分钟，
+	// 窗口内不再超限则计数清零——见 server.panelFirewall。
+	AutoBanThreshold int `json:"autoBanThreshold"`
+	// AutoBanMinutes 自动封禁维持多少分钟。
+	//
+	// 自动封禁只存在于内存，进程重启即清空，**不写进 config.json**。
+	// 这是刻意的：把每次攻击都落盘等于让攻击者控制本机的写入量（见 store.go 中
+	// 关于统计数据搬去 runstats 的那段说明），且封禁本就是短期止血手段。
+	AutoBanMinutes int `json:"autoBanMinutes"`
 }
 
 // LogConfig 日志设置。
@@ -463,6 +553,22 @@ type WebChild struct {
 	// 需要"80 端口跳到 443"时，请在监听 80 的那个父项（其子项 TLS=false）下手动开启本开关。
 	RedirectHTTPS bool `json:"redirectHttps"`
 	HSTS          bool `json:"hsts"`
+	// FrameDeny 禁止别的站点把本站页面套进 iframe（点击劫持防护），
+	// 落地成 X-Frame-Options: SAMEORIGIN 与 CSP 的 frame-ancestors 'self'。
+	//
+	// 默认关闭、必须显式开启：把页面嵌进 iframe 是完全正当的用法（内嵌看板、
+	// 第三方付款页、文档站里的示例框），无条件打开会把这类站点直接弄坏，
+	// 而它们从配置里看不出任何异常。
+	//
+	// 取 SAMEORIGIN 而不是 DENY：本站自己嵌自己的页面很常见，而要防的是**第三方**
+	// 站点拿本站页面做点击劫持——SAMEORIGIN 已经完整覆盖那件事。
+	//
+	// 反向代理的后端自己已经发了这两个头时不必再开这个开关：两份头会同时到达浏览器，
+	// 而两者的处置规则并不一样——重复且取值冲突的 X-Frame-Options 被浏览器整条**忽略**
+	// （不是"按更严的算"），重复的 CSP 则是逐条都要满足、等于取交集。也就是说这种情形下
+	// 真正生效的是 frame-ancestors 那一半，结果仍然不会比任一方更宽松，只是 XFO 那道
+	// 老浏览器兜底白发了。
+	FrameDeny bool `json:"frameDeny"`
 	// TrustProxyHeaders 决定是否采信上游代理声明的协议（X-Forwarded-Proto / CF-Visitor）。
 	// 默认不采信：这两个头任何客户端都能自己填，采信它等于让请求方自己决定
 	// "强制 HTTPS"与 HSTS 要不要生效。只有该子项确实挂在外层 TLS 终结代理

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"golang.org/x/net/netutil"
 
 	"mantou/internal/errpage"
+	"mantou/internal/ipx"
 	"mantou/internal/logx"
 )
 
@@ -43,6 +45,10 @@ type listenServer struct {
 	// conns 本监听当下握着的连接台账，停机时用它把关不掉的连接（尤其是被 Hijack 过的
 	// WebSocket）兜底关掉，见 close 与 conntrack.go。
 	conns *connTracker
+	// mod 回指模块，只用于那张跨监听共用的扫描封禁表与它的日志（见 scanban.go）。
+	// 刻意只存这一个指针而不是把 scanBanner 抄一份过来：封禁事件要写访问日志与程序日志，
+	// 那两样都挂在模块上。
+	mod *Module
 	// idle 本监听下各反代子项的连接池，close 时逐个关掉其中的空闲连接。
 	// 只在构造时写入，close 时只读，故不需要加锁。
 	idle []idleCloser
@@ -58,6 +64,7 @@ func newListenServer(g *wsGroup, resolver CertResolver, m *Module, log *logx.Log
 		log:       log,
 		routes:    make(map[string]http.Handler),
 		conns:     newConnTracker(),
+		mod:       m,
 	}
 	for _, b := range g.bindings {
 		h, idle := buildChildHandler(m, b.service, b.child)
@@ -110,6 +117,15 @@ func (ls *listenServer) healthy() bool { return !ls.failed.Load() }
 
 func (ls *listenServer) handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 扫描封禁的闸门（见 scanban.go）。放在最外层、连请求体停滞超时都在它之后：
+		// 被封禁的来源不会被读正文、不会走域名路由、更不会触达任何子项处理器，
+		// 这次请求的成本压到"一次原子读 + 一次 map 查找 + 一页响应"。
+		// 无人被封禁时那次原子读就直接返回，连锁都不碰。
+		now := time.Now()
+		if retry, banned := ls.mod.scanBanner().banned(r, now); banned {
+			writeScanBanned(w, r, retry)
+			return
+		}
 		// 请求体停滞超时（见 conntrack.go）。装在最外层：这里的 w 还是 Server 交出来的
 		// 原始 ResponseWriter，读超时能落到连接上。
 		guardBodyRead(w, r)
@@ -125,13 +141,56 @@ func (ls *listenServer) handler() http.Handler {
 			ls.defawlt.ServeHTTP(w, r)
 			return
 		}
+		// 未匹配到站点：这正是公网扫描最常见的形态——拿 IP 直连，Host 是空的或一串垃圾。
+		// 子项内部的 4xx 记在 instrument 里，两处共用同一张表（见 scanban.go）。
+		if until, newly := ls.mod.scanBanner().strike(r, now); newly {
+			ls.mod.recordScanBan("端口 "+strconv.Itoa(ls.port), "", remoteIP(r), until)
+		}
 		writeSiteNotFound(w, r, host)
 	})
 }
 
+// scanBanner 取模块上那张扫描封禁表。
+//
+// 单独包一层是为了容忍 ls.mod 为 nil：本包若干测试直接组装 listenServer，
+// 它们要验的是路由与停机行为，不该被迫先造一个完整的模块出来。
+func (m *Module) scanBanner() *scanBanner {
+	if m == nil {
+		return nil
+	}
+	return m.scanBan
+}
+
 // writeSiteNotFound 「未匹配到站点」。页面本体在 internal/errpage——面板、Web 服务、
 // 消息路由三处的错误页从前各写各的，用户撞上哪个都看不出这是同一个系统。
+//
+// 但那张卡片只给局域网来源看。公网来源拿到的是标准库那句朴素的 404，理由是**指纹**：
+//
+// 这条路径是拿 IP 直连时的默认落点，也就是全网扫描器一定会踩到的那一页。而那张卡片
+// 有一眼可辨的外观（渐变的 M 徽标、固定配色与版式），谁在自己机器上见过一次，就能靠它
+// 从扫描结果里把所有 mantou 实例挑出来——接下来针对性地猜面板路径、试这个项目特有的
+// 接口、比对版本已知问题。产品身份本身不是漏洞，但把它主动告诉每一个扫端口的人，
+// 等于替对方省掉了侦察那一步。换成标准库那句 `404 page not found` 之后，这台机器
+// 混进了互联网上数量最庞大的那一类 Go 服务里，什么都读不出来。
+//
+// 而卡片对局域网来源仍然照发：那一页真正的用处是管理员配完域名自己访问一遍、
+// 看到"这个主机名没有对应站点、请核对域名"——那件事发生在内网，不需要对公网公开。
+// 判据用 ipx.IsLAN（与扫描封禁的豁免同一口径），解不出对端 IP 时按公网处理。
+//
+// 光看对端 IP 还不够：mantou 挂在同机 nginx / cloudflared 后面时，对端永远是 127.0.0.1，
+// 于是"局域网"这条判据对全世界都成立，等于这道遮蔽在最需要它的部署形态上失效。所以再加
+// 一条——请求里带着任何代理转发头就按公网处理（proxiedRequest）。方向是安全的：加头只会
+// 让判定更严，扫描器伪造不出"更宽"的结果。代价是管理员绕自己的反代访问时看不到那张卡片，
+// 直连端口即可。
+//
+// 只改这一页、不动其它错误页：其余那些（IP 被拒、限流、后端不可用）都得先命中一个
+// **真实配置过的域名**才可能看到，撞上它们的是那个站点的真实访客，而给真实访客一张
+// 说得清楚的页面正是这些页面存在的意义。
 func writeSiteNotFound(w http.ResponseWriter, r *http.Request, host string) {
+	if !ipx.IsLAN(ipx.ClientIP(r)) || proxiedRequest(r) {
+		http.NotFound(w, r)
+		return
+	}
 	display := host
 	if display == "" {
 		display = "未知主机"
@@ -145,6 +204,20 @@ func writeSiteNotFound(w http.ResponseWriter, r *http.Request, host string) {
 	})
 }
 
+// proxiedRequest 判断这个请求看起来是不是经由某个反向代理转进来的。
+//
+// 只用于"要不要把内部诊断信息给对方看"这一类判定，**不能**用来做访问控制或取真实来源：
+// 这些头任何客户端都能自己填，采信它们做名单等于把名单交给对方填（见 ipx.ClientIP 的说明）。
+// 这里的用法方向相反——有头就收紧，所以伪造只会让自己看得更少。
+func proxiedRequest(r *http.Request) bool {
+	for _, h := range []string{"X-Forwarded-For", "X-Real-IP", "Forwarded", "CF-Connecting-IP"} {
+		if r.Header.Get(h) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 func (ls *listenServer) start() error {
 	network, bindAddr := bindTarget(ls.family, ls.port)
 	ls.addr = bindAddr
@@ -154,7 +227,8 @@ func (ls *listenServer) start() error {
 		// 主动回收空闲 keep-alive 连接，避免慢速/挂起客户端长期占用连接与 goroutine
 		// （资源耗尽型风险）。注意：刻意不设置 ReadTimeout/WriteTimeout，
 		// 以免大文件上传/下载或慢速传输被中途掐断——企业系统传大附件时尤为关键。
-		// 由此留下的缺口（正文发一半就不动了）由请求体停滞超时补上，见 guardBodyRead。
+		// 由此留下的两个缺口分别由两道停滞超时补上：请求正文那侧见 guardBodyRead，
+		// 响应体那侧（客户端不读、把写堵死）见 conntrack.go 的 writeGuard。
 		IdleTimeout: 120 * time.Second,
 		ErrorLog:    ls.log.Standard(slog.LevelWarn, "Web TLS 或连接异常"),
 	}
@@ -171,7 +245,7 @@ func (ls *listenServer) start() error {
 	// LimitListener 在达到上限时让 Accept 阻塞（连接留在内核 backlog 里等待，
 	// 而不是被立刻拒绝），对 HTTP 语义合适：客户端按自己的超时决定是否放弃。
 	// 也正因为超限是"阻塞"而不是"拒绝"，一批赖着不走的连接就能让正常访客连不进来——
-	// 那个缺口由请求体停滞超时补上（见 guardBodyRead）。
+	// 那个缺口由两道停滞超时补上（请求正文侧见 guardBodyRead，响应体侧见 writeGuard）。
 	//
 	// 台账套在最外层：停机时要拿着这些连接自己关（见 close）。
 	ln = ls.conns.wrap(netutil.LimitListener(ln, maxConnsPerListener))

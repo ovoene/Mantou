@@ -69,6 +69,7 @@ interface Child {
   tlsMinVersion: string
   redirectHttps: boolean
   hsts: boolean
+  frameDeny: boolean
   trustProxyHeaders: boolean
 }
 // 父项规则：一个 (端口, 地址族) 监听。
@@ -93,6 +94,20 @@ function genChildId(): string {
   return Array.from(buf, (b) => b.toString(16).padStart(2, '0')).join('')
 }
 
+// 新建子项默认的每 IP 每秒请求数。
+//
+// 默认给一个数而不是 0（不限）：不限的话，任何人都能拿一个脚本从单个 IP 把这个站点
+// （以及它后面的后端）打满，而新建站点的人多半不会主动想到去开这一项。
+//
+// 取 120 是往宽的一头靠：真人浏览一个图片多的页面，一秒内也就是几十个子资源请求，
+// 而共用一个出口 IP 的办公网（NAT 后面几十号人）在早高峰能叠到上百。定得太紧的后果
+// 是"升级之后图片随机加载不出来"，那种故障没人会怀疑到限流上。同时它仍然是一道硬上限：
+// 单个来源从"网卡能跑多快就多快"降到 120，配合扫描封禁与连接数上限，整机就有预算了。
+//
+// 只作用于**新建**的子项。已有配置里的 0 原样保留——0 与"没设过"在 JSON 里长得一样，
+// 后端替用户改成非 0 等于静默给运行中的站点加了一道闸。
+const DEFAULT_RATE_LIMIT = 120
+
 function emptyChild(): Child {
   return {
     id: genChildId(),
@@ -112,7 +127,7 @@ function emptyChild(): Child {
       basicAuthPass: '',
       allowIps: [],
       denyIps: [],
-      rateLimit: 0,
+      rateLimit: DEFAULT_RATE_LIMIT,
       ipFilter: false,
       ipFilterMode: 'allow',
     },
@@ -120,6 +135,7 @@ function emptyChild(): Child {
     tlsMinVersion: '1.2',
     redirectHttps: false,
     hsts: false,
+    frameDeny: false,
     trustProxyHeaders: false,
   }
 }
@@ -808,65 +824,6 @@ useCloseOnLeave(logsVisible)
                   <el-switch v-model="ch.proxy.preserveHost" />
                 </el-form-item>
                 <p class="mt-subtle hint-block">{{ t('webservice.preserveHostHint') }}</p>
-
-                <!-- IP 过滤：总开关 + 模式下拉（白/黑名单）+ 大输入框 -->
-                <el-form-item :label="t('webservice.ipFilter')">
-                  <el-switch
-                    v-model="ch.access.ipFilter"
-                    @change="(v: any) => { if (!v) { ch.access.allowIps = []; ch.access.denyIps = [] } }"
-                  />
-                  <el-select
-                    v-if="ch.access.ipFilter"
-                    v-model="ch.access.ipFilterMode"
-                    style="width: 160px; margin-left: 12px"
-                    @change="onIpFilterModeChange(ch)"
-                  >
-                    <el-option :label="t('webservice.ipWhitelist')" value="allow" />
-                    <el-option :label="t('webservice.ipBlacklist')" value="deny" />
-                  </el-select>
-                </el-form-item>
-                <el-form-item v-if="ch.access.ipFilter" :label="t('webservice.ipList')">
-                  <TagInput
-                    v-if="ch.access.ipFilterMode === 'allow'"
-                    v-model="ch.access.allowIps"
-                    class="ip-large"
-                    :placeholder="t('webservice.ipListPlaceholder')"
-                  />
-                  <TagInput
-                    v-else
-                    v-model="ch.access.denyIps"
-                    class="ip-large"
-                    :placeholder="t('webservice.ipListPlaceholder')"
-                  />
-                  <p class="mt-subtle hint-block">{{ t('webservice.ipFilterHint') }}</p>
-                </el-form-item>
-
-                <!-- 请求速率限制：总开关（rateLimit 0/非0）+ 每秒请求数。
-                     注意：el-switch 不能既把同一字段既当 number（active/inactive-value）又当
-                     truthy 开关用——一旦 change 回调把值改成 20，el-switch 的 v-model
-                     既不等于 active-value 也不等于 inactive-value，组件视觉状态会出现"按钮
-                     不变色、无法关闭"的卡死现象。改为 :model-value + @change 显式同步，
-                     switch 的开/关状态严格由 rateLimit>0 派生，避免任何值域不匹配。 -->
-                <el-form-item :label="t('webservice.rateLimit')">
-                  <el-switch
-                    :model-value="ch.access.rateLimit > 0"
-                    @change="(v: any) => {
-                      if (v) {
-                        if (ch.access.rateLimit <= 0) ch.access.rateLimit = 20
-                      } else {
-                        ch.access.rateLimit = 0
-                      }
-                    }"
-                  />
-                  <el-input-number
-                    v-if="ch.access.rateLimit > 0"
-                    v-model="ch.access.rateLimit"
-                    :min="1"
-                    :max="10000"
-                    style="margin-left: 12px"
-                  />
-                </el-form-item>
-                <p v-if="ch.access.rateLimit > 0" class="mt-subtle hint-block">{{ t('webservice.rateLimitHint') }}</p>
               </div>
             </template>
 
@@ -917,7 +874,7 @@ useCloseOnLeave(logsVisible)
             </template>
 
             <div class="section-box">
-              <div class="section-title">{{ t('webservice.proxyOptions') }}</div>
+              <div class="section-title">{{ t('webservice.securityOptions') }}</div>
               <div class="grid3">
                 <el-form-item :label="t('webservice.tls')">
                   <el-switch v-model="ch.tls" @change="(v: any) => onTLSChange(ch, Boolean(v))" />
@@ -948,6 +905,13 @@ useCloseOnLeave(logsVisible)
                 <el-switch v-model="ch.trustProxyHeaders" />
               </el-form-item>
               <p v-if="!ch.tls" class="mt-subtle hint-block">{{ t('webservice.trustProxyHeadersHint') }}</p>
+              <!-- 禁止被 iframe 嵌套：默认关，开了才发 X-Frame-Options 与 CSP frame-ancestors。
+                   不能默认开——反代后面挂着的系统被自家门户 iframe 嵌进去是常见部署，
+                   默认开等于升级之后那些页面全变空白，而用户看不出是谁干的。 -->
+              <el-form-item :label="t('webservice.frameDeny')">
+                <el-switch v-model="ch.frameDeny" />
+              </el-form-item>
+              <p class="mt-subtle hint-block">{{ t('webservice.frameDenyHint') }}</p>
 
               <!-- 访问认证：仅在该子项启用 TLS 后出现（明文 HTTP 上传口令等于直接暴露）。
                    关闭 TLS 时 onTLSChange 会一并关掉本开关，但账号与已存的口令哈希保留。 -->
@@ -975,6 +939,73 @@ useCloseOnLeave(logsVisible)
                 </div>
                 <p class="mt-subtle hint-block">{{ t('webservice.basicAuthHint') }}</p>
               </template>
+            </div>
+
+            <!-- 访问控制。这一段对三种后端（反代 / 静态 / 跳转）一律生效——后端的
+                 applyMiddleware 从来是无差别套上去的，从前它只画在"反代"那一支里，
+                 于是静态站点想限流没有任何入口，而静态站点恰恰是最容易被爬满的那一类。 -->
+            <div class="section-box">
+              <div class="section-title">{{ t('webservice.accessControl') }}</div>
+              <!-- IP 过滤：总开关 + 模式下拉（白/黑名单）+ 大输入框 -->
+              <el-form-item :label="t('webservice.ipFilter')">
+                <el-switch
+                  v-model="ch.access.ipFilter"
+                  @change="(v: any) => { if (!v) { ch.access.allowIps = []; ch.access.denyIps = [] } }"
+                />
+                <el-select
+                  v-if="ch.access.ipFilter"
+                  v-model="ch.access.ipFilterMode"
+                  style="width: 160px; margin-left: 12px"
+                  @change="onIpFilterModeChange(ch)"
+                >
+                  <el-option :label="t('webservice.ipWhitelist')" value="allow" />
+                  <el-option :label="t('webservice.ipBlacklist')" value="deny" />
+                </el-select>
+              </el-form-item>
+              <el-form-item v-if="ch.access.ipFilter" :label="t('webservice.ipList')">
+                <TagInput
+                  v-if="ch.access.ipFilterMode === 'allow'"
+                  v-model="ch.access.allowIps"
+                  class="ip-large"
+                  :placeholder="t('webservice.ipListPlaceholder')"
+                />
+                <TagInput
+                  v-else
+                  v-model="ch.access.denyIps"
+                  class="ip-large"
+                  :placeholder="t('webservice.ipListPlaceholder')"
+                />
+                <p class="mt-subtle hint-block">{{ t('webservice.ipFilterHint') }}</p>
+              </el-form-item>
+
+              <!-- 请求速率限制：总开关（rateLimit 0/非0）+ 每秒请求数。新建子项默认就是开的
+                   （见 DEFAULT_RATE_LIMIT）；已有配置里的 0 原样保留。
+                   注意：el-switch 不能把同一字段既当 number（active/inactive-value）又当
+                   truthy 开关用——一旦 change 回调把值改成非 0，el-switch 的 v-model
+                   既不等于 active-value 也不等于 inactive-value，组件视觉状态会出现"按钮
+                   不变色、无法关闭"的卡死现象。改为 :model-value + @change 显式同步，
+                   switch 的开/关状态严格由 rateLimit>0 派生，避免任何值域不匹配。 -->
+              <el-form-item :label="t('webservice.rateLimit')">
+                <el-switch
+                  :model-value="ch.access.rateLimit > 0"
+                  @change="(v: any) => {
+                    if (v) {
+                      if (ch.access.rateLimit <= 0) ch.access.rateLimit = DEFAULT_RATE_LIMIT
+                    } else {
+                      ch.access.rateLimit = 0
+                    }
+                  }"
+                />
+                <el-input-number
+                  v-if="ch.access.rateLimit > 0"
+                  v-model="ch.access.rateLimit"
+                  :min="1"
+                  :max="10000"
+                  style="margin-left: 12px"
+                />
+              </el-form-item>
+              <p v-if="ch.access.rateLimit > 0" class="mt-subtle hint-block">{{ t('webservice.rateLimitHint') }}</p>
+              <p v-else class="mt-subtle hint-block">{{ t('webservice.rateLimitOffHint') }}</p>
             </div>
 
             <div class="child-foot">

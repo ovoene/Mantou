@@ -256,23 +256,46 @@ func TestRunPlanDaySkipsLaggedTicks(t *testing.T) {
 
 // TestRunPlanDayFiresSmallJitter 落后不足一整拍属于正常抖动，仍应照常触发，
 // 不能被跳过逻辑连带吞掉——否则间隔 1 秒的安排会因为每拍几毫秒的开销而漏发一半。
+//
+// 两条子用例分工明确，因为它们的可靠程度差着一个量级：
+//
+//   - 「刚过去的那一拍」是这道宽容度的**本体**，钉成精确值。为了让它不受机器负载影响，
+//     拍间隔取 2 秒：要把这一拍误判成落后，得在取 start 与进循环之间卡满 2 秒。
+//   - 多拍那条只能给区间。它的名义拍数由墙钟决定，而整包并行跑测试时一次调度打嗝
+//     就能让某一拍真的迟到超过一整拍、于是被正确地丢掉——那不是缺陷。宽容度本身
+//     已由上一条钉住，所以这里放过 5 拍不会留下盲区。
 func TestRunPlanDayFiresSmallJitter(t *testing.T) {
-	// 拍间隔取 100 毫秒、单拍耗时 60 毫秒：过了半拍但远不到一整拍，这一轮不该丢任何一拍。
-	// 间隔不能取得更小——本机时钟粒度约 15 毫秒，20 毫秒一拍只剩几毫秒余量，
-	// 一次调度打嗝就把某一拍推过整拍，测试于是偶发地失败在一个并不存在的缺陷上。
-	const interval = 100 * time.Millisecond
-	w := newSpyStats(60 * time.Millisecond)
-	m := New(testLogger(), w)
+	// 固定时间模式（start == end）：全天只有一拍，而 runSchedule 是在日切定时器醒来之后
+	// 才推导当天计划的，唤醒时刻配成 00:00 的设备必然差那么几毫秒。少了这道宽容度，
+	// 那一拍会被向上取整到下一拍、越过 end，于是整天一拍都不发（见 runPlanDay 的说明）。
+	t.Run("刚过去的那一拍照常发", func(t *testing.T) {
+		w := newSpyStats(0)
+		m := New(testLogger(), w)
+		start := time.Now().Add(-5 * time.Millisecond)
+		p := wakePlan{start: start, end: start, interval: 2 * time.Second, burst: 1}
+		if !m.runPlanDay(context.Background(), config.WOLDevice{ID: "d1", Broadcast: "127.0.0.1"}, p) {
+			t.Fatal("未取消 ctx，runPlanDay 应返回 true")
+		}
+		if ticks := w.n.Load(); ticks != 1 {
+			t.Fatalf("刚过去几毫秒的那一拍被当成落后丢掉了：应发 1 拍，实际 %d 拍", ticks)
+		}
+	})
 
-	// 起点故意退后几毫秒：首拍必定是「刚刚过去」的那一拍，正对着要钉的宽容度。
-	// 原先靠的是「取 start 到进循环之间恰好走过一点点」，那点时间差有多大取决于时钟粒度。
-	start := time.Now().Add(-5 * time.Millisecond)
-	p := wakePlan{start: start, end: start.Add(5 * interval), interval: interval, burst: 1}
-	if !m.runPlanDay(context.Background(), config.WOLDevice{ID: "d1", Broadcast: "127.0.0.1"}, p) {
-		t.Fatal("未取消 ctx，runPlanDay 应返回 true")
-	}
-	// 名义 6 拍：start 那一拍，加上后面 5 拍。首拍能算进来靠的是 runPlanDay 给首拍留的一整拍宽容度。
-	if ticks := w.n.Load(); ticks != 6 {
-		t.Fatalf("小幅抖动被误判为落后：名义 6 拍，实际 %d 拍", ticks)
-	}
+	// 拍间隔取 100 毫秒、单拍耗时 60 毫秒：每拍都留 40 毫秒余量，正常情况下一拍不落。
+	t.Run("每拍开销不该吞掉后续拍", func(t *testing.T) {
+		const interval = 100 * time.Millisecond
+		w := newSpyStats(60 * time.Millisecond)
+		m := New(testLogger(), w)
+		start := time.Now().Add(-5 * time.Millisecond)
+		p := wakePlan{start: start, end: start.Add(5 * interval), interval: interval, burst: 1}
+		if !m.runPlanDay(context.Background(), config.WOLDevice{ID: "d1", Broadcast: "127.0.0.1"}, p) {
+			t.Fatal("未取消 ctx，runPlanDay 应返回 true")
+		}
+		// 名义 6 拍：start 那一拍，加上后面 5 拍。下界放到 5——负载重时某一拍可能真的
+		// 迟到超过一整拍而被正确丢弃。上界卡死在 6：多于名义拍数意味着在追赶补发，
+		// 那正是 TestRunPlanDaySkipsLaggedTicks 要防的那件事。
+		if ticks := w.n.Load(); ticks < 5 || ticks > 6 {
+			t.Fatalf("拍数应在 5~6 之间（名义 6 拍），实际 %d 拍", ticks)
+		}
+	})
 }

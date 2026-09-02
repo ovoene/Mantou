@@ -15,7 +15,7 @@ import { useI18n } from 'vue-i18n'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import PageCard from '@/components/PageCard.vue'
 import api from '@/api/client'
-import { actions, type StorageItem } from '@/api/resources'
+import { actions, type StorageItem, type FirewallBan } from '@/api/resources'
 import { fmtTime, fmtTimeMs, fmtBytes } from '@/composables/useResource'
 import { useCloseOnLeave } from '@/composables/useCloseOnLeave'
 import { useNarrow } from '@/composables/useNarrow'
@@ -171,8 +171,11 @@ async function cleanupStorage() {
 }
 
 // 备份与恢复那一页打开时才去扫盘：这是一次目录遍历，没必要每次进设置页都做一遍。
+// 封禁列表同理，只是理由不同：它是内存里随时在变的东西，要的是"打开时看到当下"，
+// 而不是"进设置页时抓的那一眼"。
 watch(activeTab, (tab) => {
   if (tab === 'backup') refreshStorage()
+  if (tab === 'security') refreshFirewallBans()
 })
 
 /* ---------- 在线更新（更新源 / 签名密钥） ---------- */
@@ -191,6 +194,150 @@ const savingLogin = ref(false)
 /* ---------- 出站请求内网防护（默认关闭；开启后取址 / 计划任务 HTTP 目标解析到内网或保留地址将被拒绝） ---------- */
 const security = reactive<{ blockPrivateNetwork: boolean }>({ blockPrivateNetwork: false })
 const savingSecurity = ref(false)
+
+/* ---------- 入站防火墙（面板自身的来源准入：范围 + 名单 + 限速 + 自动封禁） ---------- */
+// 名单在界面上是每行一条的文本框，配置里是字符串数组：两个方向都在 fwListToText /
+// fwTextToList 里转，不在模板里就地 split，好让"用户看到的"与"提交的"只有一处定义。
+interface FirewallCfg {
+  enabled: boolean
+  mode: 'lan' | 'all'
+  allowIps: string[]
+  denyIps: string[]
+  rateLimit: number
+  autoBan: boolean
+  autoBanThreshold: number
+  autoBanMinutes: number
+}
+const firewall = reactive<FirewallCfg>({
+  enabled: false,
+  mode: 'lan',
+  allowIps: [],
+  denyIps: [],
+  rateLimit: 60,
+  autoBan: true,
+  autoBanThreshold: 20,
+  autoBanMinutes: 60,
+})
+// 计数窗口与名单条数上限由后端下发：界面上那句「N 分钟内超限 M 次」必须和服务端
+// 真正用的数同源，前端自己抄一个迟早会对不上。
+const firewallMeta = reactive<{ autoBanWindowMinutes: number; maxIps: number }>({
+  autoBanWindowMinutes: 10,
+  maxIps: 256,
+})
+const savingFirewall = ref(false)
+const firewallAllowText = ref('')
+const firewallDenyText = ref('')
+
+// 当前封禁列表。total 与 items.length 可能不等（后端按 limit 截断）。
+const firewallBans = ref<FirewallBan[]>([])
+const firewallBanTotal = ref(0)
+const firewallBansLoading = ref(false)
+
+function fwListToText(list: unknown): string {
+  return Array.isArray(list) ? list.join('\n') : ''
+}
+// 每行一条，去空行与首尾空白。条数不在这里截断：超限要让后端报出来，
+// 前端悄悄截掉等于把用户多填的那些无声丢掉。
+function fwTextToList(text: string): string[] {
+  return text
+    .split('\n')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0)
+}
+
+async function refreshFirewallBans() {
+  firewallBansLoading.value = true
+  try {
+    const res = await actions.firewallBans()
+    firewallBans.value = res.items || []
+    firewallBanTotal.value = res.total ?? 0
+  } catch {
+    /* 忽略瞬时错误：这一块是只读展示，拉不到不该打断整页 */
+  } finally {
+    firewallBansLoading.value = false
+  }
+}
+
+async function unbanFirewallIp(ip: string) {
+  try {
+    await actions.clearFirewallBans(ip)
+    ElMessage.success(t('settings.fwUnbanOk'))
+    await refreshFirewallBans()
+  } catch (e: any) {
+    ElMessage.error(e?.message || t('common.saveFailed'))
+  }
+}
+
+async function clearFirewallBans() {
+  try {
+    await ElMessageBox.confirm(t('settings.fwClearBansConfirm'), '', {
+      confirmButtonText: t('common.confirm'),
+      cancelButtonText: t('common.cancel'),
+      type: 'warning',
+    })
+  } catch {
+    return
+  }
+  try {
+    const res = await actions.clearFirewallBans()
+    ElMessage.success(t('settings.fwClearBansOk', { n: res.cleared ?? 0 }))
+    await refreshFirewallBans()
+  } catch (e: any) {
+    ElMessage.error(e?.message || t('common.saveFailed'))
+  }
+}
+
+// 保存入站防火墙。
+//
+// 两段式：先照常提交，后端若判断这份设置会切断**当前这个人**的访问，回 409 并把原因
+// 说清楚（例如"你正从 203.0.113.5 访问，它不属于局域网"）；界面把那句话原样放进确认框，
+// 用户确认后带 force 重提。
+//
+// 之所以要这道确认而不是直接拦下：从公网管理面板的用户完全可能明知会失去当前入口
+// 也要切成"仅局域网"（接下来改走 VPN / SSH 隧道）。拦死等于替他做决定。
+// 反过来直接放行也不行——这个功能唯一严重的失败模式就是把自己关在门外，
+// 而它发生得毫无征兆：保存成功、页面正常，直到下一次刷新才发现进不来，
+// 那时已经没有入口可以改回来了。
+async function saveFirewall(force = false) {
+  const payload = {
+    security: {
+      blockPrivateNetwork: security.blockPrivateNetwork,
+      firewall: {
+        ...firewall,
+        allowIps: fwTextToList(firewallAllowText.value),
+        denyIps: fwTextToList(firewallDenyText.value),
+        force,
+      },
+    },
+  }
+  savingFirewall.value = true
+  try {
+    await api.put('/settings', payload)
+    ElMessage.success(t('msg.saveOk'))
+    // 重新拉一次：名单里写错的条目会被后端丢掉，不重拉的话用户还以为它存进去了——
+    // 而"以为白名单里有我的 IP"恰恰是把自己锁在门外的前一步。
+    await loadSettings()
+    await refreshFirewallBans()
+  } catch (e: any) {
+    // 409 = 参数没错，但后果需要确认一次。
+    if (e?.status === 409 && !force) {
+      try {
+        await ElMessageBox.confirm(e?.message || t('settings.fwLockoutConfirm'), t('settings.fwLockoutTitle'), {
+          confirmButtonText: t('settings.fwLockoutConfirmBtn'),
+          cancelButtonText: t('common.cancel'),
+          type: 'warning',
+        })
+      } catch {
+        return // 用户取消：什么都没改，设置保持原样
+      }
+      await saveFirewall(true)
+      return
+    }
+    ElMessage.error(e?.message || t('common.saveFailed'))
+  } finally {
+    savingFirewall.value = false
+  }
+}
 
 /* ---------- 重启（立即重启 + 定时重启） ---------- */
 // 三种模式各用各的字段：weekly 看 weekdays，dates 看 dates，interval 看 everyDays + startDate。
@@ -280,6 +427,22 @@ async function loadSettings() {
     }
     if (s.security) {
       security.blockPrivateNetwork = !!s.security.blockPrivateNetwork
+      const fw = s.security.firewall
+      if (fw) {
+        firewall.enabled = !!fw.enabled
+        firewall.mode = fw.mode === 'all' ? 'all' : 'lan'
+        firewall.allowIps = Array.isArray(fw.allowIps) ? fw.allowIps : []
+        firewall.denyIps = Array.isArray(fw.denyIps) ? fw.denyIps : []
+        // 限速的 0 是"不限速"这个有效选择，不能用 `|| 60` 兜——那会把用户主动填的 0 改回 60。
+        firewall.rateLimit = typeof fw.rateLimit === 'number' ? fw.rateLimit : 60
+        firewall.autoBan = fw.autoBan !== false
+        firewall.autoBanThreshold = fw.autoBanThreshold > 0 ? fw.autoBanThreshold : 20
+        firewall.autoBanMinutes = fw.autoBanMinutes > 0 ? fw.autoBanMinutes : 60
+        firewallAllowText.value = fwListToText(firewall.allowIps)
+        firewallDenyText.value = fwListToText(firewall.denyIps)
+        if (fw.autoBanWindowMinutes > 0) firewallMeta.autoBanWindowMinutes = fw.autoBanWindowMinutes
+        if (fw.maxIps > 0) firewallMeta.maxIps = fw.maxIps
+      }
     }
     if (s.restart) {
       restart.enabled = !!s.restart.enabled
@@ -1246,6 +1409,130 @@ useCloseOnLeave(importAuthVisible)
             </el-button>
           </el-form-item>
 
+          <el-divider content-position="left">{{ t('settings.fwTitle') }}</el-divider>
+          <el-alert
+            :title="t('settings.fwDesc')"
+            type="info"
+            :closable="false"
+            show-icon
+            style="margin-bottom: 12px"
+          />
+          <el-form-item :label="t('settings.fwEnabled')">
+            <el-switch v-model="firewall.enabled" />
+            <span class="mt-subtle hint" style="margin-left: 12px">{{ t('settings.fwEnabledHint') }}</span>
+          </el-form-item>
+          <template v-if="firewall.enabled">
+            <el-form-item :label="t('settings.fwMode')">
+              <el-radio-group v-model="firewall.mode">
+                <el-radio value="lan">{{ t('settings.fwModeLan') }}</el-radio>
+                <el-radio value="all">{{ t('settings.fwModeAll') }}</el-radio>
+              </el-radio-group>
+              <!-- 「不限来源」不是一个中性选项：它把面板暴露到公网，而这正是那批
+                   TLS 握手告警的来源。选中时把代价说出来，不靠用户自己想。 -->
+              <p v-if="firewall.mode === 'all'" class="mt-subtle hint">{{ t('settings.fwModeAllHint') }}</p>
+              <p v-else class="mt-subtle hint">{{ t('settings.fwModeLanHint') }}</p>
+            </el-form-item>
+            <el-form-item :label="t('settings.fwAllowIps')">
+              <el-input
+                v-model="firewallAllowText"
+                type="textarea"
+                :rows="3"
+                :placeholder="t('settings.fwIpsPlaceholder')"
+                style="width: 360px"
+              />
+              <p class="mt-subtle hint">{{ t('settings.fwAllowIpsHint', { max: firewallMeta.maxIps }) }}</p>
+            </el-form-item>
+            <el-form-item :label="t('settings.fwDenyIps')">
+              <el-input
+                v-model="firewallDenyText"
+                type="textarea"
+                :rows="3"
+                :placeholder="t('settings.fwIpsPlaceholder')"
+                style="width: 360px"
+              />
+              <p class="mt-subtle hint">{{ t('settings.fwDenyIpsHint') }}</p>
+            </el-form-item>
+            <el-form-item :label="t('settings.fwRateLimit')">
+              <el-input-number v-model="firewall.rateLimit" :min="0" :max="10000" :step="10" style="width: 160px" />
+              <span class="mt-subtle hint" style="margin-left: 12px">{{ t('settings.fwRateLimitHint') }}</span>
+            </el-form-item>
+            <el-form-item :label="t('settings.fwAutoBan')">
+              <el-switch v-model="firewall.autoBan" :disabled="firewall.rateLimit <= 0" />
+              <!-- 限速关掉时自动封禁没有触发条件（它数的就是"被限速拦下"的次数）。
+                   留着一个开着却永远不动的开关，比灰掉它更让人费解。 -->
+              <span class="mt-subtle hint" style="margin-left: 12px">
+                {{ firewall.rateLimit > 0 ? t('settings.fwAutoBanHint') : t('settings.fwAutoBanNeedsRate') }}
+              </span>
+            </el-form-item>
+            <template v-if="firewall.autoBan && firewall.rateLimit > 0">
+              <el-form-item :label="t('settings.fwAutoBanThreshold')">
+                <el-input-number
+                  v-model="firewall.autoBanThreshold"
+                  :min="1"
+                  :max="100000"
+                  :step="5"
+                  style="width: 160px"
+                />
+                <span class="mt-subtle hint" style="margin-left: 12px">
+                  {{ t('settings.fwAutoBanThresholdHint', { minutes: firewallMeta.autoBanWindowMinutes }) }}
+                </span>
+              </el-form-item>
+              <el-form-item :label="t('settings.fwAutoBanMinutes')">
+                <el-input-number
+                  v-model="firewall.autoBanMinutes"
+                  :min="1"
+                  :max="43200"
+                  :step="10"
+                  style="width: 160px"
+                />
+                <span class="mt-subtle hint" style="margin-left: 12px">{{ t('settings.fwAutoBanMinutesHint') }}</span>
+              </el-form-item>
+            </template>
+          </template>
+          <el-form-item>
+            <el-button type="primary" :loading="savingFirewall" @click="saveFirewall(false)">
+              {{ t('common.save') }}
+            </el-button>
+          </el-form-item>
+
+          <el-form-item :label="t('settings.fwBans')">
+            <div style="width: 100%">
+              <p class="mt-subtle hint">{{ t('settings.fwBansDesc') }}</p>
+              <div class="storage-bar">
+                <el-button :loading="firewallBansLoading" @click="refreshFirewallBans">
+                  {{ t('common.refresh') }}
+                </el-button>
+                <el-button type="danger" :disabled="firewallBans.length === 0" @click="clearFirewallBans">
+                  {{ t('settings.fwClearBans') }}
+                </el-button>
+                <span class="mt-subtle hint">
+                  {{ t('settings.fwBansTotal', { n: firewallBanTotal }) }}
+                  <!-- 列表被截断时说清楚：否则"表里 200 条"会被读成"总共 200 个来源"。 -->
+                  <template v-if="firewallBanTotal > firewallBans.length">
+                    {{ t('settings.fwBansTruncated', { n: firewallBans.length }) }}
+                  </template>
+                </span>
+              </div>
+              <el-empty
+                v-if="!firewallBansLoading && firewallBans.length === 0"
+                :description="t('settings.fwBansEmpty')"
+                :image-size="60"
+              />
+              <div v-else class="fw-ban-list">
+                <div v-for="b in firewallBans" :key="b.ip" class="fw-ban-row">
+                  <span class="fw-ban-ip">{{ b.ip }}</span>
+                  <span class="mt-subtle hint">{{ t('settings.fwBanUntil', { time: fmtTime(b.until) }) }}</span>
+                  <el-tag v-if="b.rounds > 1" size="small" type="warning" disable-transitions>
+                    {{ t('settings.fwBanRounds', { n: b.rounds }) }}
+                  </el-tag>
+                  <el-button link type="primary" @click="unbanFirewallIp(b.ip)">
+                    {{ t('settings.fwUnban') }}
+                  </el-button>
+                </div>
+              </div>
+            </div>
+          </el-form-item>
+
           <el-divider content-position="left">{{ t('settings.outboundGuard') }}</el-divider>
           <el-alert
             :title="t('settings.blockPrivateNetworkDesc')"
@@ -1655,6 +1942,28 @@ useCloseOnLeave(importAuthVisible)
   font-family: ui-monospace, Menlo, Consolas, monospace;
 }
 .storage-row .hint {
+  margin: 0;
+}
+/* 当前封禁列表：一行一个来源，IPv6 写起来很长，让它自己占宽并允许换行。 */
+.fw-ban-list {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+}
+.fw-ban-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  width: 100%;
+  padding: 3px 0;
+  line-height: 1.6;
+}
+.fw-ban-ip {
+  word-break: break-all;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+}
+.fw-ban-row .hint {
   margin: 0;
 }
 /* 选择性导入的模块勾选：两列固定，九项排四行，对话框高度不会随语言变化跳动。 */
