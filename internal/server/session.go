@@ -145,6 +145,32 @@ func (r *sessionRegistry) valid(token, username string, revive bool, idle time.D
 	return e.username, true
 }
 
+// expiresIn 返回该会话距**绝对过期时间**还剩多久；会话不存在或已过期时返回 (0, false)。
+//
+// 供 /auth/me 下发给前端排"到期自动退出"的闹钟用。绝对过期时间是从登录那一刻起算、
+// 永不延长的上限（见 add / valid），因此它是唯一一个前端可以在本地算准的到期点：
+// 闲置超时会被任何一次请求归零，宽限删除取决于用户什么时候关窗口，两者都不可预测。
+//
+// 只读——不刷新 lastSeenAt、不清除待删除标记。这一点是刻意的：这个访问器会被一个
+// 纯粹为了"还剩多久"而发的请求调用，如果它顺手保活，就等于让前端的看门狗自己
+// 把闲置超时永远推后，而闲置超时正是"关窗口没发出信标"时的收尾手段。
+//
+// 单独开一个方法而不是给 valid() 加返回值：valid() 有十来处调用与测试点，
+// 为一个只读字段改它的签名，改动面远大于收益。
+func (r *sessionRegistry) expiresIn(token string) (time.Duration, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	e, ok := r.entries[sessionKey(token)]
+	if !ok {
+		return 0, false
+	}
+	d := time.Until(e.expiresAt)
+	if d <= 0 {
+		return 0, false
+	}
+	return d, true
+}
+
 // remove 立即删除会话（显式退出按钮或用户名变更时调用）。
 func (r *sessionRegistry) remove(token string) {
 	r.mu.Lock()

@@ -84,6 +84,10 @@ export default {
     failed: 'Invalid username or password',
     noSession:
       'Credentials accepted, but the browser did not store the session, so the panel cannot be opened. Check whether cookies are blocked for this site (private mode, privacy extensions, “block all cookies”); if it still fails, clear this site’s cookies and retry.',
+    // Shown when the expiry watchdog signs the user out on its own (see stores/auth.ts).
+    // A sentence is mandatory: otherwise the UI jumps back to the login page by itself and the
+    // user reads that as the panel breaking.
+    expired: 'Your session reached the configured token lifetime and was signed out. Please sign in again.',
   },
   setup: {
     title: 'Set up Mantou',
@@ -848,7 +852,7 @@ export default {
     burst: 'Burst window',
     burstHint: 'Dense failures in a short span, to catch a full-scale port scan within seconds. Either window tripping is enough to ban.',
     banMinutes: 'Ban duration',
-    banMinutesHint: '1–{max} minutes, lifted automatically on expiry. Bans live in memory only, are never written to the config file, and are cleared on restart.',
+    banMinutesHint: '1–{max} minutes (up to {days} days), lifted automatically on expiry. Bans live in memory only, are never written to the config file, and are cleared on restart. For a permanent block, put the source on the denylist.',
     memoryMB: 'Memory limit',
     memoryHint: 'Default 5 / max 15 MB. This is the cap for EACH ban table — the panel\'s inbound guard and this module keep one each, both sized by this number, so the worst-case total is twice this. Once a table is full no new addresses are recorded; existing bans keep working.',
     saveHint: 'Changes take effect only after you click Save. Saving does not restart the Web Services / Message Routing listeners, so live connections are unaffected.',
@@ -885,6 +889,16 @@ export default {
     banTruncated: '(showing the {n} most recent)',
     banUnbanOk: 'Ban lifted',
     banClearOk: 'Lifted {n} ban(s)',
+    // Add to denylist: promote a temporary ban into a permanent denylist entry (written to the
+    // config file, survives restart). It is the opposite of "Lift", so the wording has to spell out
+    // both that it is permanent and that it lands in the config file.
+    banDeny: 'Add to denylist',
+    banDenyAll: 'Add all to denylist',
+    banDenyHint: 'Adding to the denylist writes the source permanently into the config file (up to {max} entries) and lifts its temporary ban at the same time — the denylist is checked first, so the temporary ban no longer matters. To allow it again, delete the line on the Denylist tab.',
+    banDenyAllConfirm: 'Add all {n} currently banned sources to the denylist? Denylist entries are permanent and written to the config file, and home or office egress IPs are often shared by many people, so unrelated users may get locked out too.',
+    banDenyDirty: 'The Denylist tab has unsaved edits, and this will overwrite them with the list from the server.',
+    banDenyOk: 'Added to denylist: {added} new, {skipped} already present, {unbanned} temporary ban(s) lifted',
+    banDenyCapped: 'Denylist is at its {max}-entry limit: {added} added this time, the remaining sources were not added and keep their temporary bans',
     // Read-only status widget on business pages. The rules text is composed from the structured
     // fields in the current locale (the backend no longer ships a pre-rendered summary), so what it
     // shows always agrees with the module page instead of the two drifting apart.
@@ -1092,7 +1106,8 @@ export default {
     srv: {
       enabled: 'Enable module',
       port: 'Listen port',
-      portHint: 'Separate from the panel port; it must not clash with the panel or any web service.',
+      portHint:
+        "This module's own listen port. It must not be the same as the panel admin port. Sharing a port with a web service is not a conflict: that web service owns the listener and this module rides on it, receiving by access domain — so an access domain is required here, and the HTTPS switches on both sides must match.",
       https: 'Enable HTTPS',
       httpsOnly:
         'With HTTPS on, this port accepts HTTPS only and rejects plain HTTP — update the URL configured in the third-party system to https as well.',
@@ -1112,7 +1127,7 @@ export default {
       sourceRetainHint:
         'For rejected and discarded messages, a copy of what the sender sent is kept in memory and shown when you click Detail / source on that history row. Retained payloads are never written to a file and are cleared on restart. Set 0 to keep none; at most {max} MB. This is what you look at when a message never arrived; turn it off if you are not investigating.',
       publicPortHint:
-        'Ports 80 / 443 are the defaults for browsers and third-party systems, and the panel, web services and message routing may all want them: an access domain is required so requests can be routed to this module by host name. A domain cannot be reused on the same port, nor can it be the panel domain. If a web service already holds the port, this module rides on that listener and receives by domain, so the HTTPS switches on both sides must match.',
+        'Ports 80 / 443 are the defaults for browsers and third-party systems, and the panel, web services and message routing may all want them: an access domain is required even when nothing else is on this port yet, so requests can be routed to this module by host name. A domain cannot be reused on the same port, nor can it be the panel domain.',
       listening: 'Listening on {addr}',
       notCreated: 'There is no inbound listener on this machine yet: create the module first so receivers get a reachable address.',
       emptyHint:

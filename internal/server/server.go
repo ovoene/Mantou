@@ -281,6 +281,9 @@ func (s *Server) registerRoutes(r *gin.Engine) {
 			authed.PUT("/global-firewall", s.handleUpdateGlobalFirewall)
 			authed.GET("/global-firewall/bans", s.handleGetGlobalFirewallBans)
 			authed.POST("/global-firewall/bans/clear", s.handleClearGlobalFirewallBans)
+			// 把封禁来源升级成拒绝名单：读—改—写整段在配置写锁内完成，前端拿一份可能已过期的
+			// denyIps 追加后整体 PUT 回来会静默抹掉别处新增的条目（见 handleDenyGlobalFirewallBans）。
+			authed.POST("/global-firewall/bans/deny", s.handleDenyGlobalFirewallBans)
 
 			authed.POST("/settings/restart-now", s.handleRestartNow)
 

@@ -408,6 +408,18 @@ func (s *Server) handleUpdateSettings(c *gin.Context) {
 		}
 	}
 
+	// 版本检测仓库：同一个道理，但它不是 URL 而是被**拼进** URL 的一段路径
+	// （https://api.github.com/repos/<这里>/releases/latest），所以校验的是形状而非地址。
+	// 填 "../../users/someone" 这类段名能把检测请求挪到另一个接口上，
+	// 再把那边返回的 html_url 当作"新版本下载页"显示出来（见 githubRepoOf）。
+	// 完整 http(s) 地址仍然收——界面上那个仓库图标本来就支持这种写法。
+	if req.Update != nil && req.Update.GitHubRepo != nil {
+		if raw := strings.TrimSpace(*req.Update.GitHubRepo); raw != "" && !validGitHubRepoField(raw) {
+			respondError(c, http.StatusBadRequest, "项目仓库应填 owner/name（如 ovoene/Mantou）或完整的 http(s) 地址")
+			return
+		}
+	}
+
 	// 面板入站防护：同样先按加载期的规则规范化，再校验，最后确认它不会把
 	// 提交这次改动的人本人关在门外（见 checkFirewallLockout）。
 	//

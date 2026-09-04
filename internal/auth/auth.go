@@ -18,6 +18,14 @@ import (
 var (
 	ErrInvalidToken = errors.New("会话令牌无效")
 	ErrTokenExpired = errors.New("会话已过期")
+	// ErrNoSecret 签名密钥为空。这不是"令牌无效"的一种，而是服务端状态不对：
+	// 空密钥下 HMAC-SHA256 退化成一个所有人都能算出来的固定函数，于是任何人都能离线
+	// 造出通得过校验的令牌。所以空密钥既不签发也不校验，一律当失败处理（fail closed）。
+	//
+	// 这道闸的意义在于它不问密钥"为什么"是空的：随机源异常、导入了一份被裁剪过的备份、
+	// 有人手改了 config.json、将来某次重构漏了一条赋值路径——所有路径都在这里被挡住，
+	// 而不是各自去堵。密钥正常时它的成本是一次字符串长度比较。
+	ErrNoSecret = errors.New("会话签名密钥未配置")
 )
 
 // HashPassword 使用 bcrypt 生成密码哈希。
@@ -64,6 +72,9 @@ const tokenNonceBytes = 12
 // 一边点退出，另一边跟着掉线；"关闭最后一个标签"的信标也会连带把另一边标成待删除。
 // 更要紧的是它让"改密码时给当前浏览器换一条新会话"变成空操作，旧令牌的副本照旧有效。
 func IssueToken(secret, username string, ttl time.Duration) (string, error) {
+	if secret == "" {
+		return "", ErrNoSecret // 见 ErrNoSecret：空密钥的签名等于没有签名
+	}
 	nonce := make([]byte, tokenNonceBytes)
 	if _, err := rand.Read(nonce); err != nil {
 		return "", err // 取不到随机数就不签发，不退回可预测的形式
@@ -87,6 +98,11 @@ func IssueToken(secret, username string, ttl time.Duration) (string, error) {
 // ParseToken 校验令牌签名与有效期，返回其中的用户名。
 // jti 不参与校验：它只是签发时掺进去的随机串，升级前签发的令牌没有这个字段也照样能解。
 func ParseToken(secret, token string) (string, error) {
+	if secret == "" {
+		// 校验侧也要拦。只拦签发是不够的：攻击者手上的令牌不必由本进程签发，
+		// 空密钥下他自己就能算出正确签名。
+		return "", ErrNoSecret
+	}
 	parts := strings.SplitN(token, ".", 2)
 	if len(parts) != 2 {
 		return "", ErrInvalidToken

@@ -214,12 +214,30 @@ func (s *Server) handleSessionClose(c *gin.Context) {
 	respondOK(c, gin.H{"ok": true})
 }
 
-// handleMe 返回当前登录用户信息。
+// handleMe 返回当前登录用户信息，外加本次会话还剩多少秒（expiresIn）。
 // 只回 username：二次验证（Auth.TwoFA）本期未实现，曾经下发的 twoFA 字段前端从未使用，
 // 留着只会让"接口说有、界面没有"的假象一直存在。真正实现时再连同界面一起加回来。
+//
+// expiresIn 是「令牌有效时长」（Auth.SessionHours）剩下的秒数，给前端排一个到期闹钟用：
+// 到点之后服务端本来就会拒绝这条会话，但浏览器不会自己知道——页面上没有任何请求要发，
+// 于是界面停在原样，直到用户点了什么才被一个 401 弹回登录页。多开的窗口更明显：
+// 有的已经跳走、有的还亮着一个能填的表单。
+//
+// 下发**剩余秒数**而不是绝对时间戳：客户端时钟可以和服务器差上几小时（虚拟机休眠、
+// 时区设错、手动改过），拿绝对时间比对等于把这份误差直接算进有效期里。用相对秒数
+// 由浏览器换算成自己时间轴上的时刻，误差就只剩一次网络往返。
+//
+// 取不到（会话不在表里）时**不带**这个字段，而不是回 0：0 会被前端读成"立刻到期"。
+// 缺字段则前端退回原来的行为（下次请求被 401 弹走），这是一个安全的降级方向。
 func (s *Server) handleMe(c *gin.Context) {
 	username, _ := c.Get("username")
-	respondOK(c, gin.H{"username": username})
+	out := gin.H{"username": username}
+	if token := s.extractToken(c); token != "" {
+		if d, ok := s.sessions.expiresIn(token); ok {
+			out["expiresIn"] = int(d.Seconds())
+		}
+	}
+	respondOK(c, out)
 }
 
 // setSessionCookie 下发会话 Cookie。

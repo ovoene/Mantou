@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { computed, ref, onActivated, onDeactivated, onBeforeUnmount } from 'vue'
+import { computed, ref, onActivated } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { ElMessage } from 'element-plus'
 import { Plus } from '@element-plus/icons-vue'
 import PageCard from '@/components/PageCard.vue'
 import RowActions from '@/components/RowActions.vue'
 import { useNarrow } from '@/composables/useNarrow'
+import { usePolling } from '@/composables/usePolling'
 import { useResource, fmtTime } from '@/composables/useResource'
 import { actions, type WOLInterface } from '@/api/resources'
 
@@ -217,23 +218,14 @@ async function wake(row: Device) {
   }
 }
 
-let refreshTimer: ReturnType<typeof setInterval> | undefined
-function startRefresh() {
-  if (refreshTimer) return
-  refreshTimer = setInterval(() => r.load({ silent: true }), 3000)
-}
-function stopRefresh() {
-  if (!refreshTimer) return
-  clearInterval(refreshTimer)
-  refreshTimer = undefined
-}
+// 在线状态由后端探活得来，3 秒一轮。停 / 恢复的三条规则（切页停、标签页不可见停、
+// 重新可见补一次）都在 usePolling 里，这里只表达"这一页需要轮询"。
+const poll = usePolling(() => r.load({ silent: true }), 3000)
 
 onActivated(() => {
   void r.load()
-  startRefresh()
+  poll.start()
 })
-onDeactivated(stopRefresh)
-onBeforeUnmount(stopRefresh)
 </script>
 
 <template>

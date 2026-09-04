@@ -133,7 +133,11 @@ func (p *baiduProvider) call(ctx context.Context, secrets map[string]string, met
 
 	var bodyBytes []byte
 	if payload != nil {
-		bodyBytes, _ = json.Marshal(payload)
+		b, err := marshalBody(payload)
+		if err != nil {
+			return err
+		}
+		bodyBytes = b
 	}
 
 	timestamp := time.Now().UTC().Format("2006-01-02T15:04:05Z")

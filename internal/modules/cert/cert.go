@@ -890,6 +890,9 @@ func (m *Module) issue(ctx context.Context, certID string, renewal bool) (string
 	}
 
 	cfg := m.cfgMgr.Get()
+	if cfg == nil {
+		return "", fmt.Errorf("读取配置失败")
+	}
 	var target *config.Certificate
 	for i := range cfg.Certs {
 		if cfg.Certs[i].ID == certID {

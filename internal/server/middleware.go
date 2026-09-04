@@ -68,10 +68,29 @@ func (s *Server) requestLogger() gin.HandlerFunc {
 	}
 }
 
-// csrfGuard 对状态变更型请求（POST/PUT/DELETE/PATCH）做轻量同源校验：
-// 若请求携带 Origin 头且与当前 Host 不同源，则拒绝，防御跨站请求伪造（CSRF）。
-// 同源请求（含本应用前端调用与 sendBeacon 软注销信标）的 Origin 与 Host 一致，不受影响；
-// 未携带 Origin 的请求（如部分同源导航）不拦截。
+// csrfGuard 对状态变更型请求（POST/PUT/DELETE/PATCH）做同源校验，防御跨站请求伪造。
+//
+// 判定顺序与理由：
+//
+//  1. Sec-Fetch-Site（Chrome 76+ / Firefox 90+ / Safari 16.4+）。这个头由浏览器自己填，
+//     页面脚本改不了，比 Origin 更可信，所以排在最前。取 same-origin 与 none（地址栏、
+//     书签这类用户直接发起的导航）为放行；same-site 与 cross-site 一律拒——同站不等于同源，
+//     旁边一个子域被拿下就能打过来。
+//     顺带修掉一个反代场景：代理改写 Host 时 Origin 比对必然不相等（下面 sameOrigin 比的是
+//     u.Host == r.Host），而浏览器在这种部署里照样会给出 same-origin，于是这一步先放行。
+//
+//  2. 没有 Sec-Fetch-Site 的（旧浏览器、非浏览器客户端）退回 Origin 比对，与之前一致。
+//
+//  3. 两个头都没有——这是本次收紧的那一格，原先直接放行。放行等于**整道防线可以被绕过**：
+//     跨站表单在少数旧浏览器上不带 Origin，而 Cookie 会照常被带上。
+//     现在改为：**带着会话 Cookie 就拒**。CSRF 的载体只有 Cookie（浏览器自动附加），
+//     靠 Authorization: Bearer 鉴权的请求跨站根本发不出来——自定义头会触发 CORS 预检，
+//     本服务不放行任何跨源预检。所以脚本调接口的正确姿势（先 POST /auth/login 拿令牌，
+//     此后带 Bearer）完全不受影响，登录那一跳本身也还没有 Cookie、照常通过。
+//
+// 唯一被这条收紧挡住的是「拿 Cookie 当长期凭据、又不设任何请求头」的非浏览器脚本；
+// 那恰好也是唯一在 CSRF 意义上不可区分于攻击者的调用形态。补一个 -H "Origin: <面板地址>"
+// 即可，或改用 Bearer。
 func (s *Server) csrfGuard() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if c.Request.Method == http.MethodGet ||
@@ -80,14 +99,43 @@ func (s *Server) csrfGuard() gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		origin := c.GetHeader("Origin")
-		if origin == "" || sameOrigin(c.Request, origin) {
+		switch c.GetHeader("Sec-Fetch-Site") {
+		case "same-origin", "none":
 			c.Next()
 			return
+		case "same-site", "cross-site":
+			s.rejectCrossSite(c)
+			return
 		}
-		respondError(c, http.StatusForbidden, "请求来源不被允许")
-		c.Abort()
+		if origin := c.GetHeader("Origin"); origin != "" {
+			if sameOrigin(c.Request, origin) {
+				c.Next()
+				return
+			}
+			s.rejectCrossSite(c)
+			return
+		}
+		if hasSessionCookie(c.Request) {
+			s.rejectCrossSite(c)
+			return
+		}
+		c.Next()
 	}
+}
+
+// rejectCrossSite 拒掉一个来源可疑的状态变更请求。
+// 以 WARN 记录：这既可能是真的 CSRF 尝试，也可能是某个脚本升级后开始被拦，
+// 两种情况都需要在日志里看得见，否则表现为"面板某个操作莫名 403"。
+func (s *Server) rejectCrossSite(c *gin.Context) {
+	s.deps.Log.Warn("已拒绝跨站状态变更请求",
+		"method", c.Request.Method,
+		"path", c.Request.URL.Path,
+		"origin", c.GetHeader("Origin"),
+		"fetchSite", c.GetHeader("Sec-Fetch-Site"),
+		"ip", c.ClientIP(),
+	)
+	respondError(c, http.StatusForbidden, "请求来源不被允许")
+	c.Abort()
 }
 
 // sameOrigin 判断 origin 是否与请求 Host 同源（比较 host，含端口）。
@@ -97,6 +145,18 @@ func sameOrigin(r *http.Request, origin string) bool {
 		return false
 	}
 	return u.Host == r.Host
+}
+
+// hasSessionCookie 判断请求是否带着会话 Cookie（三个名字任一，见 extractToken）。
+// 只看"有没有"，不校验令牌本身——csrfGuard 排在鉴权之前，此处要的只是
+// "这次请求会不会被 Cookie 自动鉴权"这一个事实。
+func hasSessionCookie(r *http.Request) bool {
+	for _, name := range [3]string{sessionCookie, sessionCookieSecure, sessionCookieLegacy} {
+		if ck, err := r.Cookie(name); err == nil && ck.Value != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // authRequired 校验会话令牌；未登录返回 401。

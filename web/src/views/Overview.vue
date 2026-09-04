@@ -10,6 +10,7 @@ import {
 } from 'echarts/components'
 import { CanvasRenderer } from 'echarts/renderers'
 import api from '@/api/client'
+import { usePolling } from '@/composables/usePolling'
 import { useAppearanceStore } from '@/stores/appearance'
 import { currentLocale } from '@/i18n'
 
@@ -91,7 +92,6 @@ const cpuEl = ref<HTMLDivElement>()
 const netEl = ref<HTMLDivElement>()
 let cpuChart: echarts.ECharts | null = null
 let netChart: echarts.ECharts | null = null
-let timer: number | null = null
 
 function fmtBytes(n: number): string {
   if (!n) return '0 B'
@@ -375,39 +375,18 @@ function unobserveCharts() {
   ro = null
 }
 
-function startPolling() {
-  if (timer !== null) return
-  timer = window.setInterval(() => load(true), POLL_MS)
-}
-function stopPolling() {
-  if (timer === null) return
-  clearInterval(timer)
-  timer = null
-}
-
-// 标签页不可见时停止轮询。"面板开着忘了关"很常见，而后台标签页的轮询既白占上行带宽
-//（远程访问家宽时尤其明显：约 8 KB/s ≈ 30 MB/小时），又让后端持续为无人查看的页面采样。
-// 重新可见时立刻补一次拉取，避免图表停在离开时的旧数据上。
-function onVisibilityChange() {
-  if (document.hidden) {
-    stopPolling()
-    return
-  }
-  startPolling()
-  void load(true)
-}
-
-// alive 标记本页当前是否处于「激活」状态。keep-alive 下切走只是 deactivate，
-// 若在 onActivated 的 await load() 期间用户已经切到别的模块，onDeactivated 早已跑完，
-// 此时再 startPolling 就会留下一个谁也不会停掉的定时器（每 3 秒继续打接口）。
-let alive = false
+// 轮询：切页停、标签页不可见停、重新可见补一次，三条都在 usePolling 里
+//（那里也记着为什么值得停——后台标签页的轮询白占上行带宽，还让后端为无人查看的页面采样）。
+//
+// poll.start() 在页面切走后会自动变成空操作，因此下面 onActivated 里那句
+// 「await load() 之后再 start」不需要自己记一个 alive 标记：若这期间用户已经切到别的模块，
+// 这一句什么也不做，不会留下一个谁都不会停掉的定时器。
+const poll = usePolling(() => load(true), POLL_MS)
 
 // 页面被激活（含首次挂载——keep-alive 下 onActivated 在 onMounted 之后同样会触发一次，
 // 因此这里是唯一的入口，不需要"首次挂载"分支）。
-// 图表实例、容器尺寸监听、visibilitychange 监听、轮询定时器全在这里成对建立，在 onDeactivated 成对拆除：
-// 被缓存的页面必须停掉轮询，否则十个模块切一圈之后会有十份定时器同时在后台打接口。
+// 图表实例与容器尺寸监听在这里成对建立、在 onDeactivated 成对拆除。
 onActivated(async () => {
-  alive = true
   await nextTick()
   // 复用缓存实例：keep-alive 保留了 DOM，切回来时 cpuEl/netEl 仍是同一批元素，
   // 重新 init 会泄漏掉旧实例（echarts 以 DOM 为键，重复 init 会告警）。
@@ -416,29 +395,20 @@ onActivated(async () => {
   // 离开期间侧栏可能被折叠、窗口可能被缩放，那时监听已摘除，容器尺寸与画布不一致。
   resize()
   observeCharts()
-  document.addEventListener('visibilitychange', onVisibilityChange)
   // 拉取失败不应连带把轮询也一起废掉（否则一次瞬时错误就让页面永久停在旧数据上）。
   try {
     await load()
   } catch {
     /* 忽略瞬时错误，交给下一轮轮询 */
   }
-  if (alive) startPolling()
+  poll.start()
 })
 
-onDeactivated(() => {
-  alive = false
-  stopPolling()
-  unobserveCharts()
-  document.removeEventListener('visibilitychange', onVisibilityChange)
-})
+onDeactivated(unobserveCharts)
 
 // keep-alive 缓存被销毁时（退出登录 / 整个布局卸载）才真正释放 echarts 实例。
 onBeforeUnmount(() => {
-  alive = false
-  stopPolling()
   unobserveCharts()
-  document.removeEventListener('visibilitychange', onVisibilityChange)
   cpuChart?.dispose()
   netChart?.dispose()
   cpuChart = null

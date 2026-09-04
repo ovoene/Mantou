@@ -1,9 +1,16 @@
 <script setup lang="ts">
-import { ref, reactive, computed, onActivated, watch } from 'vue'
+import { ref, reactive, computed, onActivated, watch, h } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import PageCard from '@/components/PageCard.vue'
-import { actions, type GfwConfig, type GfwPreset, type GfwUpdateReq, type FirewallBan } from '@/api/resources'
+import {
+  actions,
+  type GfwConfig,
+  type GfwPreset,
+  type GfwUpdateReq,
+  type GfwDenyResp,
+  type FirewallBan,
+} from '@/api/resources'
 import { fmtTime, fmtBytes } from '@/composables/useResource'
 import { useNarrow } from '@/composables/useNarrow'
 import { gfwLevelLabel } from '@/composables/gfwText'
@@ -71,7 +78,7 @@ const limits = reactive<{
 }>({
   maxIps: 256,
   maxMemoryMB: 15,
-  maxBanMinutes: 1440,
+  maxBanMinutes: 10080,
   minWindowSeconds: 1,
   maxWindowSeconds: 3600,
   minLimit: 1,
@@ -83,6 +90,17 @@ const limits = reactive<{
 // 档位是否为「自定义」。只有它才允许手填数值：其余档位的数值由服务端按档位重写
 // （见 config.normalizeGlobalFirewall），让用户在那里输入等于让他改一个不会生效的数。
 const isCustom = computed(() => cfg.level === 'custom')
+
+// maxBanDays 封禁时长上限折算成天，只用于说明文案。
+//
+// 上限是 10080 分钟，而"10080 分钟"这个数字读不出量级——用户想知道的是"能封多久"。
+// 从 limits.maxBanMinutes 折算而不是在语言包里写死"7 天"：上限由后端下发，
+// 写死就意味着改了常量之后两个语言包里各有一处会悄悄对不上。
+// 取一位小数再去掉多余的 ".0"，于是整天数显示成 7 而不是 7.0。
+const maxBanDays = computed(() => {
+  const d = limits.maxBanMinutes / 1440
+  return d >= 1 ? String(Math.round(d * 10) / 10) : d.toFixed(2)
+})
 
 // levelLabel 档位的译名。用 composables/gfwText 里那一份，与两个业务页顶部的状态条同源：
 // 各自写一份的话，"均衡"在模块页和状态条上能显示成两个不同的词，且不会有任何报错。
@@ -254,6 +272,103 @@ async function clearBans() {
   }
 }
 
+// 「加入黑名单」= 把一条临时封禁升级成永久的拒绝名单条目。
+//
+// 走后端专用口子（POST /global-firewall/bans/deny）而不是"改 denyText 再点保存"：
+// 保存走的 PUT 是整体替换名单，而这个文本框里那份是打开页面时取的，期间别处新增的条目
+// 会被静默抹掉；而且服务端那条口子还会在同一次请求里解除对应的临时封禁，
+// 不会留下"名单加上了、封禁还挂着"的中间态。
+const denying = ref(false)
+
+// denyDirty 「黑名单」页的文本框有没有未保存的编辑。
+//
+// 这条口子成功之后要用服务端返回的整份名单回填文本框（那才是真正落盘的内容），
+// 于是用户手打还没保存的那些行会被覆盖掉。比较的是**规范化后的行**而不是原始文本：
+// 否则光标在文本框里敲了个回车就算"有改动"，白弹一次确认。
+const denyDirty = computed(() => textToList(denyText.value).join('\n') !== listToText(cfg.denyIps))
+
+// askDeny 需要确认时弹确认框，返回用户是否继续。
+//
+// 单个升级且没有未保存编辑时**不弹**：与同一行的「解除封禁」同口径——一次点击对应一条记录，
+// 后果看得见、也能在黑名单页手工删回去，为它加一次确认只是给常用操作加摩擦。
+// 批量升级一定要确认：一次可能写进几十条永久条目，而共用出口 IP 的场合会连带把人关在门外。
+async function askDeny(all: boolean, n: number): Promise<boolean> {
+  const parts: string[] = []
+  if (all) parts.push(t('gfw.banDenyAllConfirm', { n }))
+  if (denyDirty.value) parts.push(t('gfw.banDenyDirty'))
+  if (parts.length === 0) return true
+  try {
+    // 用 vnode 而不是拼接字符串：两段话之间要有真正的段间距，
+    // 而 el-message-box 的纯文本模式会把换行压成一个空格。也不用 HTML 字符串——
+    // 那需要 dangerouslyUseHTMLString，为两行静态文案开这个口子不值当。
+    await ElMessageBox.confirm(
+      h(
+        'div',
+        { style: 'display:flex;flex-direction:column;gap:8px' },
+        parts.map((s) => h('p', { style: 'margin:0' }, s)),
+      ),
+      '',
+      {
+        confirmButtonText: t('common.confirm'),
+        cancelButtonText: t('common.cancel'),
+        type: 'warning',
+      },
+    )
+    return true
+  } catch {
+    return false
+  }
+}
+// applyDenyResult 回填服务端返回的整份名单，并把结果说清楚。
+//
+// 只动 denyIps / denyText 两处，**不**整页 load()：用户可能正在设置页改着档位和阈值，
+// 一次 load() 会把那些还没保存的改动全部冲掉——为了刷新一张名单而丢掉别处的输入不划算。
+function applyDenyResult(res: GfwDenyResp) {
+  if (Array.isArray(res.denyIps)) cfg.denyIps = res.denyIps
+  denyText.value = listToText(cfg.denyIps)
+  const stat = {
+    added: res.added ?? 0,
+    skipped: res.skipped ?? 0,
+    unbanned: res.unbanned ?? 0,
+    max: res.maxIps || limits.maxIps,
+  }
+  // 截断必须报出来：悄悄丢掉后半截，用户会以为一键之后所有来源都封死了。
+  if (res.capped) ElMessage.warning(t('gfw.banDenyCapped', stat))
+  else ElMessage.success(t('gfw.banDenyOk', stat))
+}
+
+// denyOne 单个加入黑名单。
+async function denyOne(ip: string) {
+  if (denying.value) return
+  if (!(await askDeny(false, 1))) return
+  denying.value = true
+  try {
+    applyDenyResult(await actions.denyGlobalFirewallBans({ ip }))
+    await loadBans()
+  } catch (e: any) {
+    ElMessage.error(e?.message || t('common.saveFailed'))
+  } finally {
+    denying.value = false
+  }
+}
+
+// denyAll 一键加入黑名单：升级当前**全部**生效封禁，不止界面上列出的那些。
+// 服务端按封禁表全量快照办事（界面只列前 gfwBanListLimit 条），所以确认文案里用的是
+// banTotal 而不是 bans.length——说的数与实际发生的必须是一回事。
+async function denyAll() {
+  if (denying.value || bans.value.length === 0) return
+  if (!(await askDeny(true, banTotal.value))) return
+  denying.value = true
+  try {
+    applyDenyResult(await actions.denyGlobalFirewallBans({ all: true }))
+    await loadBans()
+  } catch (e: any) {
+    ElMessage.error(e?.message || t('common.saveFailed'))
+  } finally {
+    denying.value = false
+  }
+}
+
 // 切到「自动封禁」才去拉封禁名单：它是内存里随时在变的东西，要的是"打开时看到当下"，
 // 而不是进页面时抓的那一眼。
 watch(activeTab, (tab) => {
@@ -379,7 +494,7 @@ onActivated(load)
                 />
                 <span class="unit">{{ t('gfw.unitMinutes') }}</span>
               </div>
-              <p class="field-hint">{{ t('gfw.banMinutesHint', { max: limits.maxBanMinutes }) }}</p>
+              <p class="field-hint">{{ t('gfw.banMinutesHint', { max: limits.maxBanMinutes, days: maxBanDays }) }}</p>
             </div>
           </el-form-item>
 
@@ -407,23 +522,9 @@ onActivated(load)
           <el-button type="primary" :loading="saving" @click="save">{{ t('common.save') }}</el-button>
           <p class="field-hint save-hint">{{ t('gfw.saveHint') }}</p>
         </div>
-        <el-divider />
-
-        <!-- 来源自检：复用实时封禁数据，作为「服务防护确实看到了真实来源 IP 并已在拦截」的信号。 -->
-        <div class="selfcheck">
-          <div class="sc-title">{{ t('gfw.selfCheck') }}</div>
-          <p class="field-hint">{{ t('gfw.selfCheckHint') }}</p>
-          <template v-if="banTotal > 0">
-            <p class="field-hint">{{ t('gfw.selfCheckActive', { n: banTotal }) }}</p>
-            <div class="sc-list">
-              <div v-for="b in bans.slice(0, 5)" :key="b.ip" class="sc-item">
-                <span class="sc-ip">{{ b.ip }}</span>
-                <span class="field-hint">{{ t('gfw.banColBannedAt') }} {{ fmtTime(b.bannedAt) }}</span>
-              </div>
-            </div>
-          </template>
-          <p v-else class="field-hint">{{ t('gfw.selfCheckEmpty') }}</p>
-        </div>
+        <!-- 「来源自检」原先在这里，已移到「自动封禁」页签：它念的是实时封禁数据，
+             与那一页的名单是同一份来源，放在设置页要么显示的是进页面时抓的旧值，
+             要么得为它单独再拉一次。设置页因此不再需要一条分隔线（下方还有全局的那条）。 -->
       </div>
 
       <!-- 白名单 -->
@@ -479,12 +580,19 @@ onActivated(load)
         </div>
         <div class="storage-bar" style="margin: 14px 0">
           <el-button :loading="bansLoading" @click="loadBans">{{ t('common.refresh') }}</el-button>
+          <!-- 一键加入黑名单：把当前全部生效封禁升级成永久拒绝名单条目。
+               放在「解除全部封禁」左边——两个按钮的后果相反（一个放行、一个封死），
+               危险色那个留在最右，手滑点到的那个就不会是不可逆的这一侧。 -->
+          <el-button type="warning" :disabled="bans.length === 0 || denying" :loading="denying" @click="denyAll">
+            {{ t('gfw.banDenyAll') }}
+          </el-button>
           <el-button type="danger" :disabled="bans.length === 0" @click="clearBans">{{ t('gfw.banClearAll') }}</el-button>
           <span class="field-hint">
             {{ t('gfw.banTotal', { n: banTotal }) }}
             <template v-if="banTotal > bans.length">{{ t('gfw.banTruncated', { n: bans.length }) }}</template>
           </span>
         </div>
+        <p class="field-hint" style="margin: 0 0 12px">{{ t('gfw.banDenyHint', { max: limits.maxIps }) }}</p>
         <el-empty
           v-if="!bansLoading && bans.length === 0"
           :description="t('gfw.banEmpty')"
@@ -498,8 +606,31 @@ onActivated(load)
               {{ t('gfw.banColCount') }} {{ b.rounds }}
             </el-tag>
             <span class="field-hint">{{ t('gfw.banColUntil') }} {{ fmtTime(b.until) }}</span>
+            <!-- 行内两个动作按同一条理由排序：升级（不可逆）在前，解除在后，
+                 于是最右边那个是"放行"而不是"永久封死"。 -->
+            <el-button link type="warning" :disabled="denying" @click="denyOne(b.ip)">
+              {{ t('gfw.banDeny') }}
+            </el-button>
             <el-button link type="primary" @click="unban(b.ip)">{{ t('gfw.banUnban') }}</el-button>
           </div>
+        </div>
+
+        <!-- 来源自检：从设置页移来。它念的就是本页这份实时封禁数据——
+             「服务防护确实看到了真实来源 IP 并已在拦截」这个信号，和名单放在一起才有对照。 -->
+        <el-divider />
+        <div class="selfcheck">
+          <div class="sc-title">{{ t('gfw.selfCheck') }}</div>
+          <p class="field-hint">{{ t('gfw.selfCheckHint') }}</p>
+          <template v-if="banTotal > 0">
+            <p class="field-hint">{{ t('gfw.selfCheckActive', { n: banTotal }) }}</p>
+            <div class="sc-list">
+              <div v-for="b in bans.slice(0, 5)" :key="b.ip" class="sc-item">
+                <span class="sc-ip">{{ b.ip }}</span>
+                <span class="field-hint">{{ t('gfw.banColBannedAt') }} {{ fmtTime(b.bannedAt) }}</span>
+              </div>
+            </div>
+          </template>
+          <p v-else class="field-hint">{{ t('gfw.selfCheckEmpty') }}</p>
         </div>
       </div>
 

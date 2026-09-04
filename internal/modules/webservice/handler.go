@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/tls"
 	"fmt"
+	"html"
 	"io"
 	"net"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -203,12 +205,7 @@ func staticHandler(ch config.WebChild) http.Handler {
 	if index == "" {
 		index = "index.html"
 	}
-	site := &staticFiles{dir: http.Dir(root), index: index, spa: ch.Static.SPAFallback}
-	if ch.Static.DirList {
-		// 只有开了目录列表才用得上 FileServer——那页索引是它在这里唯一还有用的部分。
-		site.lister = http.FileServer(site.dir)
-	}
-	return site
+	return &staticFiles{root: root, index: index, spa: ch.Static.SPAFallback, dirList: ch.Static.DirList}
 }
 
 // staticFiles 提供静态站点的文件。刻意不把请求整个交给 http.FileServer：
@@ -218,10 +215,10 @@ func staticHandler(ch config.WebChild) http.Handler {
 //   - 点开头的文件默认不发（.git/、.env 这类），.well-known 例外；
 //   - 配置里那个 Index 文件名真正生效——FileServer 只认死了的 index.html。
 type staticFiles struct {
-	dir    http.Dir
-	index  string
-	spa    bool
-	lister http.Handler // 非 nil 表示允许列目录
+	root    string
+	index   string
+	spa     bool
+	dirList bool // 允许列目录
 }
 
 func (s *staticFiles) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -240,7 +237,7 @@ func (s *staticFiles) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if st.IsDir() {
 		// 目录必须带尾斜杠，否则页面内的相对链接会少拼一层（标准库同样这么跳）。
 		if !strings.HasSuffix(r.URL.Path, "/") {
-			redirectToDir(w, r)
+			redirectToDir(w, r, rel)
 			return
 		}
 		s.serveDir(w, r, rel)
@@ -249,10 +246,34 @@ func (s *staticFiles) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	http.ServeContent(w, r, st.Name(), st.ModTime(), f)
 }
 
-// open 打开站点内的一个路径。走 http.Dir.Open 而不是自己拼字符串：它会把路径
-// 收敛在根目录以内，并挡掉 Windows 上用反斜杠当分隔符的写法。
+// open 打开站点内的一个路径。
+//
+// 用 os.Root（Go 1.24 起）而不是 http.Dir：后者只把**路径字符串**收敛在根目录以内，
+// 落到磁盘那一步照样跟着符号链接走。于是站点根里一条 `pub -> /etc` 就能让访客读到
+// 站点外的文件，而路径检查全都是过的（"/pub/passwd" 本身规规矩矩）。
+// os.Root 交给内核判定（Linux 上 openat2 + RESOLVE_BENEATH），指向根外的链接直接打不开，
+// 指向根内的相对链接仍然能用——`current -> releases/v3` 这类正常用法不受影响。
+//
+// 已知的行为收窄：os.Root 把**绝对路径的链接目标**一律判成逃逸，哪怕目标就在根里
+// （它的约束模型是逐段 openat + 不许离开根，绝对路径在这个模型里没法表达）。
+// 所以站点根内写成 `current -> /srv/www/releases/v3` 的链接改动后取不到，改成相对目标即可。
+// 不为它加回退（失败后用 EvalSymlinks 判一下是否仍在根内、再按普通路径打开）是刻意的：
+// 那会在"检查"与"打开"之间留一个可替换链接的时间窗，而能往站点根里写链接的人正是
+// 这条缺陷唯一的攻击者。
+//
+// 每个请求开一次根句柄再关掉，而不是在构造时开一个长期持有：
+//   - 静态站点的处理器随配置重载重建，长期句柄要跟着加一条关闭路径，而它没有；
+//   - Windows 上长期持有目录句柄会影响管理员改名/删除那个目录；
+//   - 代价是每个请求多一次 open+close，与它本来就要做的 open/stat/read/close 相比可以忽略。
+//
+// 另一个好处是不必再自己挡 Windows 的反斜杠：os.Root 不接受非 "/" 分隔符的路径。
 func (s *staticFiles) open(rel string) (http.File, os.FileInfo, error) {
-	f, err := s.dir.Open(rel)
+	root, err := os.OpenRoot(s.root)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer root.Close()
+	f, err := root.Open(rootRel(rel))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -264,6 +285,16 @@ func (s *staticFiles) open(rel string) (http.File, os.FileInfo, error) {
 	return f, st, nil
 }
 
+// rootRel 把站点内的绝对路径（cleanSitePath 的产物，形如 "/a/b"）换成 os.Root 要的相对形式。
+// 根目录自身写成 "."：os.Root 拒绝绝对路径，也拒绝空串。
+func rootRel(rel string) string {
+	p := strings.TrimPrefix(rel, "/")
+	if p == "" {
+		return "."
+	}
+	return p
+}
+
 // serveDir 处理命中目录的请求：先找本目录的 Index 文件，其次才考虑列清单。
 func (s *staticFiles) serveDir(w http.ResponseWriter, r *http.Request, rel string) {
 	if f, st, err := s.open(path.Join(rel, s.index)); err == nil {
@@ -273,11 +304,68 @@ func (s *staticFiles) serveDir(w http.ResponseWriter, r *http.Request, rel strin
 			return
 		}
 	}
-	if s.lister != nil {
-		s.lister.ServeHTTP(w, r)
+	if s.dirList {
+		s.listDir(w, r, rel)
 		return
 	}
 	s.miss(w, r)
+}
+
+// listDir 列出一个目录。
+//
+// 原先这一步是把整个请求交回 http.FileServer 去列。那样等于在这个处理器的正中间开了个
+// 旁路：FileServer 会拿 r.URL.Path 重新解析一遍路径、重新开文件，上面那几道
+// （cleanSitePath、hiddenSitePath、os.Root 的根内约束）在这条分支上一条都不生效。
+// 于是"目录默认不列清单"这句话在开了列表之后连带把别的硬化也一起关掉了。
+//
+// 自己列还顺手解决一件事：点开头的条目不写进清单。它们本来就取不到（hiddenSitePath 会拒），
+// 把名字列出来只是白告诉访客这里有个 .env。
+func (s *staticFiles) listDir(w http.ResponseWriter, r *http.Request, rel string) {
+	f, _, err := s.open(rel)
+	if err != nil {
+		s.miss(w, r)
+		return
+	}
+	defer f.Close()
+	ents, err := f.Readdir(-1)
+	if err != nil {
+		s.miss(w, r)
+		return
+	}
+	sort.Slice(ents, func(i, j int) bool { return ents[i].Name() < ents[j].Name() })
+
+	var b strings.Builder
+	b.WriteString("<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\">")
+	b.WriteString("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">")
+	b.WriteString("<title>")
+	b.WriteString(html.EscapeString(rel))
+	b.WriteString("</title></head><body><pre>\n")
+	for _, e := range ents {
+		name := e.Name()
+		if hiddenSitePath(name) {
+			continue
+		}
+		if e.IsDir() {
+			name += "/"
+		}
+		// href 用 url.URL 转义（路径里可能有空格、井号、问号），显示文本用 HTML 转义。
+		// 两种转义不能混用：拿转义后的 HTML 当 href，或拿原始名字当 HTML，都会出问题。
+		href := (&url.URL{Path: name}).String()
+		b.WriteString("<a href=\"")
+		b.WriteString(html.EscapeString(href))
+		b.WriteString("\">")
+		b.WriteString(html.EscapeString(name))
+		b.WriteString("</a>\n")
+	}
+	b.WriteString("</pre></body></html>\n")
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	// 目录清单随文件增删而变，不该被缓存住。
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	if r.Method != http.MethodHead {
+		_, _ = io.WriteString(w, b.String())
+	}
 }
 
 // miss 是所有"给不出这个路径"的统一出口：SPA 站回站点首页交给前端路由认路，
@@ -322,8 +410,18 @@ func hiddenSitePath(rel string) bool {
 }
 
 // redirectToDir 给目录补上尾斜杠，与标准库一致用 301。
-func redirectToDir(w http.ResponseWriter, r *http.Request) {
-	loc := r.URL.EscapedPath() + "/"
+//
+// Location 用 cleanSitePath 归一化后的 rel 重建，而**不是**照抄 r.URL.EscapedPath()：
+// 后者是客户端原样递上来的路径，"//evil.example" 这种写法会被浏览器当作协议相对 URL，
+// 于是这一跳成了开放重定向（要够到还得站点根里恰好有个同名目录，但把客户端输入直接
+// 回写进 Location 本身就不该做）。rel 出自 path.Clean("/"+p)，必然以单个 "/" 开头。
+func redirectToDir(w http.ResponseWriter, r *http.Request, rel string) {
+	target := rel
+	if !strings.HasSuffix(target, "/") {
+		// rel 已经是 "/" 时不能再拼一道：Location: "//" 又变回协议相对 URL。
+		target += "/"
+	}
+	loc := (&url.URL{Path: target}).String()
 	if q := r.URL.RawQuery; q != "" {
 		loc += "?" + q
 	}

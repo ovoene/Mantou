@@ -7,7 +7,7 @@ REM Output: ./mantou-<VERSION>-linux-<arch>.tar.gz in current dir
 REM Requires: go, node/npm, system tar (Win10+)
 
 set APP=mantou
-set VERSION=Ver 1.0.3
+set VERSION=Ver 1.0.5
 set BIN_DIR=bin
 set PKG_GOOS=linux
 if not "%~1"=="" ( set PKG_ARCHS=%~1 ) else ( set PKG_ARCHS=amd64 arm64 )
@@ -24,9 +24,12 @@ REM module proxy: default to a China-friendly mirror unless the user already set
 if "%GOPROXY%"=="" set GOPROXY=https://goproxy.cn,direct
 if "%GOSUMDB%"=="" set GOSUMDB=off
 
-REM force the local toolchain: skip go's auto toolchain probe, which can emit a localized
-REM "invalid switch - version" warning on Chinese Windows. Safe because installed go (1.26.6)
-REM already satisfies go.mod's go directive (1.25.0).
+REM force the local toolchain: keep go from downloading and switching to a different toolchain
+REM if go.mod's go directive ever moves ahead of the installed go. Safe as long as the
+REM installed go satisfies that directive (go.mod asks for 1.25.0), and it keeps packaging
+REM working without network access to the toolchain server.
+REM (This was once credited with silencing a localized `invalid switch - "version"` line.
+REM It never did: that came from a `del /f internal/version/gen.go`, since removed.)
 if "%GOTOOLCHAIN%"=="" set GOTOOLCHAIN=local
 
 REM build time (local), format yyyy-MM-dd HH:mm:ss
@@ -90,10 +93,9 @@ echo } >> internal/version/gen.go
 REM normalise the file we just wrote: batch's `echo x >> file` also writes the space that
 REM sits before the `>`, and the two lines above are indented with spaces rather than a tab,
 REM so the generated gen.go is never gofmt-clean. `go fmt` fixes both in one shot.
-REM Why bother for a file that is deleted a few lines below: if the build is interrupted
-REM (Ctrl-C, failing `go mod tidy`, power loss) the file stays on disk, and a stray
-REM unformatted gen.go makes `make check` / the CI gofmt gate fail while pointing at a file
-REM the developer never edited. The gates also skip it explicitly, this is the other half.
+REM This matters because gen.go is kept, not deleted (see the end of :buildone): an
+REM unformatted gen.go would make `make check` / the CI gofmt gate fail while pointing at a
+REM file the developer never edited. The gates also skip it explicitly, this is the other half.
 call go fmt ./internal/version/ >nul 2>&1
 
 call go mod tidy
@@ -107,11 +109,14 @@ go build -trimpath -ldflags "-s -w" -o %BIN_DIR%/%APP% ./cmd/mantou
 set CGO_ENABLED=
 set GOOS=
 set GOARCH=
-if errorlevel 1 (
-  del /f internal/version/gen.go 2>nul
-  goto :fail
-)
-del /f internal/version/gen.go
+if errorlevel 1 goto :fail
+
+REM internal/version/gen.go is left on disk on purpose: a plain local `go build` afterwards
+REM then carries the same version and build time as the packaged binary. It is gitignored
+REM (.gitignore line 46), so it never reaches a commit, and `go fmt` above keeps it
+REM gofmt-clean for the check gates. Do not add a `del` back here -- besides throwing the
+REM version stamp away, `del /f internal/version/gen.go` cannot work: cmd reads the forward
+REM slashes as switches and only prints `invalid switch - "version"` (localized) per arch.
 
 REM sign the fresh binary: Ed25519 over its SHA-256 digest (raw 64 bytes), shipped as
 REM mantou.sig inside the tarball, verified by the server if Update.SignKey is configured.

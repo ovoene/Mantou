@@ -85,7 +85,10 @@ func (p *cloudflareProvider) SetTXT(ctx context.Context, req TXTRequest) error {
 		return nil
 	}
 	payload := map[string]any{"type": "TXT", "name": req.FQDN, "content": req.Value, "ttl": ttl}
-	body, _ := json.Marshal(payload)
+	body, err := marshalBody(payload)
+	if err != nil {
+		return err
+	}
 	endpoint := fmt.Sprintf("%s/zones/%s/dns_records", cfAPIBase, zoneID)
 	return p.do(ctx, client, token, http.MethodPost, endpoint, bytes.NewReader(body), nil)
 }
@@ -123,7 +126,10 @@ func (p *cloudflareProvider) upsert(ctx context.Context, client *http.Client, to
 		return err
 	}
 	payload := map[string]any{"type": recordType, "name": fqdn, "content": value, "ttl": ttl}
-	body, _ := json.Marshal(payload)
+	body, err := marshalBody(payload)
+	if err != nil {
+		return err
+	}
 	var method, endpoint string
 	if recordID == "" {
 		method = http.MethodPost
@@ -209,8 +215,18 @@ func (p *cloudflareProvider) do(ctx context.Context, client *http.Client, token,
 		}
 		return fmt.Errorf("Cloudflare API 失败: %s", string(data))
 	}
-	if out != nil {
-		_ = json.Unmarshal(envelope.Result, &out.Result)
+	if out != nil && len(envelope.Result) > 0 {
+		// 这个错误不能吞：out.Result 空着回去，调用方读不出任何区别。recordID 会因此
+		// 返回空 ID，upsert 便判定"记录不存在"而改走新建——同一个名字上多出一条重复记录。
+		// 传了 out 的三处（zoneID / txtRecords / recordID）都是列表端点，result 是数组或 null，
+		// 后者 Unmarshal 成 nil 切片同样不报错，因此这里报错就只剩"响应真的对不上"这一种情形。
+		//
+		// 上面那个 len > 0 是刻意的：result 整个字段缺失时 RawMessage 为空，
+		// json.Unmarshal 会报"unexpected end of JSON input"。那种响应在旧代码里是被容忍的，
+		// 这次不打算顺手把它变成错误——要挡的是"结构对不上"，不是"字段没给"。
+		if err := json.Unmarshal(envelope.Result, &out.Result); err != nil {
+			return fmt.Errorf("解析 Cloudflare 记录列表失败: %w", err)
+		}
 	}
 	return nil
 }

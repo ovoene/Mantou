@@ -37,6 +37,15 @@ export function setUnauthorizedHandler(fn: () => void) {
   onUnauthorized = fn
 }
 
+// notifyUnauthorized 手工触发上面那套「会话已失效」的处置（清登录态 + 回登录页）。
+//
+// 给不存在 401 响应的场合用：会话到期看门狗在本地就能算出令牌已过期（见 stores/auth.ts），
+// 那一刻并没有一个请求可以借它的状态码。处置逻辑仍然只有一份——否则"到期退出"与
+// "401 退出"会走两条不同的路，其中一条早晚会漏掉某个该清的状态。
+export function notifyUnauthorized() {
+  onUnauthorized?.()
+}
+
 // ApiError 在 Error 之外多带一个 HTTP 状态码。
 //
 // 之前拦截器只把错误消息包成 Error 抛出，状态码就此丢掉——于是调用方只能靠比对

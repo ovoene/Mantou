@@ -176,6 +176,123 @@ func (s *Server) handleClearGlobalFirewallBans(c *gin.Context) {
 	respondOK(c, gin.H{"ok": true, "cleared": n})
 }
 
+// handleDenyGlobalFirewallBans 把自动封禁里的来源升级成拒绝名单（永久、落盘）。
+// 带 ip 升级单个；all=true 升级当前**全部**生效封禁。
+//
+// 为什么需要服务端的一条专用口子，而不是让前端读一份 denyIps、追加两条再 PUT 回来：
+//
+//   - PUT 的名单语义是「带了就整体替换」。前端手里那份 denyIps 是打开页面那一刻取的，
+//     期间若有另一个管理员（或另一个标签页）加过条目，整体替换会把它们静默抹掉。
+//     这里的读—改—写整段在 Config.Update 的写锁内完成，不存在这个窗口。
+//   - 加入拒绝名单之后那条临时封禁就没有意义了：判定顺序是 拒绝名单 → …… → 自动封禁，
+//     前者已经把它挡死。顺手解除封禁能腾出封禁表的位置（表是有容量上限的），
+//     也让「自动封禁」页保持"当下正被机器盯着的那些"这一层语义。两步要么都做要么都不做，
+//     放在一个请求里才不会出现"名单加上了、封禁还挂着"的中间态。
+//   - 名单有 GlobalFirewallMaxIPs 条的硬上限，而封禁表能装上万条。截断必须被**报出来**：
+//     悄悄丢掉后半截，用户会以为一键之后所有来源都封死了。
+func (s *Server) handleDenyGlobalFirewallBans(c *gin.Context) {
+	var req struct {
+		IP  string `json:"ip"`
+		All bool   `json:"all"`
+	}
+	_ = c.ShouldBindJSON(&req)
+
+	// 目标地址。单个来自请求体，全部来自封禁表快照。
+	// BanSnapshot(0) 不限条数：界面上只列 gfwBanListLimit 条，但"一键加入黑名单"说的是
+	// 当前**全部**生效封禁——按界面那 200 条来办，用户看到的和实际发生的就不是一回事。
+	var targets []string
+	switch {
+	case strings.TrimSpace(req.IP) != "":
+		ip := strings.TrimSpace(req.IP)
+		if net.ParseIP(ip) == nil {
+			respondError(c, http.StatusBadRequest, "IP 地址无效")
+			return
+		}
+		targets = []string{ip}
+	case req.All:
+		if s.gfw == nil {
+			respondError(c, http.StatusServiceUnavailable, "服务防护未就绪")
+			return
+		}
+		items, _ := s.gfw.BanSnapshot(0)
+		targets = make([]string, 0, len(items))
+		for _, b := range items {
+			targets = append(targets, b.IP)
+		}
+	default:
+		respondError(c, http.StatusBadRequest, "请指定要加入拒绝名单的来源")
+		return
+	}
+
+	// applied 是"最终确实在拒绝名单里"的那些（新加的 + 本来就在的）。
+	// 只有它们才该解除封禁：因名单满而没加进去的必须保留封禁，否则那些来源当场恢复访问。
+	var added, skipped int
+	var capped bool
+	var applied []string
+	var denyList []string
+	if err := s.deps.Config.Update(func(cfg *config.Config) {
+		// 每次进来都从当前值重算：Update 可能因写盘失败而整份丢弃，闭包外的计数器
+		// 不能跨调用累加（gin 一个请求只调一次，这里是防御性写法，也让本函数可重入）。
+		added, skipped, capped = 0, 0, false
+		applied = applied[:0]
+
+		cur := cfg.GlobalFirewall.DenyIPs
+		seen := make(map[string]bool, len(cur)+len(targets))
+		for _, s := range cur {
+			seen[s] = true
+		}
+		next := make([]string, len(cur), len(cur)+len(targets))
+		copy(next, cur)
+		for _, ip := range targets {
+			if seen[ip] {
+				skipped++
+				applied = append(applied, ip)
+				continue
+			}
+			if len(next) >= config.GlobalFirewallMaxIPs {
+				capped = true
+				continue // 不 break：后面的地址可能已在名单里，那些仍应算 skipped 并解除封禁
+			}
+			seen[ip] = true
+			next = append(next, ip)
+			applied = append(applied, ip)
+			added++
+		}
+		cfg.GlobalFirewall.DenyIPs = next
+		// 与保存表单同一套规范化：写法不合法的条目丢掉、去重、按上限截断，
+		// 于是"这条口子写进去的"与"加载后跑的"永远是同一份值。
+		config.NormalizeGlobalFirewall(&cfg.GlobalFirewall)
+		denyList = append([]string{}, cfg.GlobalFirewall.DenyIPs...)
+	}); err != nil {
+		respondError(c, http.StatusInternalServerError, "保存配置失败")
+		return
+	}
+
+	// 解除封禁放在落盘**之后**：先解封再落盘的话，写盘失败就等于白白放走了一批来源。
+	unbanned := 0
+	if s.gfw != nil {
+		for _, ip := range applied {
+			if s.gfw.Unban(ip) {
+				unbanned++
+			}
+		}
+	}
+	s.deps.Log.Info("服务防护封禁来源加入拒绝名单",
+		"targets", len(targets), "added", added, "skipped", skipped,
+		"capped", capped, "unbanned", unbanned, "denyTotal", len(denyList))
+
+	respondOK(c, gin.H{
+		"ok":       true,
+		"added":    added,
+		"skipped":  skipped,
+		"capped":   capped,
+		"maxIps":   config.GlobalFirewallMaxIPs,
+		"unbanned": unbanned,
+		// 回传整份名单：前端据此刷新「黑名单」页的文本框，不必自己猜服务端规范化后的结果。
+		"denyIps": denyList,
+	})
+}
+
 // globalFirewallReq 服务防护的提交体。
 //
 // **每个**字段都是指针，包括两张名单与档位字符串。理由是同一个：这个接口要能接受

@@ -8,6 +8,7 @@
 package ipx
 
 import (
+	"bytes"
 	"net"
 	"net/http"
 	"strconv"
@@ -18,13 +19,10 @@ import (
 	"mantou/internal/mapx"
 )
 
-// maxRangeIPs 一条「a-b」范围最多展开成多少个单 IP。
-const maxRangeIPs = 4096
-
 // ParseCIDRs 将输入解析为 IP 网络集合，支持三类写法：
 //   - 单个 IP（自动补全为 /32 或 /128）
 //   - CIDR（如 10.0.0.0/24）
-//   - IP 范围（如 192.168.1.1-192.168.1.20），展开为逐个单 IP（封顶 maxRangeIPs）
+//   - IP 范围（如 192.168.1.1-192.168.1.20），转换为**覆盖整段**的最小 CIDR 集合
 //
 // 无法识别的条目直接跳过，不返回错误：名单是用户在面板里手填的，
 // 一条写错不该让整份名单失效（那会把「白名单里有个错字」变成「谁都进不来」）。
@@ -35,7 +33,7 @@ func ParseCIDRs(items []string) []*net.IPNet {
 		if trimmed == "" {
 			continue
 		}
-		// IP 范围：start-end（无斜杠且含连字符），展开为单 IP。
+		// IP 范围：start-end（无斜杠且含连字符），转成覆盖整段的 CIDR 集合。
 		if !strings.Contains(trimmed, "/") && strings.Contains(trimmed, "-") {
 			if nets := parseRange(trimmed); nets != nil {
 				out = append(out, nets...)
@@ -61,8 +59,15 @@ func ParseCIDRs(items []string) []*net.IPNet {
 	return out
 }
 
-// parseRange 将「start-end」形式的 IP 范围展开为一组单 IP 网络。
-// 协议族不一致或范围过大时返回 nil（视为无效、跳过）。
+// parseRange 把「start-end」形式的 IP 范围转换为覆盖整段的最小 CIDR 集合。
+// 协议族不一致、或起点大于终点时返回 nil（视为无效、跳过）。
+//
+// 刻意**不**逐个枚举地址。旧实现把 a-b 展开成单 IP 并封顶 4096 条，而那个封顶是
+// 「静默截断」而不是「整条作废」：用户填 1.0.0.0-2.0.0.0 想拒掉整段，实际只拒了开头
+// 4096 个地址、其余全部放行，且界面上看不出任何异常——对拒绝名单这是个方向不安全的降级。
+//
+// 改成 CIDR 分解后不存在需要截断的规模：任意闭区间最多分解成 2*bitLen-2 个块
+// （IPv4 ≤ 62、IPv6 ≤ 254），覆盖是精确的，内存也从「与区间大小成正比」变成常量级。
 func parseRange(s string) []*net.IPNet {
 	parts := strings.SplitN(s, "-", 2)
 	if len(parts) != 2 {
@@ -73,54 +78,106 @@ func parseRange(s string) []*net.IPNet {
 	if start == nil || end == nil {
 		return nil
 	}
-	if (start.To4() == nil) != (end.To4() == nil) {
+	s4, e4 := start.To4(), end.To4()
+	if (s4 == nil) != (e4 == nil) {
 		// 协议族不一致（一个 IPv4、一个 IPv6）。
 		return nil
 	}
+	// 先统一成同一种字节表示再比较：net.ParseIP("1.2.3.4") 返回的是 16 字节的
+	// IPv4-in-IPv6 形式，拿两个长度不同的切片做字节序比较会得出错误结论。
+	lo, hi, bitLen := start.To16(), end.To16(), 128
+	if s4 != nil {
+		lo, hi, bitLen = s4, e4, 32
+	}
+	if lo == nil || hi == nil {
+		return nil
+	}
+	if bytes.Compare(lo, hi) > 0 {
+		// 起点大于终点。旧实现在这里会一路走到封顶：cur 永远等不到 end，
+		// 于是往名单里塞 4096 条与用户意图毫无关系的地址。
+		return nil
+	}
+	return rangeToCIDRs(lo, hi, bitLen)
+}
+
+// rangeToCIDRs 把闭区间 [lo, hi] 分解成一组对齐的 CIDR 块。
+//
+// 每轮取「以 lo 开头、且不越过 hi 的最大对齐块」：块长先受 lo 末尾零位个数的限制
+// （CIDR 必须按自身长度对齐），再收缩到不超出 hi。每轮至少前进一整块，且块长沿区间
+// 先递增后递减，因此循环次数有上界 2*bitLen-2，不需要额外的条数封顶。
+func rangeToCIDRs(lo, hi []byte, bitLen int) []*net.IPNet {
 	var out []*net.IPNet
-	cur := start
-	count := 0
+	cur := lo
 	for {
-		bits := 32
-		if cur.To4() == nil {
-			bits = 128
+		n := trailingZeroBits(cur)
+		if n > bitLen {
+			n = bitLen
 		}
-		out = append(out, &net.IPNet{IP: cur, Mask: net.CIDRMask(bits, bits)})
-		count++
-		if count > maxRangeIPs || cur.Equal(end) {
-			break
+		last := blockEnd(cur, n)
+		for n > 0 && bytes.Compare(last, hi) > 0 {
+			n--
+			last = blockEnd(cur, n)
 		}
-		next := nextIP(cur)
-		if next == nil || next.Equal(cur) {
-			break // 地址溢出，停止展开
+		ip := make(net.IP, len(cur))
+		copy(ip, cur)
+		out = append(out, &net.IPNet{IP: ip, Mask: net.CIDRMask(bitLen-n, bitLen)})
+		if bytes.Compare(last, hi) >= 0 {
+			return out
+		}
+		next, ok := incBytes(last)
+		if !ok {
+			return out // 地址空间到顶，不可能还有后续块
 		}
 		cur = next
+	}
+}
+
+// trailingZeroBits 返回大端字节串末尾连续零位的个数（全零时返回总位数）。
+func trailingZeroBits(b []byte) int {
+	n := 0
+	for i := len(b) - 1; i >= 0; i-- {
+		if b[i] == 0 {
+			n += 8
+			continue
+		}
+		for m := byte(1); b[i]&m == 0; m <<= 1 {
+			n++
+		}
+		return n
+	}
+	return n
+}
+
+// blockEnd 返回「以 base 开头、长度为 2^n 的块」的末地址，即把低 n 位全部置 1。
+// 调用方取的 n 不超过 base 末尾的零位个数，因此这等价于 base + 2^n - 1 且不会进位。
+func blockEnd(base []byte, n int) []byte {
+	out := make([]byte, len(base))
+	copy(out, base)
+	for i := 0; i < n; i++ {
+		out[len(out)-1-i/8] |= 1 << (i % 8)
 	}
 	return out
 }
 
-// nextIP 返回 ip+1（按 16 字节表示递增，兼容 IPv4 / IPv6）。
-func nextIP(ip net.IP) net.IP {
-	v := ip.To16()
-	out := make(net.IP, len(v))
-	copy(out, v)
+// incBytes 返回大端字节串 +1；已是全 1（地址空间到顶）时返回 false。
+func incBytes(b []byte) ([]byte, bool) {
+	out := make([]byte, len(b))
+	copy(out, b)
 	for i := len(out) - 1; i >= 0; i-- {
 		out[i]++
 		if out[i] != 0 {
-			break
+			return out, true
 		}
 	}
-	if ip.To4() != nil {
-		return out[12:]
-	}
-	return out
+	return out, false
 }
 
 // Matcher 是预解析好的名单匹配器：名单在 Reload 构建处理器时解析一次，请求路径上只做匹配。
 //
 // 分成两半是有意的：单主机条目（/32、/128）进 map 走 O(1) 精确匹配，只有真正带前缀的
-// 网段才留在切片里线性扫。名单里绝大多数条目本就是单个 IP，而「a-b」范围还会被 parseRange
-// 展开成最多 maxRangeIPs 个单 IP——若一律线性扫，一份几千条的封禁名单会让每个请求都遍历整表。
+// 网段才留在切片里线性扫。名单里绝大多数条目本就是单个 IP——若一律线性扫，一份几千条的
+// 封禁名单会让每个请求都遍历整表。「a-b」范围经 parseRange 分解成的 CIDR 块也按同一规则
+// 分流（恰好落成 /32、/128 的块进 map，其余进切片）。
 type Matcher struct {
 	// hosts 的键取 IP 的 16 字节归一形式，使 IPv4 的 4 字节与 IPv4-in-IPv6 两种表示落到同一键。
 	hosts map[[16]byte]struct{}

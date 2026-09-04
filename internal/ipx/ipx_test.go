@@ -7,20 +7,20 @@ import (
 )
 
 // TestIPMatcherSplitsHostsAndNets 单主机条目应进精确匹配表，只有带前缀的网段才留在线性扫描表里。
-// 这正是 M-28 的要点：范围写法会展开成大量单 IP，若全部线性扫，每个请求都要遍历整表。
+// 这正是 M-28 的要点：名单可能很长，若全部线性扫，每个请求都要遍历整表。
 func TestIPMatcherSplitsHostsAndNets(t *testing.T) {
 	m := NewMatcher([]string{
 		"203.0.113.7",             // 单 IP → hosts
 		"10.0.0.0/8",              // 前缀 → nets
-		"192.168.5.1-192.168.5.4", // 范围 → 展开 4 个单 IP → hosts
+		"192.168.5.1-192.168.5.4", // 范围 → .1/32 + .2/31 + .4/32 → 2 进 hosts、1 进 nets
 		"2001:db8::1",             // IPv6 单 IP → hosts
 		"2001:db8:1::/48",         // IPv6 前缀 → nets
 	})
-	if len(m.hosts) != 6 {
-		t.Errorf("精确匹配表应有 6 条，实际 %d", len(m.hosts))
+	if len(m.hosts) != 4 {
+		t.Errorf("精确匹配表应有 4 条，实际 %d", len(m.hosts))
 	}
-	if len(m.nets) != 2 {
-		t.Errorf("网段表应有 2 条，实际 %d", len(m.nets))
+	if len(m.nets) != 3 {
+		t.Errorf("网段表应有 3 条，实际 %d", len(m.nets))
 	}
 }
 

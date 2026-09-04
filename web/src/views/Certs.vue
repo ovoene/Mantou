@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onActivated, onDeactivated, onBeforeUnmount, ref, reactive } from 'vue'
+import { onActivated, ref, reactive } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { ElMessage } from 'element-plus'
 import { Plus, Key, Upload } from '@element-plus/icons-vue'
@@ -7,6 +7,7 @@ import PageCard from '@/components/PageCard.vue'
 import RowActions from '@/components/RowActions.vue'
 import TagInput from '@/components/TagInput.vue'
 import { useNarrow } from '@/composables/useNarrow'
+import { usePolling } from '@/composables/usePolling'
 import { useResource } from '@/composables/useResource'
 import { useCloseOnLeave } from '@/composables/useCloseOnLeave'
 import { actions, credentialsApi } from '@/api/resources'
@@ -338,31 +339,27 @@ async function toggleCert(row: Cert) {
   }
 }
 
-let statusTimer: ReturnType<typeof setInterval> | undefined
-
-// 轮询只在页面处于激活状态时存在，切走即停（见 onDeactivated）。
-function startPolling() {
-  if (statusTimer) return
-  statusTimer = setInterval(() => {
-    if (r.list.value.some((item) => {
+// 有签发 / 续期在跑的时候才拉列表，2 秒一轮。停 / 恢复的三条规则（切页停、
+// 标签页不可见停、重新可见补一次）都在 usePolling 里，这里只表达"这一页需要轮询"。
+//
+// 定时器本身常驻（而不是"有任务时才建、任务完就拆"）：任务是从别处开始的（点按钮、
+// 另一个浏览器标签、后端自动续期），拆掉之后没有谁负责把它建回来。
+const poll = usePolling(() => {
+  if (
+    r.list.value.some((item) => {
       const state = currentOperation(item)?.state
       return state === 'pending' || state === 'running'
-    })) {
-      r.load({ silent: true })
-    }
-  }, 2000)
-}
-
-function stopPolling() {
-  if (statusTimer) clearInterval(statusTimer)
-  statusTimer = undefined
-}
+    })
+  ) {
+    r.load({ silent: true })
+  }
+}, 2000)
 
 // 页面被激活（keep-alive 下首次挂载同样会触发一次，因此这里是唯一入口）。
 // 三个请求彼此独立（证书列表 / ACME 账户 / 凭据），并发发出即可：
 // 原先串行等于把三个往返首尾相接，首屏要等最后一个回来。
 onActivated(() => {
-  startPolling()
+  poll.start()
   r.load()
   acme.load()
   credentialsApi
@@ -372,11 +369,6 @@ onActivated(() => {
     })
     .catch(() => undefined) /* 凭据拉不到不影响证书列表（与原先的 try/catch 同义） */
 })
-
-// 被缓存的页面必须停掉轮询：否则在别的模块里待着，这个 2 秒定时器仍在后台打接口，
-// 十个模块转一圈就会攒下十份定时器。
-onDeactivated(stopPolling)
-onBeforeUnmount(stopPolling)
 
 // 本页另开的两个弹窗（导入 PEM、ACME 账户）也在切页时收起；新增 / 编辑那个在 useResource 里。
 useCloseOnLeave(importVisible, acmeManageVisible)

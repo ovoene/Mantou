@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onActivated, onDeactivated, onUnmounted, ref } from 'vue'
+import { computed, onActivated, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Delete, Edit } from '@element-plus/icons-vue'
@@ -10,6 +10,7 @@ import GfwStatusChip from '@/components/GfwStatusChip.vue'
 import { useResource } from '@/composables/useResource'
 import { useCloseOnLeave } from '@/composables/useCloseOnLeave'
 import { useNarrow } from '@/composables/useNarrow'
+import { usePolling } from '@/composables/usePolling'
 import { maxCountOf } from '@/api/limits'
 import { webServicesApi, actions, type WebAccessLog } from '@/api/resources'
 
@@ -176,7 +177,6 @@ const probeIntervalOptions = computed<number[]>(() => {
 const stats = ref<Record<string, number>>({})
 // 各子项链接状态（最近成功 / 失败时间 + 失败状态码）。
 const childStatus = ref<Record<string, { lastOK: number; lastErr: number; lastStatus: number }>>({})
-let statsTimer: number | undefined
 
 async function refreshStats(silent = false) {
   try {
@@ -543,33 +543,22 @@ function fmtLogTime(ms: number): string {
   return new Date(ms).toLocaleString()
 }
 
-// 轮询只在页面处于激活状态时存在，切走即停（见 onDeactivated）。
-function startPolling() {
-  if (statsTimer) return
-  statsTimer = window.setInterval(() => {
-    refreshStats(true)
-    refreshChildStatus(true)
-  }, 5000)
-}
-
-function stopPolling() {
-  if (statsTimer) window.clearInterval(statsTimer)
-  statsTimer = undefined
-}
+// 连接数与子进程状态 5 秒一轮。停 / 恢复的三条规则（切页停、标签页不可见停、
+// 重新可见补一次）都在 usePolling 里，这里只表达"这一页需要轮询"。
+const poll = usePolling(() => {
+  refreshStats(true)
+  refreshChildStatus(true)
+}, 5000)
 
 // 页面被激活（keep-alive 下首次挂载同样会触发一次，因此这里是唯一入口）。
 // 三个请求彼此独立（规则列表 / 连接数 / 链接状态），并发发出：
 // 原先串行等于把三个往返首尾相接，首屏要等最后一个回来才成形。
 onActivated(() => {
-  startPolling()
+  poll.start()
   r.load()
   refreshStats()
   refreshChildStatus()
 })
-
-// 被缓存的页面必须停掉轮询：否则待在别的模块里时，这个 5 秒定时器仍在后台打两个接口。
-onDeactivated(stopPolling)
-onUnmounted(stopPolling)
 
 // 本页另开的日志弹窗也在切页时收起；新增 / 编辑那个在 useResource 里。
 useCloseOnLeave(logsVisible)

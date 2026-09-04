@@ -10,6 +10,7 @@ package dnsprovider
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -162,4 +163,23 @@ func relativeName(fqdn, zone string) string {
 		return "@"
 	}
 	return strings.TrimSuffix(fqdn, "."+zone)
+}
+
+// marshalBody 序列化请求体，序列化失败即报错。
+//
+// 存在的唯一理由就是"不许把 json.Marshal 的错误丢掉"。各家 provider 的请求体都是
+// map[string]any / []map[string]any，类型上并不保证可序列化（今天塞进去的都是 string 与 int，
+// 但那是约定而不是编译器保证）。而这个错误一旦丢掉，body 就是 nil——请求照样带着算好的
+// 签名发出去，对方回的是一个看不出原因的 400 或"签名不符"，排查方向会被彻底带偏：
+// 看起来像凭据错或时钟偏移，实际是请求体根本没组装出来。
+//
+// 宁可在这里当场失败并把真正的原因说出来。这属于审计里 A-1 / A-2 那一族
+// （失败被静默吞掉、降级方向不安全）；internal/config/silentfail_guard_test.go
+// 会挡住重新写回 `body, _ := json.Marshal(...)` 的改法。
+func marshalBody(v any) ([]byte, error) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil, fmt.Errorf("序列化请求体失败: %w", err)
+	}
+	return b, nil
 }

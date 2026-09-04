@@ -85,8 +85,16 @@ func (m *Manager) Snapshot() *Config {
 	if cfg := m.snap.Load(); cfg != nil {
 		return cfg
 	}
-	// 尚未 Load（仅在初始化竞态或未调用 Load 的测试里出现）：退化为深拷贝，保证非 nil。
-	return m.Get()
+	// 尚未 Load（仅在初始化竞态或未调用 Load 的测试里出现）。这里刻意**不**走 Get()：
+	// Get 会因克隆失败而返回 error，而 Snapshot 必须保证非 nil；且 Snapshot 的契约本就是
+	// 「共享只读」，直接交出内存里那份指针正合语义（Update/Replace 从不就地改已发布的配置）。
+	m.mu.RLock()
+	cfg := m.cfg
+	m.mu.RUnlock()
+	if cfg == nil {
+		return &Config{}
+	}
+	return cfg
 }
 
 // publishLocked 发布 m.cfg 为新的只读快照，调用方需已持有写锁。
@@ -155,10 +163,22 @@ func (m *Manager) loadStateLocked() {
 // Get 返回配置的深拷贝，避免调用方在锁外修改共享状态。
 // 只读场景（尤其是每请求/每握手的热路径）应改用 Snapshot()：Get 每次都要把整份配置
 // 序列化再反序列化一遍，在 TLS 握手与鉴权中间件里属于纯粹的浪费。
+//
+// **深拷贝失败时返回 nil**（见 clone），调用方必须判空并放弃这次操作。这里不改成
+// 返回 (*Config, error)，是因为那会让近百个只读调用点各写一段永远不会执行的错误处理；
+// 而真正会造成损失的两条路——Update / UpdateState 的「落盘 + 换内存」——已经在各自
+// 内部拿到并返回了这个 error，不经过 Get。
 func (m *Manager) Get() *Config {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.cfg.clone()
+	clone, err := m.cfg.clone()
+	if err != nil {
+		// 返回 nil 而不是空 Config：空 Config 会被下游当成"用户真的什么都没配"，
+		// 于是合并出一份空配置再存回去，正是这条缺陷最初的后果。
+		logx.L().Error("复制配置失败", "err", err.Error())
+		return nil
+	}
+	return clone
 }
 
 // Update 在写锁保护下对配置执行修改函数，成功后原子落盘。
@@ -171,7 +191,12 @@ func (m *Manager) Update(mutate func(c *Config)) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	clone := m.cfg.clone()
+	clone, err := m.cfg.clone()
+	if err != nil {
+		// 克隆失败即放弃：不落盘、不换内存。紧接着的 writeLocked 会把 clone 写进
+		// config.json，若这里放一个残缺副本过去，一次「保存设置」就成了「清空配置」。
+		return err
+	}
 	mutate(clone)
 	// 运行态只归 UpdateState / state.json 管辖，配置写入路径一律原样保留。
 	// 否则面板保存表单（PUT 会整体替换条目，而表单里并不包含这些只读字段）
@@ -203,7 +228,13 @@ func (m *Manager) Update(mutate func(c *Config)) error {
 // 该改动只存在于内存中、永远不会落盘，重启即丢失——配置变更必须走 Update。
 func (m *Manager) UpdateState(mutate func(c *Config)) error {
 	m.mu.Lock()
-	clone := m.cfg.clone()
+	clone, err := m.cfg.clone()
+	if err != nil {
+		m.mu.Unlock()
+		// 与 Update 同一取舍：宁可这一拍运行态不更新，也不能把残缺副本换进内存——
+		// 它随后会被 state.json 的批量落盘写出去。
+		return err
+	}
 	mutate(clone)
 	// 脏检查：状态未实际变化（典型如 DDNS 轮询「IP 未变化」、计划任务空跑）时直接返回，
 	// 既不换出内存配置也不标记落盘。
@@ -1073,19 +1104,41 @@ func clearLegacy(ws *WebService) {
 }
 
 // clone 通过 JSON 往返做一次深拷贝。
-func (c *Config) clone() *Config {
-	data, _ := json.Marshal(c)
+//
+// 返回 error 而不是像早先那样用 `_` 把 json 的错误丢掉：Update 紧接着就会把克隆结果
+// 落盘并换进内存，一旦序列化失败而这里静默返回一个空 Config，那一次「保存设置」
+// 就等于**清空全部配置**，而且全程不留任何日志。
+//
+// 当前 Config 的字段类型（string / int / bool / map[string]string / 三个 float64）
+// 保证 Marshal 不会失败，因此这条错误路径今天不可达。但挡住它的是字段类型集合，
+// 不是代码里的判断：将来任何人给 Config 加一个 any / chan 字段，它立刻变成活的。
+func (c *Config) clone() (*Config, error) {
+	data, err := json.Marshal(c)
+	if err != nil {
+		return nil, fmt.Errorf("序列化配置失败: %w", err)
+	}
 	out := &Config{}
-	_ = json.Unmarshal(data, out)
-	return out
+	if err := json.Unmarshal(data, out); err != nil {
+		return nil, fmt.Errorf("解析配置副本失败: %w", err)
+	}
+	return out, nil
 }
 
 // randomHex 生成 n 字节的随机十六进制字符串。
+//
+// crypto/rand.Read 自 Go 1.24 起被文档保证**永不返回错误**（熵源不可用时运行时直接
+// 终止进程），所以下面这条分支不可达。仍然写它、并且写成 panic，是因为旧实现在这里
+// 返回的是空串：三个调用点之一是 Auth.JWTSecret，而 auth 侧对空密钥没有任何拒绝逻辑，
+// 于是「取不到随机数」会静默降级成「任何人都能离线伪造会话令牌」——方向完全反了。
+//
+// 不改成返回 (string, error) 是刻意的取舍：调用点在 Default() 与 migrate 的规范化里，
+// 让它们全部改签名会给十几个调用方各加一段永远不会执行的错误处理。一条不可达的
+// panic 分支同样保住了「失败就停下」的方向，代价为零。空密钥的兜底另有一道，
+// 在 auth.IssueToken / auth.ParseToken 的前置校验里。
 func randomHex(n int) string {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
-		// 极少发生；退化为固定长度零值也不影响后续覆盖写入。
-		return ""
+		panic("config: 无法获取随机数: " + err.Error())
 	}
 	return hex.EncodeToString(b)
 }

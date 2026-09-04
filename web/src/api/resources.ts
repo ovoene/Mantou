@@ -108,6 +108,23 @@ export interface GfwUpdateReq {
   memoryMB?: number
 }
 
+// POST /global-firewall/bans/deny 的返回：把封禁来源升级成拒绝名单的结果。
+//
+// added/skipped 分开报是有用的：批量升级时「20 条里有 18 条早就在名单里」与「新增了 20 条」
+// 对用户是完全不同的两件事。capped 表示名单已满（maxIps 条）、后面的目标没能加进去——
+// 这一条必须让界面显式提示，悄悄丢掉后半截会让人以为所有来源都已封死。
+// denyIps 是服务端规范化之后的整份名单，前端据此直接刷新黑名单页，不必自己猜结果。
+export interface GfwDenyResp {
+  ok: boolean
+  added: number
+  skipped: number
+  capped: boolean
+  maxIps: number
+  // 顺带解除的临时封禁条数：加入拒绝名单后那条封禁已无意义（判定顺序里拒绝名单在前）。
+  unbanned: number
+  denyIps: string[]
+}
+
 // DNS 服务商元信息（供前端动态渲染凭证表单）。
 export interface ProviderField {
   key: string
@@ -279,4 +296,11 @@ export const actions = {
   // 解除服务防护的封禁：带 ip 解除单个，不带则全部解除。
   clearGlobalFirewallBans: (ip?: string) =>
     api.post<{ ok: boolean; cleared: number }>(`/global-firewall/bans/clear`, ip ? { ip } : {}),
+  // 把封禁来源升级成拒绝名单（永久、落盘）：带 ip 升级单个，all=true 升级当前全部生效封禁。
+  //
+  // 不用「读一份 denyIps、前端追加、再整体 PUT」是刻意的：PUT 的名单语义是整体替换，
+  // 而前端手里那份是打开页面那一刻取的，期间别处新增的条目会被静默抹掉。
+  // 这条口子的读—改—写在服务端配置写锁内完成，并在同一次请求里解除对应的临时封禁。
+  denyGlobalFirewallBans: (target: { ip?: string; all?: boolean }) =>
+    api.post<GfwDenyResp>(`/global-firewall/bans/deny`, target),
 }

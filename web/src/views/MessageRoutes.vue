@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onActivated, onDeactivated, onUnmounted, reactive, ref, watch } from 'vue'
+import { computed, onActivated, onUnmounted, reactive, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Setting, Refresh, CopyDocument } from '@element-plus/icons-vue'
@@ -10,6 +10,7 @@ import GfwStatusChip from '@/components/GfwStatusChip.vue'
 import { useNarrow } from '@/composables/useNarrow'
 import { useResource, fmtTime, fmtTimeMs, fmtBytes } from '@/composables/useResource'
 import { useCloseOnLeave } from '@/composables/useCloseOnLeave'
+import { usePolling } from '@/composables/usePolling'
 import ReceiverDialog from '@/components/webhook/ReceiverDialog.vue'
 import RuleDialog from '@/components/webhook/RuleDialog.vue'
 import TargetDialog from '@/components/webhook/TargetDialog.vue'
@@ -560,7 +561,6 @@ const dryReceiver = ref<WebhookReceiver | null>(null)
 const TESTRUN_POLL_MS = 2000
 const testRuns = ref<Record<string, TestRunState>>({})
 const testRunBusy = ref<Record<string, boolean>>({})
-let pollTimer: number | undefined
 
 function isTesting(id?: string): boolean {
   return !!(id && testRuns.value[id]?.running)
@@ -577,30 +577,22 @@ async function pollTestRun(id: string, silent = true) {
   }
 }
 
-function schedulePoll() {
-  if (pollTimer !== undefined) return
-  pollTimer = window.setInterval(async () => {
-    const ids = Object.keys(testRuns.value).filter((id) => testRuns.value[id]?.running)
-    if (!ids.length) {
-      stopPoll()
-      return
-    }
-    const before = ids.filter((id) => testRuns.value[id]?.running)
-    await Promise.all(ids.map((id) => pollTestRun(id)))
-    // 超时自停要主动告诉用户：他以为消息还被拦着，实际上已经恢复转发了。
-    for (const id of before) {
-      const st = testRuns.value[id]
-      if (st && !st.running && st.stoppedReason) ElMessage.warning(st.stoppedReason)
-    }
-  }, TESTRUN_POLL_MS)
-}
-
-function stopPoll() {
-  if (pollTimer !== undefined) {
-    clearInterval(pollTimer)
-    pollTimer = undefined
+// 停 / 恢复的三条规则（切页停、标签页不可见停、重新可见补一次）都在 usePolling 里。
+// 「有没有在试运行」这一条由 tick 自己判：跑完就 stop，避免空转。
+const poll = usePolling(async () => {
+  // ids 取在 await 之前：这一发请求要问的就是"这些刚才还在跑的"现在怎么样了。
+  const ids = Object.keys(testRuns.value).filter((id) => testRuns.value[id]?.running)
+  if (!ids.length) {
+    poll.stop()
+    return
   }
-}
+  await Promise.all(ids.map((id) => pollTestRun(id)))
+  // 超时自停要主动告诉用户：他以为消息还被拦着，实际上已经恢复转发了。
+  for (const id of ids) {
+    const st = testRuns.value[id]
+    if (st && !st.running && st.stoppedReason) ElMessage.warning(st.stoppedReason)
+  }
+}, TESTRUN_POLL_MS)
 
 async function startTestRun(row: WebhookReceiver) {
   if (!row.id) return
@@ -608,7 +600,7 @@ async function startTestRun(row: WebhookReceiver) {
   try {
     const st = await webhookActions.testRunStart(row.id)
     testRuns.value = { ...testRuns.value, [row.id]: st }
-    schedulePoll()
+    poll.start()
   } catch (e: any) {
     ElMessage.error(e?.message || t('common.saveFailed'))
   } finally {
@@ -624,7 +616,7 @@ async function stopTestRun(row: WebhookReceiver) {
   try {
     const st = await webhookActions.testRunStop(row.id)
     testRuns.value = { ...testRuns.value, [row.id]: st }
-    if (!anyTesting.value) stopPoll()
+    if (!anyTesting.value) poll.stop()
     ElMessage.success(t('mroute.dry.stopped'))
   } catch (e: any) {
     ElMessage.error(e?.message || t('common.saveFailed'))
@@ -707,7 +699,7 @@ async function refreshTestRuns() {
     if (st) next[id] = st
   })
   testRuns.value = next
-  if (anyTesting.value) schedulePoll()
+  if (anyTesting.value) poll.start()
 }
 
 // 实时试运行的开关只留在「试运行」面板与接收器弹窗里（列表上不再有）：
@@ -964,11 +956,9 @@ onActivated(async () => {
   await refreshTestRuns()
 })
 
-// 离开页面就停轮询：后端的试运行不受影响（它有自己的超时），
-// 但没人在看的时候不该继续每两秒打一次接口。
-onDeactivated(stopPoll)
+// 切页 / 标签页不可见就停轮询由 usePolling 负责（后端的试运行不受影响，它有自己的超时；
+// 回到本页时上面的 onActivated → refreshTestRuns 会重新判断要不要接着轮）。
 onUnmounted(() => {
-  stopPoll()
   // 销毁定时器只在组件活着的时候有意义；组件没了，下次进来 readSample 会重新判过期。
   if (sampleTimer) window.clearTimeout(sampleTimer)
 })
@@ -1573,8 +1563,13 @@ useCloseOnLeave(serverVisible, sourceVisible, dryVisible, testVisible, ruleVisib
           <el-switch v-model="server.enabled" />
         </el-form-item>
         <el-form-item :label="t('mroute.srv.port')">
-          <el-input-number v-model="server.port" :min="1" :max="65535" />
-          <span class="mt-subtle hint">{{ t('mroute.srv.portHint') }}</span>
+          <!-- 说明放在输入框下方，不放右侧：.el-form-item__content 是 flex，直接塞进去的
+               灰字会成为输入框右侧的兄弟节点，把整行撑高，标签也就不与输入框齐平了
+               （全项目同一约定，见 GlobalFirewall.vue 的 .field）。 -->
+          <div class="field-col">
+            <el-input-number v-model="server.port" :min="1" :max="65535" />
+            <span class="mt-subtle hint">{{ t('mroute.srv.portHint') }}</span>
+          </div>
         </el-form-item>
         <el-form-item :label="t('mroute.srv.https')">
           <el-switch v-model="server.https.enabled" />
@@ -1824,6 +1819,15 @@ useCloseOnLeave(serverVisible, sourceVisible, dryVisible, testVisible, ruleVisib
 .hint {
   font-size: 12px;
   margin-left: 10px;
+}
+/* 控件 + 下方说明的竖排容器：让灰字换到控件下方，而不是挤在右侧。
+ * 不设 gap——本对话框里其他几行的灰字是靠 content 的 flex-wrap 折下去的，
+ * 紧贴控件底边，这里跟着对齐，免得同一个框里两种行高。 */
+.field-col {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  width: 100%;
 }
 /* ---- 入站原文对话框 ---- */
 .src-meta {

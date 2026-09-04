@@ -157,7 +157,15 @@ func Build(log *logx.Logger, cfgMgr *config.Manager, dataDir string) *App {
 
 // ReloadAll 用当前配置重载全部模块。
 func (a *App) ReloadAll() {
-	a.Modules.ReloadAll(a.CfgMgr.Get())
+	cfg := a.CfgMgr.Get()
+	if cfg == nil {
+		// 拿不到配置副本就**不重载**：模块继续按上一份已知良好的配置跑。
+		// 这里没有比"什么都不做"更安全的选择——把空配置交给 ReloadAll 会让每个模块
+		// 都按"用户什么都没配"重建，等于一次配置读取失败把所有对外服务停掉。
+		logx.L().Error("读取配置失败，跳过模块重载")
+		return
+	}
+	a.Modules.ReloadAll(cfg)
 }
 
 // CloseAll 关闭全部模块。

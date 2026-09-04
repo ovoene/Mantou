@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -198,7 +200,12 @@ func (s *Server) handleImportConfig(c *gin.Context) {
 	// 先把整份备份迁到最新版本，再按模块切片合并（见 config.Migrate 的说明）。
 	config.Migrate(cfg)
 	// 合并基准必须是 Get() 的深拷贝：Snapshot() 是运行中模块共享的只读对象。
-	target := mergeImportedConfig(s.deps.Config.Get(), cfg, scope)
+	base := s.deps.Config.Get()
+	if base == nil {
+		respondError(c, http.StatusInternalServerError, "读取当前配置失败，已中止导入")
+		return
+	}
+	target := mergeImportedConfig(base, cfg, scope)
 	// 未选中的模块不动它的磁盘资源：证书目录与 uploads 目录都是整体替换的，
 	// 传 nil 即跳过（见 restoreBackupResources）。
 	if !scope[modCert] {
@@ -532,7 +539,11 @@ func (tx *restoreTransaction) commit() error {
 
 func (s *Server) restoreBackupResources(cfg *config.Config, certs []CertBackup, uploads []FileBackup) (*restoreTransaction, error) {
 	tx := &restoreTransaction{}
-	if certs != nil && len(certs) > 0 && s.deps.Cert == nil {
+	// 这里问的是"备份里真的带了证书文件吗"，len 一个判断就够（nil 切片的 len 是 0）。
+	// 下面几处的 `!= nil` 不是同一个意思、也不能照这样简化：它们区分的是
+	// "备份里有这个字段但是空的"（JSON []）与"根本没有这个字段"（JSON null），
+	// 前者要走清理流程，后者要整段跳过。
+	if len(certs) > 0 && s.deps.Cert == nil {
 		return nil, errors.New("证书模块未就绪")
 	}
 	if certs != nil && s.deps.DataDir == "" {
@@ -751,13 +762,81 @@ func (s *Server) handleUpdateCheck(c *gin.Context) {
 	respondOK(c, resp)
 }
 
+// defaultGitHubRepo 版本检测的出厂仓库。
+const defaultGitHubRepo = "ovoene/Mantou"
+
+// githubRepoPattern 仓库标识的合法形状：owner/name。
+//
+// 两段都要求以字母或数字开头，因此 "."、".." 这类段名被直接排除——这正是必须校验的原因：
+// 这个值会被拼进 "https://api.github.com/repos/" + repo + "/releases/latest"，
+// 而 URL 里的 ".." 由服务端（GitHub）解析，填 "../../users/someone" 就能把这次请求
+// 挪到另一个接口上，再把它返回的 html_url 当作"新版本下载页"显示在面板里。
+// 主机名换不掉（authority 早已闭合），但"面板给出的下载链接指向哪"是可以被改的。
+//
+// 字符集取 GitHub 实际允许的：owner 用字母数字与连字符，仓库名另允许下划线与点。
+// 一律不含 "/"、"?"、"#"、"@"、"%"，所以拼出来的 URL 结构不可能被改写。
+var githubRepoPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9-]{0,63}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}$`)
+
+// validGitHubRepo 判断一个仓库标识能否安全地拼进 GitHub API 地址。空串表示"未配置"，不算合法值。
+func validGitHubRepo(repo string) bool {
+	return githubRepoPattern.MatchString(repo)
+}
+
+// validGitHubRepoField 判断「项目仓库」这一项填的内容能否接受。
+//
+// 两种写法都收：owner/name，或一个完整的 http(s) 地址——后者是前端已有的用法，
+// 界面上那个仓库图标会直接把它当项目主页链接用（见 web/src/views/About.vue 的 repoUrl）。
+// 限定 scheme 是顺手的一道：这个值会变成页面上的 href，不该允许出现别的协议。
+func validGitHubRepoField(raw string) bool {
+	if validGitHubRepo(raw) {
+		return true
+	}
+	u, err := url.Parse(raw)
+	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
+}
+
+// repoFromGitHubURL 从 https://github.com/owner/name[/...] 里取出 owner/name。
+//
+// 只认 github.com 一个主机：换成别的站点，它的路径与 api.github.com 上的仓库路径就没有
+// 对应关系了，猜一个出来只会让版本检测查到一个不相干的仓库。
+func repoFromGitHubURL(raw string) (string, bool) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", false
+	}
+	if h := strings.ToLower(u.Hostname()); h != "github.com" && h != "www.github.com" {
+		return "", false
+	}
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	if len(parts) < 2 {
+		return "", false
+	}
+	repo := parts[0] + "/" + strings.TrimSuffix(parts[1], ".git")
+	if !validGitHubRepo(repo) {
+		return "", false
+	}
+	return repo, true
+}
+
 // githubRepoOf 返回用于版本检测的 GitHub 仓库（owner/name）。
 // 来自配置 Update.GitHubRepo，留空默认 ovoene/Mantou（恢复自动检测，但仓库可配置、不写死）。
+//
+// 形状不合法时退回默认值，而不是照原样拼进 URL。写入接口已经拦了一道（见 api_overview.go
+// 的 GitHubRepo 分支），这里再拦是因为配置未必经过那道闸：手改 config.json、导入一份别处的
+// 备份都能把任意字符串放进这个字段。校验放在"使用点"才真正覆盖所有来源。
+//
+// 填成完整 github.com 地址的（前端支持的另一种写法）从里面把 owner/name 抽出来用，
+// 而不是当成不合法：否则界面上的仓库链接指向用户填的那个仓库、版本检测却在查默认仓库，
+// 两处对不上。
 func githubRepoOf(cfg *config.Config) string {
-	if r := strings.TrimSpace(cfg.Update.GitHubRepo); r != "" {
-		return r
+	raw := strings.TrimSpace(cfg.Update.GitHubRepo)
+	if validGitHubRepo(raw) {
+		return raw
 	}
-	return "ovoene/Mantou"
+	if repo, ok := repoFromGitHubURL(raw); ok {
+		return repo
+	}
+	return defaultGitHubRepo
 }
 
 // handleVersion 直接返回 version 包的内容（版本号、官网地址、编译时间）；

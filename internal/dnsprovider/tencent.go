@@ -150,7 +150,10 @@ func (p *tencentProvider) call(ctx context.Context, secrets map[string]string, a
 		return fmt.Errorf("腾讯云凭证缺少 secretId/secretKey")
 	}
 
-	body, _ := json.Marshal(payload)
+	body, err := marshalBody(payload)
+	if err != nil {
+		return err
+	}
 	now := time.Now().UTC()
 	timestamp := strconv.FormatInt(now.Unix(), 10)
 	date := now.Format("2006-01-02")

@@ -217,8 +217,9 @@ type Security struct {
 // normalizePanelFirewall 的夹取、API 层的入参校验、前端输入框的 min/max。
 const (
 	// MaxFirewallIPs 单张名单（允许 / 拒绝各一张）最多多少条。
-	// 这是一条内存与解析成本的护栏：一条「a-b」范围在 ipx.ParseCIDRs 里最多展开成
-	// 4096 个单 IP，256 条全写成范围就是百万级条目，而名单是每次配置变更时全量重建的。
+	// 这是一条内存与解析成本的护栏：名单在每次配置变更时全量重建，匹配又在请求路径上。
+	// 一条「a-b」范围经 ipx.ParseCIDRs 会分解成覆盖整段的 CIDR 块（IPv4 最多 62 块、
+	// IPv6 最多 254 块），因此 256 条全写成范围的最坏情况也只有万级条目。
 	MaxFirewallIPs = 256
 	// DefaultFirewallRateLimit 每个来源 IP 每秒允许的请求数。
 	//
@@ -250,7 +251,7 @@ const (
 const (
 	// GlobalFirewallMaxIPs 单张名单（允许 / 拒绝各一张）最多多少条。
 	// 与面板入站防护同一护栏（见 MaxFirewallIPs 的说明）：名单每次配置变更全量重建，
-	// 一份「a-b」范围在 ipx.ParseCIDRs 里最多展开成 4096 个单 IP。
+	// 一条「a-b」范围在 ipx.ParseCIDRs 里会分解成覆盖整段的一组 CIDR 块。
 	//
 	// 直接**取自** MaxFirewallIPs 而不是另写一个 256：两张名单都由同一个 normalizeIPList
 	// 整理，而它按 MaxFirewallIPs 截断。各写一份字面量的话，改动其中一个就会出现
@@ -296,10 +297,14 @@ const (
 	DefaultGlobalFirewallMemoryMB = 5
 	MaxGlobalFirewallMemoryMB     = 15
 
-	// MaxGlobalFirewallBanMinutes 自动封禁时长上限：24 小时。
+	// MaxGlobalFirewallBanMinutes 自动封禁时长上限：7 天（7×24×60）。
 	// 与面板同理——不提供「永久」：自动封禁是机器判断，判错代价是把人关在门外，
-	// 有限期意味着误判会自己愈合。要永久封就写进拒绝名单。
-	MaxGlobalFirewallBanMinutes = 1440
+	// 有限期意味着误判会自己愈合。要永久封就写进拒绝名单（自动封禁页有一键加入的入口）。
+	//
+	// 从 24 小时放宽到 7 天：一天封顶对"每天换一批地址、一轮扫几个小时"的持续扫描起不到
+	// 抑制作用——次日同一批地址又是干净的。7 天仍是有限期，误判照样会自己愈合，
+	// 只是愈合周期长了；真要更久就该是一条明确的人工决定（拒绝名单），而不是机器判断。
+	MaxGlobalFirewallBanMinutes = 7 * 24 * 60
 
 	// 自定义档位的数值边界。四处必须一致：normalizeGlobalFirewall 的夹取、Valid 的校验、
 	// 接口下发给前端的 limits、前端输入框的 min/max。任一处对不上，都会出现

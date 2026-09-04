@@ -64,7 +64,10 @@ func (p *godaddyProvider) EnsureRecord(ctx context.Context, req RecordRequest) e
 	}
 	// PUT 替换该 type+name 下的全部记录，天然幂等（适合单值 A/AAAA）。
 	rec := []map[string]any{{"data": req.Value, "ttl": gdTTL(req.TTL, 600)}}
-	body, _ := json.Marshal(rec)
+	body, err := marshalBody(rec)
+	if err != nil {
+		return err
+	}
 	endpoint := fmt.Sprintf("%s/domains/%s/records/%s/%s", gdAPIBase, req.Domain, req.RecordType, name)
 	return p.do(ctx, auth, http.MethodPut, endpoint, bytes.NewReader(body))
 }
@@ -77,7 +80,10 @@ func (p *godaddyProvider) SetTXT(ctx context.Context, req TXTRequest) error {
 	name := relativeName(req.FQDN, req.Zone)
 	// 用 PATCH 追加，避免覆盖同名已有 TXT（如通配 + 主域共用 _acme-challenge）。
 	rec := []map[string]any{{"type": "TXT", "name": name, "data": req.Value, "ttl": gdTTL(req.TTL, 600)}}
-	body, _ := json.Marshal(rec)
+	body, err := marshalBody(rec)
+	if err != nil {
+		return err
+	}
 	endpoint := fmt.Sprintf("%s/domains/%s/records", gdAPIBase, req.Zone)
 	return p.do(ctx, auth, http.MethodPatch, endpoint, bytes.NewReader(body))
 }
@@ -120,7 +126,10 @@ func (p *godaddyProvider) RemoveTXT(ctx context.Context, req TXTRequest) error {
 	if len(remaining) == 0 {
 		return p.do(ctx, auth, http.MethodDelete, endpoint, nil)
 	}
-	body, _ := json.Marshal(remaining)
+	body, err := marshalBody(remaining)
+	if err != nil {
+		return err
+	}
 	return p.do(ctx, auth, http.MethodPut, endpoint, bytes.NewReader(body))
 }
 

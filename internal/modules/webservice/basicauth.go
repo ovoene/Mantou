@@ -114,6 +114,27 @@ func (c *basicAuthCache) verify(key string, budget, compute func() bool) (ok, li
 	c.entries[key] = pending
 	c.mu.Unlock()
 
+	// compute() 是 bcrypt，正常不会 panic；这条 defer 挡的就是它万一 panic 的情况。
+	// net/http 会 recover 掉 panic 使进程不死，但 pending.done 若永不关闭，后续所有
+	// 等这把凭据的请求都会**永久阻塞**在上面那个 <-done 上——一次 panic 就把这个子项的
+	// 这把口令永久锁死。
+	//
+	// 收尾时必须连表项一起摘掉：只关通道不摘条目，醒来的等待者会再次看到 done != nil，
+	// 于是对着一个已关闭的通道空转，把永久阻塞换成活锁。
+	defer func() {
+		c.mu.Lock()
+		stale := c.entries[key] == pending
+		if stale {
+			delete(c.entries, key)
+		}
+		c.mu.Unlock()
+		if stale {
+			// 只有 compute() 异常退出才会走到这里：正常路径早已把结果写进表并关过通道，
+			// 表里那条不再是 pending。等待者醒来查不到条目，自己算一次即可。
+			close(pending.done)
+		}
+	}()
+
 	ok = compute()
 
 	ttl := basicAuthFailTTL

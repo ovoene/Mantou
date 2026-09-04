@@ -48,7 +48,6 @@ const (
 // UpdateState 只更新内存并合并落盘到 state.json，不会重写 config.json（见 config/state.go）。
 type ConfigWriter interface {
 	UpdateState(mutate func(c *config.Config)) error
-	Get() *config.Config
 	Snapshot() *config.Config
 }
 
