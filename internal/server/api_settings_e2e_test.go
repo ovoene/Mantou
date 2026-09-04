@@ -120,6 +120,23 @@ func seedFullConfig(t *testing.T, manager *config.Manager, dataDir string) {
 		cfg.Settings.Notify = config.Notify{Enabled: true}
 		cfg.Update.About = "我的自定义说明"
 
+		// 服务防护：档位、自动封禁、两张名单都填成可辨认的值。
+		//
+		// 必须与默认值不同，否则下面那一整份 JSON 比对会在这一段上空跑——
+		// 新环境的默认值和这里一模一样，"备份里带没带服务防护"两种结果长得一样。
+		// 它也是唯一一个不在 Settings 里的安全设置（顶层 GlobalFirewall），
+		// 因而是最容易在"按模块切片"时被漏掉的那一段。
+		cfg.GlobalFirewall = config.GlobalFirewall{
+			Enabled: true, Level: config.GlobalFirewallLevelStrict, AutoBan: true,
+			AllowIPs: []string{"198.51.100.7", "198.51.100.0/24"},
+			DenyIPs:  []string{"203.0.113.66"},
+			MemoryMB: config.MaxGlobalFirewallMemoryMB,
+		}
+		// 就地规范化，让种子值成为规范化的不动点：Update 不做规范化，而导入侧要过
+		// config.Migrate，两边不一致时整份比对会挂在纯属规范化造成的差异上
+		//（同 ProbeInterval 那处的坑）。
+		config.NormalizeGlobalFirewall(&cfg.GlobalFirewall)
+
 		// 凭证与 ACME 账户私钥：这两样在磁盘上是密文，在备份里必须是明文。
 		cfg.Credentials = []config.Credential{{
 			ID: "cred-e2e", Name: "我的 Cloudflare", Provider: "cloudflare",
@@ -302,6 +319,19 @@ func TestBackupRestoresEverythingInAFreshEnvironment(t *testing.T) {
 	}
 	if after.WebServices[0].Children[0].Upstreams[0].URL != "http://127.0.0.1:3000" {
 		t.Fatal("Web 服务子项设置丢失")
+	}
+	// 服务防护单独点名：它是顶层字段而不是 Settings 的一部分，按模块切片时最容易被漏掉，
+	// 而漏掉的表现是"导入成功、防护回到了默认的关闭状态"——没有任何报错。
+	gfw := after.GlobalFirewall
+	if !gfw.Enabled || gfw.Level != config.GlobalFirewallLevelStrict {
+		t.Fatalf("服务防护的开关或档位丢失: %+v", gfw)
+	}
+	if len(gfw.AllowIPs) != 2 || gfw.AllowIPs[0] != "198.51.100.7" ||
+		len(gfw.DenyIPs) != 1 || gfw.DenyIPs[0] != "203.0.113.66" {
+		t.Fatalf("服务防护的名单丢失: allow=%v deny=%v", gfw.AllowIPs, gfw.DenyIPs)
+	}
+	if gfw.MemoryMB != config.MaxGlobalFirewallMemoryMB {
+		t.Fatalf("服务防护的内存上限丢失: %d", gfw.MemoryMB)
 	}
 
 	// 背景图文件本身也要落到新环境（不然设置在、图没了，界面是一片空白）。

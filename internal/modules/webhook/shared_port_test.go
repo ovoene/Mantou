@@ -149,10 +149,19 @@ func TestSharedPortReleasesOwnListen(t *testing.T) {
 	// 没有自己的 Listener，健康判断不能按"在不在监听"算——那会一直报不健康。
 	st := m.Status()
 	if !st.Healthy {
-		t.Fatalf("共用端口不该判为不健康：%s", st.Message)
+		t.Fatalf("共用端口不该判为不健康：code=%q args=%v", st.Code, st.Args)
 	}
-	if !strings.Contains(st.Message, "共用") || !strings.Contains(st.Message, cfg.Webhook.Domain) {
-		t.Fatalf("状态里应说明与谁共用、按哪个域名分流，实际 %q", st.Message)
+	// 断言的是键名与参数，不是拼好的句子：句子由前端按当前语言拼（见 module.Status.Code）。
+	// 参数得逐个查——少一个 domain，界面上就成了"与 Web 服务共用，域名 "，
+	// 而这恰恰是共用这条路上用户唯一需要知道的东西。
+	if st.Code != "shared" {
+		t.Fatalf("共用端口的状态键应为 shared，实际 %q", st.Code)
+	}
+	if got := st.Args["domain"]; got != cfg.Webhook.Domain {
+		t.Fatalf("状态里应说明按哪个域名分流，domain=%v 期望 %q", got, cfg.Webhook.Domain)
+	}
+	if got, ok := st.Args["addr"].(string); !ok || !strings.Contains(got, strconv.Itoa(port)) {
+		t.Fatalf("状态里应说明共用哪个地址，addr=%v 期望含端口 %d", st.Args["addr"], port)
 	}
 	// Handler 是共用这条路上唯一的入口，取不到就等于收不到任何消息。
 	if m.Handler() == nil {

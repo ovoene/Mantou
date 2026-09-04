@@ -16,7 +16,7 @@ import (
 	"mantou/internal/mapx"
 )
 
-// 面板入站防火墙的服务端实现。配置模型与取值边界在 internal/config/firewall.go，
+// 面板入站防护的服务端实现。配置模型与取值边界在 internal/config/firewall.go，
 // 这里只管「怎么拦」。
 //
 // # 为什么要拦两次
@@ -40,11 +40,6 @@ import (
 // 顺序即语义，每一步为什么在这个位置见 decide 的注释。
 
 const (
-	// fwBanMaxEntries 自动封禁表的条目上限。
-	//
-	// 必须有上限，而且理由比登录限流那张表更硬：这张表的键是**攻击者选的**。
-	// IPv6 下一个 /64 就能提供 1.8e19 个来源地址，无上限等于把内存分配权交给对方。
-	fwBanMaxEntries = 4096
 	// fwBanShrinkFloor 触发整表重建的最小峰值（同 mapx.ShrinkSparse 的语义）：
 	// delete 不归还 map 桶内存，一次大规模扫描退潮后那块内存会一直挂着。
 	fwBanShrinkFloor = 512
@@ -112,7 +107,7 @@ type fwBanEntry struct {
 	banRounds int       // 累计被封次数，供界面判断"惯犯"
 }
 
-// panelFirewall 面板入站防火墙的运行态。
+// panelFirewall 面板入站防护的运行态。
 //
 // 它自己不持有配置：每次判定都从 config.Manager 取当前快照，因此设置一保存就生效，
 // 不需要重启面板，也不需要往这里推送变更。
@@ -185,7 +180,7 @@ func (f *panelFirewall) enabled() bool { return f.current().fw.Enabled }
 //
 //  2. **回环紧随其后**，豁免后面的一切自动判定。这是最后的自救通道：
 //     配置写错、把自己关在门外时，还能从本机（或一条 SSH 隧道）进面板改回来。
-//     一个能在本机发起连接的人，早就有比"绕过面板防火墙"更直接的手段。
+//     一个能在本机发起连接的人，早就有比"绕过面板入站防护"更直接的手段。
 //
 //  3. **允许名单先于自动封禁**：写进允许名单是人做的明示决定，自动封禁是机器的推测；
 //     推测不该推翻明示，否则用户会遇到"我明明加白了却还是进不来"，而且无从得知原因。
@@ -238,7 +233,7 @@ func (f *panelFirewall) decide(l *fwLists, ip net.IP) fwVerdict {
 // 攻击停了以后就没人再调它，于是过期条目会一直留在表里、size 永远大于零，
 // 之后每个请求（与每次 Accept）都要为一张全是死条目的表抢一次锁。
 // 这里已经持有 mu，清扫是顺路的事；它自带最小间隔（fwBanSweepInterval），
-// 全表最多 fwBanMaxEntries 条，摊到每分钟一次可以忽略。
+// 全表最多为 MemoryMB 折算出的上限条（与服务防护共用同一额度概念），摊到每分钟一次可以忽略。
 func (f *panelFirewall) isBanned(ip net.IP) bool {
 	if f.size.Load() == 0 {
 		return false
@@ -257,6 +252,16 @@ func (f *panelFirewall) allowRate(l *fwLists, key string) bool {
 		return true
 	}
 	return f.limiter.Allow(fwLimiterScope, key, float64(l.fw.RateLimit))
+}
+
+// maxEntries 由「服务防护」模块的 MemoryMB 折算面板入站防护封禁表的条目上限。
+//
+// 面板入站防护与服务防护共用同一份内存额度概念（见 config.BanEntriesForMemoryMB 与
+// GlobalFirewall.MemoryMB 的说明）：那个额度只暴露在「服务防护」模块里，面板这里不另设旋钮，
+// 于是两张表的容量由同一个 MemoryMB 决定。读的是调用方已经持有的快照（l.src），
+// 不再额外取一次 Snapshot，避免热路径上的重复分配。
+func (f *panelFirewall) maxEntries(l *fwLists) int {
+	return config.BanEntriesForMemoryMB(l.src.GlobalFirewall.MemoryMB)
 }
 
 // strike 记一次「被限速拦下」，必要时转为封禁；返回本次是否**新**产生了一条封禁。
@@ -285,7 +290,7 @@ func (f *panelFirewall) strike(l *fwLists, ip net.IP, display string) bool {
 	k := ipx.Key(ip)
 	e := f.bans[k]
 	if e == nil {
-		if len(f.bans) >= fwBanMaxEntries {
+		if len(f.bans) >= f.maxEntries(l) {
 			// 表满：先清一批，清不动就放弃这一次计数。
 			//
 			// 放弃计数而不是"挤掉别人"，方向与 ipx.IPLimiter 相反，因为代价不对称：
@@ -293,7 +298,7 @@ func (f *panelFirewall) strike(l *fwLists, ip net.IP, display string) bool {
 			// **一条正在生效的封禁被提前解除**。让新来的少数一次，比让已确认的攻击者
 			// 提前放出来要安全。上限本身仍是硬的，内存不会因此增长。
 			f.evictLocked(now)
-			if len(f.bans) >= fwBanMaxEntries {
+			if len(f.bans) >= f.maxEntries(l) {
 				return false
 			}
 		}
@@ -382,7 +387,7 @@ func (f *panelFirewall) banList(limit int) []fwBanView {
 			Rounds:   e.banRounds,
 		})
 	}
-	// 插入排序：条目数受 fwBanMaxEntries 约束，且这个接口只在用户打开设置页时被调用。
+	// 插入排序：条目数受 MemoryMB 折算出的上限约束，且这个接口只在用户打开设置页时被调用。
 	for i := 1; i < len(out); i++ {
 		for j := i; j > 0 && out[j].Until > out[j-1].Until; j-- {
 			out[j], out[j-1] = out[j-1], out[j]
@@ -463,7 +468,7 @@ func (f *panelFirewall) logBan(ip string, minutes int) {
 	if skipped > 0 {
 		args = append(args, "suppressed", skipped)
 	}
-	f.log.Warn("面板防火墙自动封禁", args...)
+	f.log.Warn("面板入站防护自动封禁", args...)
 }
 
 // ---------------------------------------------------------------------------
@@ -496,7 +501,7 @@ func (l *firewallListener) Accept() (net.Conn, error) {
 		if v := l.fw.decide(lists, ip); v != fwPass {
 			// Debug 级别：这条路径正是日志洪水的来源，按 WARN 输出等于用一种噪声
 			// 换掉另一种。真正值得报警的是"新增了一条封禁"（见 logBan）。
-			l.fw.log.Debug("面板防火墙拦截连接",
+			l.fw.log.Debug("面板入站防护拦截连接",
 				"ip", remoteAddrOf(c), "reason", v.reason())
 			_ = c.Close()
 			continue
@@ -537,7 +542,7 @@ func (f *panelFirewall) wrapListener(ln net.Listener) net.Listener {
 // 第二层：中间件
 // ---------------------------------------------------------------------------
 
-// firewallGuard 请求级的入站防火墙：复查名单/封禁/范围，并做限速与超限计数。
+// firewallGuard 请求级的入站防护：复查名单/封禁/范围，并做限速与超限计数。
 //
 // 位置：紧跟 gin.CustomRecovery 之后、其余一切之前。
 // 恢复中间件必须在最外层（它要兜住这里面的任何 panic），除此之外没有任何东西
@@ -565,7 +570,7 @@ func (s *Server) firewallGuard() gin.HandlerFunc {
 			who = ip.String()
 		}
 		if v := f.decide(lists, ip); v != fwPass {
-			f.log.Debug("面板防火墙拦截请求",
+			f.log.Debug("面板入站防护拦截请求",
 				"ip", who, "path", c.Request.URL.Path, "reason", v.reason())
 			writeFirewallRejected(c)
 			return
@@ -643,10 +648,10 @@ func (s *Server) logFirewallState() {
 		"deny", len(fw.DenyIPs),
 	}
 	if fw.Mode == config.FirewallModeLAN {
-		s.deps.Log.Warn("面板入站防火墙已启用：仅允许局域网访问。"+
-			"若需从公网访问，请在「设置 → 登录安全 → 入站防火墙」改为不限来源，"+
+		s.deps.Log.Warn("面板入站防护已启用：仅允许局域网访问。"+
+			"若需从公网访问，请在「设置 → 登录安全 → 入站防护」改为不限来源，"+
 			"或把可信 IP 加入允许名单；无法登录时可先经 SSH 隧道从本机进入面板", args...)
 		return
 	}
-	s.deps.Log.Info("面板入站防火墙已启用", args...)
+	s.deps.Log.Info("面板入站防护已启用", args...)
 }

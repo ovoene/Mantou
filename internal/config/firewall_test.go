@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// 面板入站防火墙的数据层规则。这一层是唯一的兜底：配置有三条写入路径
+// 面板入站防护的数据层规则。这一层是唯一的兜底：配置有三条写入路径
 // （面板保存、整份导入、手改 config.json），只有第一条经过接口校验，
 // 而加载期不能因为一份不合理的设置就拒绝启动，只能夹住。
 
@@ -15,7 +15,7 @@ func TestDefaultPanelFirewall(t *testing.T) {
 	// 默认开启且仅局域网是这份设计的主张（理由见 defaultPanelFirewall 的注释）。
 	// 一旦有人把默认值改松，这里必须先红。
 	if !fw.Enabled {
-		t.Error("全新安装应默认开启入站防火墙")
+		t.Error("全新安装应默认开启入站防护")
 	}
 	if fw.Mode != FirewallModeLAN {
 		t.Errorf("默认访问范围 = %q，应为 %q", fw.Mode, FirewallModeLAN)

@@ -14,11 +14,11 @@ import (
 	"mantou/internal/logx"
 )
 
-// 本文件钉住入站防火墙的判定语义。这些用例存在的理由不是"覆盖率"，
+// 本文件钉住入站防护的判定语义。这些用例存在的理由不是"覆盖率"，
 // 而是这道逻辑一旦悄悄走偏，症状要么是"防了个寂寞"，要么是"把人锁在门外"——
 // 两种都不会在日常使用里暴露出来。
 
-// firewallOff 把入站防火墙关掉，供那些"验的是别的东西"的用例在建路由前调用。
+// firewallOff 把入站防护关掉，供那些"验的是别的东西"的用例在建路由前调用。
 //
 // 新装默认是"仅局域网"，而 httptest.NewRequest 造出来的对端固定是 192.0.2.1:1234
 // （RFC 5737 的文档地址段，按外网算），于是所有沿用它的既有用例都会先吃一个 403。
@@ -285,8 +285,11 @@ func TestFirewallBanTableBounded(t *testing.T) {
 		AutoBan: true, AutoBanThreshold: 1, AutoBanMinutes: 60,
 	})
 	lists := f.current()
+	// 上限由「服务防护」的 MemoryMB 折算而来（与服务防护共用同一额度概念），
+	// 这里直接取运行态算出的真实上限，免得和默认值耦合。
+	cap := f.maxEntries(lists)
 	// 造出远多于上限的来源；IPv6 下这在现实中毫无成本。
-	for i := 0; i < fwBanMaxEntries+500; i++ {
+	for i := 0; i < cap+500; i++ {
 		ip := net.ParseIP("2001:db8::1")
 		ip = ip.To16()
 		ip[14] = byte(i >> 8)
@@ -296,8 +299,8 @@ func TestFirewallBanTableBounded(t *testing.T) {
 	f.mu.Lock()
 	n := len(f.bans)
 	f.mu.Unlock()
-	if n > fwBanMaxEntries {
-		t.Fatalf("封禁表条目数 = %d，超过上限 %d", n, fwBanMaxEntries)
+	if n > cap {
+		t.Fatalf("封禁表条目数 = %d，超过上限 %d", n, cap)
 	}
 }
 

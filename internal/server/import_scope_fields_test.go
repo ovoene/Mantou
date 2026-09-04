@@ -22,6 +22,7 @@ var importFieldOwners = map[string]importModule{
 	"Auth":             modPanel,
 	"Settings":         modPanel,
 	"Update":           modPanel,
+	"GlobalFirewall":   modGlobalFirewall,
 	"Credentials":      modCredential,
 	"DDNS":             modDDNS,
 	"WebServices":      modWebService,
@@ -134,6 +135,9 @@ func importDiffConfigs() (base, imp *config.Config) {
 	imp.Update.GitHubRepo = "backup/repo"
 	base.Webhook.Port = 18080
 	imp.Webhook.Port = 28080
+	// 服务防护自成一个模块，同样要在两边拉开差异，否则那一行赋值漏掉也测不出来。
+	base.GlobalFirewall.Level = config.GlobalFirewallLevelLoose
+	imp.GlobalFirewall.Level = config.GlobalFirewallLevelStrict
 	// 定时重启的执行记录两边取同一个值：它是 Settings 里唯一**刻意不跟备份走**的字段
 	//（见 TestMergeImportedConfigKeepsLocalRestartLastRunAt），
 	// 在这里拉开差异只会让整段 Settings 的逐字段对账变成在考那一个例外。

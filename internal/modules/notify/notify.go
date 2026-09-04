@@ -303,6 +303,16 @@ func (m *Module) Close() error {
 const drainTimeout = 30 * time.Second
 
 // Status 实现 module.StatusReporter。
+//
+// Code / Args 只给键名与数值，不拼句子（理由见 module.Status.Code）。本模块的取值：
+//
+//	bodyErr 有目标的请求体模板编译不过（args: n）
+//	dropped 队列满导致丢过消息（args: n）
+//	queued  队列里还有在飞的任务（args: n）
+//
+// 这三个键目前没有界面在渲染（总览页只画名称与健康点，消息路由页显示的是本模块的计数
+// 而不是这句状态）。仍然按键名给，是为了不在同一个结构体上留下"一半键名一半中文句子"
+// 的两套约定——真要渲染时直接加译名即可，不必先回头改一遍 Go。
 func (m *Module) Status() module.Status {
 	m.mu.RLock()
 	total := len(m.targets)
@@ -322,12 +332,15 @@ func (m *Module) Status() module.Status {
 	switch {
 	case broken > 0:
 		st.Healthy = false
-		st.Message = fmt.Sprintf("%d 个目标的请求体模板有错", broken)
+		st.Code = "bodyErr"
+		st.Args = map[string]any{"n": broken}
 	case m.dropped.Load() > 0:
 		st.Healthy = false
-		st.Message = fmt.Sprintf("已丢弃 %d 条（队列满）", m.dropped.Load())
+		st.Code = "dropped"
+		st.Args = map[string]any{"n": m.dropped.Load()}
 	case m.depth.Load() > 0:
-		st.Message = fmt.Sprintf("队列中 %d 条", m.depth.Load())
+		st.Code = "queued"
+		st.Args = map[string]any{"n": m.depth.Load()}
 	}
 	return st
 }

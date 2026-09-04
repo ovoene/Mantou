@@ -828,8 +828,8 @@ func TestPushRejectsWhenQueueFull(t *testing.T) {
 		t.Fatalf("丢弃数期望 1，实际 %d", dropped)
 	}
 	st := m.Status()
-	if st.Healthy || !strings.Contains(st.Message, "已丢弃") {
-		t.Fatalf("队列丢过消息时状态应不健康：%+v", st)
+	if st.Healthy || st.Code != "dropped" || st.Args["n"] != int64(1) {
+		t.Fatalf("队列丢过消息时状态应不健康且报 dropped=1：%+v", st)
 	}
 }
 
@@ -906,8 +906,8 @@ func TestStatusReportsBrokenBodyTemplate(t *testing.T) {
 		t.Fatalf("目标计数不符：%+v", st)
 	}
 	// 模板写错在"保存配置"这一刻就该可见，而不是等第一条真实消息进来才暴露。
-	if st.Healthy || !strings.Contains(st.Message, "请求体模板有错") {
-		t.Fatalf("有坏模板时状态应不健康：%+v", st)
+	if st.Healthy || st.Code != "bodyErr" || st.Args["n"] != 1 {
+		t.Fatalf("有坏模板时状态应不健康且报 bodyErr=1：%+v", st)
 	}
 }
 

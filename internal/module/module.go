@@ -29,7 +29,20 @@ type Status struct {
 	Total   int    `json:"total"`
 	Active  int    `json:"active"`
 	Healthy bool   `json:"healthy"`
-	Message string `json:"message,omitempty"`
+	// Code 是状态短语的**键名**，Args 是它的插值参数——不是拼好的句子。
+	//
+	// 与 Name 同一条理由：翻译只能在前端做。这里原先是一个 Message string，各模块往里
+	// 塞拼好的中文（"HTTPS 监听 0.0.0.0:25667，已接收 3 条"），英文界面上就照原样漏出中文，
+	// 而这种漏字不会有任何报错，只能靠人眼在英文页面上撞见（消息路由页的状态行就是这么发现的）。
+	// 换成键名之后，忘了加译名的表现是界面上出现一个可见的英文键，而不是一行中文。
+	//
+	// 取值由各模块自己定义（见各自的 Status 方法），前端按模块归类查译名。
+	// Code 为空表示"没有额外可说的"，调用方不渲染这一行。
+	Code string `json:"code,omitempty"`
+	// Args 的键与译文里的 {name} 一一对应。刻意用 map 而不是定长字段：
+	// 各模块要说的事不一样（监听地址、队列深度、出错条数），定长字段会退化成
+	// 一堆彼此无关的可选项，而每个模块只填其中两三个。
+	Args map[string]any `json:"args,omitempty"`
 }
 
 // StatusReporter 是可选接口：模块可上报自身状态。

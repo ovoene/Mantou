@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"mantou/internal/config"
+	"mantou/internal/inboundfw"
 	"mantou/internal/ipx"
 	"mantou/internal/logx"
 	"mantou/internal/module"
@@ -70,6 +71,9 @@ type Module struct {
 	// scanBan 公网扫描自动封禁的记账表（见 scanban.go）。同样跨 Reload 存活：
 	// 一次保存配置不该把正在封禁中的扫描器统统放出来。
 	scanBan *scanBanner
+	// globalFirewall 服务防护（连接层）的运行态，由 app 装配时注入（见 SetGlobalFirewall）。
+	// 它保护本模块的入站连接，与面板入站防护是两套独立机制。
+	globalFirewall *inboundfw.Firewall
 	// 全局访问日志写速令牌桶：每秒至多记录 logGlobalRPS 条，防海量不同 IP 时写盘/CPU 被打爆。
 	logRate *logRateLimiter
 
@@ -207,6 +211,16 @@ func (m *Module) SetCertResolver(r CertResolver) {
 func (m *Module) SetWebhookPeer(p WebhookPeer) {
 	m.mu.Lock()
 	m.webhookPeer = p
+	m.mu.Unlock()
+}
+
+// SetGlobalFirewall 注入服务防护（连接层）。由 app 装配时调用一次。
+//
+// 只存指针：封禁表是全局唯一的，Web 服务与消息路由共享同一份，跨 Reload 存活。
+// 注入缺失时 listener 退化为不拦截（见 listenServer.start 的 nil 处理），不影响正常服务。
+func (m *Module) SetGlobalFirewall(f *inboundfw.Firewall) {
+	m.mu.Lock()
+	m.globalFirewall = f
 	m.mu.Unlock()
 }
 

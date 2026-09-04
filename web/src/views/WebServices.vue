@@ -6,6 +6,7 @@ import { Plus, Delete, Edit } from '@element-plus/icons-vue'
 import PageCard from '@/components/PageCard.vue'
 import RowActions from '@/components/RowActions.vue'
 import TagInput from '@/components/TagInput.vue'
+import GfwStatusChip from '@/components/GfwStatusChip.vue'
 import { useResource } from '@/composables/useResource'
 import { useCloseOnLeave } from '@/composables/useCloseOnLeave'
 import { useNarrow } from '@/composables/useNarrow'
@@ -580,7 +581,13 @@ useCloseOnLeave(logsVisible)
       <el-button type="primary" :icon="Plus" @click="openCreateParent">{{ t('common.add') }}</el-button>
     </template>
 
+    <!-- 父子规则的说明放在服务防护状态条**上方**：它讲的是本页列表怎么读，属于页面本身的
+         导读，应该紧跟标题；服务防护状态条讲的是另一个模块的当前开关，是补充信息。
+         夹在中间会把本页的说明推到与它无关的一行之下。 -->
     <p class="mt-subtle hint-block">{{ t('webservice.parentHint') }}</p>
+
+    <!-- 服务防护只读状态：仅展示当前启用状态与规则，不改任何业务页原有文案与布局。 -->
+    <GfwStatusChip />
 
     <div v-loading="r.loading.value">
       <el-empty v-if="!r.list.value.length" :description="t('common.empty')" />

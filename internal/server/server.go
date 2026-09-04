@@ -22,6 +22,7 @@ import (
 	"mantou/internal/config"
 	"mantou/internal/dnsprovider"
 	"mantou/internal/errpage"
+	"mantou/internal/inboundfw"
 	"mantou/internal/logx"
 	"mantou/internal/metrics"
 	"mantou/internal/module"
@@ -64,6 +65,10 @@ type Deps struct {
 	Notify  *notify.Module
 	Webhook *webhook.Module
 
+	// GlobalFirewall 服务防护（连接层）的运行态。由 app 装配时创建一次，
+	// 共享给 Web 服务、消息路由两个监听与这里的接口层——封禁表只有一份。
+	GlobalFirewall *inboundfw.Firewall
+
 	// OnConfigChanged 在配置变更后调用，用于热重载所有模块。
 	OnConfigChanged func()
 	RestartPanel    func()
@@ -81,9 +86,12 @@ type Server struct {
 	setupLimiter *loginLimiter    // 初始化接口限流，防止面板暴露期间被抢注管理员
 	wakeLimiter  *wakeLimiter     // 手动网络唤醒限流，按设备计量（见 wakelimit.go）
 	sessions     *sessionRegistry // 服务端会话状态（"关闭才退、刷新保活"）
-	// firewall 面板入站防火墙：连接层拦截 + 请求层限速/自动封禁（见 firewall.go）。
+	// firewall 面板入站防护：连接层拦截 + 请求层限速/自动封禁（见 firewall.go）。
 	// 它自己每次都从配置快照读策略，因此改设置立刻生效、不需要重启面板。
-	firewall     *panelFirewall
+	firewall *panelFirewall
+	// gfw 服务防护（连接层）：保护 Web 服务与消息路由的入站（见 internal/inboundfw）。
+	// 与 firewall 是两套独立机制，各管各的范围。
+	gfw          *inboundfw.Firewall
 	dnsProviders []dnsprovider.Info
 	basePath     string // 规范化后的访问路径前缀（""或"/xxx"）
 	indexHTML    []byte // 注入 base 前缀后的前端入口页（basePath 非空时使用）
@@ -125,6 +133,7 @@ func New(deps Deps) *Server {
 		wakeLimiter:  newWakeLimiter(),
 		sessions:     newSessionRegistry(),
 		firewall:     newPanelFirewall(deps.Config, deps.Log),
+		gfw:          deps.GlobalFirewall,
 		dnsProviders: dnsprovider.Infos(),
 		basePath:     normalizeBasePath(cfg.Panel.BasePath),
 		panelHTTPS:   cfg.Panel.HTTPS.Enabled,
@@ -145,7 +154,7 @@ func New(deps Deps) *Server {
 	// （防爆破、防抢注），并污染审计日志中的来源 IP。置 nil 后 ClientIP() 只取真实对端地址。
 	_ = r.SetTrustedProxies(nil)
 	r.Use(gin.CustomRecovery(s.recoverPanic))
-	// 面板入站防火墙：来源名单 / 访问范围 / 限速 / 自动封禁。
+	// 面板入站防护：来源名单 / 访问范围 / 限速 / 自动封禁。
 	//
 	// 紧跟恢复中间件之后，排在其余一切之前。恢复必须留在最外层（它要兜住这里面的
 	// 任何 panic），除此之外没有东西该排在访问控制前面——被拒的来源不该有机会
@@ -266,6 +275,12 @@ func (s *Server) registerRoutes(r *gin.Engine) {
 
 			authed.GET("/settings/firewall/bans", s.handleGetFirewallBans)
 			authed.POST("/settings/firewall/bans/clear", s.handleClearFirewallBans)
+
+			// 服务防护（连接层）：保护 Web 服务与消息路由入站，与面板入站防护是两套独立机制。
+			authed.GET("/global-firewall", s.handleGetGlobalFirewall)
+			authed.PUT("/global-firewall", s.handleUpdateGlobalFirewall)
+			authed.GET("/global-firewall/bans", s.handleGetGlobalFirewallBans)
+			authed.POST("/global-firewall/bans/clear", s.handleClearGlobalFirewallBans)
 
 			authed.POST("/settings/restart-now", s.handleRestartNow)
 
@@ -474,7 +489,7 @@ func (s *Server) requirePanelCertificateHost() gin.HandlerFunc {
 
 // Start 启动面板监听（阻塞直至服务器关闭）。
 //
-// 自己 net.Listen 而不用 ListenAndServe，是为了在监听器外面包一层入站防火墙
+// 自己 net.Listen 而不用 ListenAndServe，是为了在监听器外面包一层入站防护
 // （见 firewall.go）。这一层必须在 TLS 之前：被拒的连接直接 Close，
 // 于是既不会产出「TLS handshake error from …」这类告警，也不用为一个注定被拒的
 // 来源付一次完整的密钥协商。

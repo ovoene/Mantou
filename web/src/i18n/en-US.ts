@@ -70,6 +70,7 @@ export default {
     cert: 'SSL/TLS Certificates',
     cred: 'DNS Provider Credentials',
     settings: 'Settings',
+    gfw: 'Service Guard',
     about: 'About',
     logout: 'Sign out',
   },
@@ -774,11 +775,11 @@ export default {
     loginMaxFailsHint: 'The account is locked after this many failures; 0 disables the limit',
     loginLockMinutes: 'Lock duration (minutes)',
     loginLockMinutesHint: 'How long the account stays locked before it auto-unlocks',
-    // Inbound firewall (who may reach the panel itself)
-    fwTitle: 'Inbound firewall',
+    // Inbound guard (who may reach the panel itself)
+    fwTitle: 'Inbound guard',
     fwDesc:
-      'Controls one thing: who may reach this panel. The panel listens on 0.0.0.0, so it is scannable from the internet the moment it starts — those "TLS handshake error" warnings are usually scanners knocking. When enabled, a source that is not allowed gets dropped before the handshake, which stops the knocking and quiets the log. This is unrelated to the outbound request guard below, which governs requests the server itself makes.',
-    fwEnabled: 'Enable inbound firewall',
+      'Controls one thing: who may reach this panel. The panel listens on 0.0.0.0, so it is scannable from the internet the moment it starts — those "TLS handshake error" warnings are usually scanners knocking. When enabled, a source that is not allowed gets dropped before the handshake, which stops the knocking and quiets the log. This section covers the panel port only: the Web Services and Message Routing ports belong to the Service Guard module, and requests the server itself makes belong to the outbound request guard below.',
+    fwEnabled: 'Enable inbound guard',
     fwEnabledHint: 'When off, any source can reach the panel (login limits and rate limits still apply)',
     fwMode: 'Allowed sources',
     fwModeLan: 'LAN only',
@@ -819,6 +820,94 @@ export default {
     blockPrivateNetwork: 'Block private / reserved addresses',
     blockPrivateNetworkHint: 'Off by default; keep it off if you fetch IPs or call back from an intranet address',
     blockPrivateNetworkDesc: 'Covers the four kinds of outbound request whose target you supply: DDNS "custom URL" IP detection, scheduled-task HTTP actions, message-target delivery, and fetching the online-update manifest. When enabled, a request is refused if the target resolves to a private or reserved address (e.g. 127.0.0.1, the 10 / 172.16 / 192.168 private ranges, 169.254 link-local, or 100.64/10 carrier-grade NAT). This stops someone from steering the server into probing internal services by supplying an internal address, and every block is logged for auditing. Keep it off if you legitimately need to reach an IP-detection service, a webhook, or a self-hosted update manifest on your LAN.',
+  },
+  // Service Guard (connection layer): protects inbound connections of Web Services and Message Routing.
+  // Independent from the panel's inbound guard.
+  gfw: {
+    title: 'Service Guard',
+    brief: 'Auto-blocks external port scans, service probes and TLS handshake probes at the connection layer by source-IP behaviour, protecting the inbound connections of Web Services and Message Routing.',
+    tabSettings: 'Settings',
+    tabAllow: 'Allowlist',
+    tabDeny: 'Denylist',
+    tabBans: 'Auto-bans',
+    // Settings
+    level: 'Detection level',
+    levelLoose: 'Loose',
+    levelBalanced: 'Balanced',
+    levelStrict: 'Strict',
+    levelCustom: 'Custom',
+    levelHint: 'Pick Loose / Balanced / Strict and the regular window, burst window and ban duration below are filled from that level\'s preset and locked; choose "Custom" to type your own. The three levels go from lenient to strict: shorter windows, lower thresholds, longer bans.',
+    levelPresetLoose: 'Loose: regular {wl} hits / {ws}s, burst {bl} hits / {bs}s, ban {bm} min. Fewest false positives — only catches aggressive scanners.',
+    levelPresetBalanced: 'Balanced: regular {wl} hits / {ws}s, burst {bl} hits / {bs}s, ban {bm} min. Recommended.',
+    levelPresetStrict: 'Strict: regular {wl} hits / {ws}s, burst {bl} hits / {bs}s, ban {bm} min. Blocks earlier and longer; misconfigured clients are more likely to be caught.',
+    levelPresetCustom: 'Custom: the regular window, burst window and ban duration are yours to set. The server only clamps out-of-range values, it never substitutes different ones.',
+    autoBan: 'Auto-ban',
+    autoBanHint: 'When off, only the two lists below allow or block traffic — no behaviour-based banning, and the windows and ban duration stop mattering.',
+    window: 'Regular window',
+    windowHint: 'Ban a source once it accumulates this many handshake failures within this period. This is what catches slow scans — the "a dozen knocks a minute" kind.',
+    burst: 'Burst window',
+    burstHint: 'Dense failures in a short span, to catch a full-scale port scan within seconds. Either window tripping is enough to ban.',
+    banMinutes: 'Ban duration',
+    banMinutesHint: '1–{max} minutes, lifted automatically on expiry. Bans live in memory only, are never written to the config file, and are cleared on restart.',
+    memoryMB: 'Memory limit',
+    memoryHint: 'Default 5 / max 15 MB. This is the cap for EACH ban table — the panel\'s inbound guard and this module keep one each, both sized by this number, so the worst-case total is twice this. Once a table is full no new addresses are recorded; existing bans keep working.',
+    saveHint: 'Changes take effect only after you click Save. Saving does not restart the Web Services / Message Routing listeners, so live connections are unaffected.',
+    // Units and connectives (never hardcode them in the template: the other locale would leak through).
+    // windowJoin ties "seconds" to "how many hits" in one sentence rather than leaving a lone slash
+    // on screen — "60 / 12" gives no clue which number is the time and which is the count.
+    windowJoin: 'seconds, up to',
+    unitTimes: 'hits',
+    unitMinutes: 'min',
+    selfCheck: 'Source self-check',
+    selfCheckHint: 'Service Guard only blocks when it sees the real source IP. If a reverse proxy (nginx/Caddy) sits in front of Web Services / Message Routing, the peer becomes 127.0.0.1 and bans stop working.',
+    selfCheckEmpty: 'No active bans right now. If your service is public yet this stays empty for long, a front proxy is probably rewriting the source to loopback, so bans are effectively off.',
+    selfCheckActive: 'There are {n} active bans, which means Service Guard is seeing real source IPs and is blocking. Most recently blocked sources:',
+    // Lists
+    allowIps: 'Allowlist',
+    allowHint: 'One per line; supports single IP, CIDR (10.0.0.0/8) and ranges (1.2.3.4-1.2.3.9). Addresses here are exempt from auto-ban. At most {max} entries; entries with invalid syntax are dropped on save.',
+    denyIps: 'Denylist',
+    denyHint: 'One per line, same syntax. The denylist overrides every other rule — including the allowlist and loopback.',
+    ipsPlaceholder: 'One per line, e.g.\n192.168.1.10\n10.0.0.0/8\n1.2.3.4-1.2.3.9',
+    // Auto-bans
+    banActive: 'Active',
+    banMemoryUsed: 'Memory used',
+    banMemoryLimit: 'Memory limit',
+    banClearAll: 'Lift all',
+    banClearConfirm: 'Lift every auto-ban? Sources that are still scanning regain access immediately and will be banned again once they trip the limit.',
+    banColIp: 'IP',
+    banColCount: 'Hits',
+    banColBannedAt: 'Banned at',
+    banColUntil: 'Until',
+    banColAction: 'Action',
+    banUnban: 'Lift',
+    banEmpty: 'No addresses are currently banned',
+    banTotal: '{n} source(s) banned',
+    banTruncated: '(showing the {n} most recent)',
+    banUnbanOk: 'Ban lifted',
+    banClearOk: 'Lifted {n} ban(s)',
+    // Read-only status widget on business pages. The rules text is composed from the structured
+    // fields in the current locale (the backend no longer ships a pre-rendered summary), so what it
+    // shows always agrees with the module page instead of the two drifting apart.
+    chipEnabled: 'Service Guard · Enabled',
+    chipDisabled: 'Service Guard · Disabled',
+    rulesLabel: 'Rules: ',
+    chipRules: '{level} · regular {wl}/{ws}s · burst {bl}/{bs}s · ban {bm} min',
+    chipAutoBanOff: '{level} · lists only, auto-ban is off',
+    chipLists: 'Lists: {allow} allowed / {deny} denied',
+    // Explanations
+    explainTitle: 'Details (which modules it covers & how it differs from the panel\'s inbound guard & what it does / does not defend against)',
+    explainWhat: 'What it is: fail2ban-family protection at the connection layer — intercepts by source IP before TCP is established and TLS handshakes happen, and blacklists misbehaving sources automatically (with a TTL).',
+    explainModules: 'Which modules it covers: it covers Web Services (reverse proxy / static site / redirect) inbound connections; it covers Message Routing (Webhook) standalone-port inbound (the shared port is covered together with Web Services). It does NOT cover Port Forwarding (TCP / UDP).',
+    explainVsPanel: 'How it differs from the panel\'s inbound guard: that one only protects the panel port (with "LAN only / all" mode); Service Guard protects Web Services and Message Routing inbound — two independent mechanisms, each guarding its own scope.',
+    explainDefends: 'What it defends against: port scans, service probes and TLS handshake probes (the "TLS handshake error from <ip>" lines flooding the log) from a single host / a few sources, and slow enumeration.',
+    explainNotDefends: 'What it does NOT defend against: distributed DDoS (per-IP judgement, a botnet never trips the threshold); packet filtering / NAT / stateful inspection.',
+    explainOrder: 'Verdict order: denylist → LAN/loopback exemption → allowlist → auto-ban → allow. The denylist overrides everything; LAN and loopback are exempt from auto-ban (internal liveness probes, health checks and clients with a half-configured certificate produce handshake failures continuously, and banning them would make the whole site disappear from the load balancer).',
+    // Read-only inbound-guard memory (Settings page)
+    panelMemoryTitle: 'Memory limit',
+    panelMemoryHint: 'The inbound guard\'s ban table is sized by the same figure as Service Guard\'s (one table each, both derived from this number). It is set centrally on the Service Guard module; read-only here.',
+    enabled: 'Enabled',
+    disabled: 'Disabled',
+    loadFailed: 'Failed to load Service Guard status',
   },
   about: {
     title: 'About Mantou',
@@ -870,6 +959,16 @@ export default {
     running: 'Running',
     abnormal: 'Error',
     stopped: 'Disabled',
+    // status.* mirrors the state keys the backend sends (see module.Status.Code on the Go side).
+    // {err} in startFailed is the raw error string and is not translated.
+    // There is no `disabled` entry on purpose — the adjacent tag already says it (see statusText).
+    status: {
+      notListening: 'Not listening',
+      startFailed: 'Failed to start: {err}',
+      shared: 'Sharing {addr} with Web Services, routed by domain {domain}; {received} received',
+      listening: '{proto} listening on {addr}; {received} received',
+      warnSuffix: ' — {n} settings need review',
+    },
     moduleSettings: 'Module settings',
     moduleIntro:
       "This module's own inbound listener: port, domain and HTTPS. Every receiver URL hangs off this one listener.",

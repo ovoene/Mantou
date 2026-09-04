@@ -13,6 +13,7 @@ export const views = {
   ddns: () => import('@/views/DDNS.vue'),
   webservice: () => import('@/views/WebServices.vue'),
   mroute: () => import('@/views/MessageRoutes.vue'),
+  globalfirewall: () => import('@/views/GlobalFirewall.vue'),
   forward: () => import('@/views/Forwards.vue'),
   wol: () => import('@/views/Wol.vue'),
   cron: () => import('@/views/CronTasks.vue'),

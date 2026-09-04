@@ -205,7 +205,7 @@ type updateSettingsReq struct {
 	Restart *restartReq `json:"restart"`
 }
 
-// firewallReq 面板入站防火墙的提交体。
+// firewallReq 面板入站防护的提交体。
 //
 // 数值字段一律用指针：0 在「每秒请求数」上是"不限速"这个有效选择，
 // 而在阈值/时长上则代表"没填"（由 normalize 回落到默认值）——两种含义都要求
@@ -408,7 +408,7 @@ func (s *Server) handleUpdateSettings(c *gin.Context) {
 		}
 	}
 
-	// 面板入站防火墙：同样先按加载期的规则规范化，再校验，最后确认它不会把
+	// 面板入站防护：同样先按加载期的规则规范化，再校验，最后确认它不会把
 	// 提交这次改动的人本人关在门外（见 checkFirewallLockout）。
 	//
 	// 三步的顺序不能换：checkLimits 要看未截断的原始名单，Valid 要看未被 normalize
@@ -564,7 +564,7 @@ func (s *Server) handleUpdateSettings(c *gin.Context) {
 		before.Panel.HTTPS.Enabled != after.Panel.HTTPS.Enabled ||
 		before.Panel.HTTPS.CertID != after.Panel.HTTPS.CertID ||
 		before.Panel.HTTPS.Domain != after.Panel.HTTPS.Domain
-	// 入站防火墙**不在**这个清单里：它每次判定都现取配置快照（见 firewall.go 的
+	// 入站防护**不在**这个清单里：它每次判定都现取配置快照（见 firewall.go 的
 	// panelFirewall.current），保存完下一个连接与下一个请求就按新规则走。
 	// 把它算进重启项只会让一次"加个白名单"变成一次面板重启。
 

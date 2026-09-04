@@ -11,12 +11,12 @@ import (
 	"mantou/internal/ipx"
 )
 
-// 面板入站防火墙的接口层：自锁校验 + 自动封禁名单的查看与解除。
+// 面板入站防护的接口层：自锁校验 + 自动封禁名单的查看与解除。
 // 判定逻辑本身在 firewall.go，配置规则在 internal/config/firewall.go。
 
 // fwBanListLimit 「当前封禁」接口一次最多返回多少条。
 //
-// 封禁表最多 fwBanMaxEntries（4096）条，全量下发对一个只是想看看谁被拦了的
+// 封禁表容量由「服务防护」的 MemoryMB 折算（与服务防护共用同一额度概念），全量下发对一个只是想看看谁被拦了的
 // 设置页没有意义，且会让这个接口的响应体随攻击规模膨胀。
 // 总数另行返回（total 字段），不会因为截断而看不出实际规模。
 const fwBanListLimit = 200
@@ -67,7 +67,7 @@ func checkFirewallLockout(fw config.PanelFirewall, r *http.Request) error {
 // 只读内存，不落盘：自动封禁本来就只存在于内存（理由见 config.PanelFirewall.AutoBanMinutes）。
 func (s *Server) handleGetFirewallBans(c *gin.Context) {
 	if s.firewall == nil {
-		respondError(c, http.StatusServiceUnavailable, "防火墙未就绪")
+		respondError(c, http.StatusServiceUnavailable, "入站防护未就绪")
 		return
 	}
 	list := s.firewall.banList(fwBanListLimit)
@@ -90,7 +90,7 @@ func (s *Server) handleGetFirewallBans(c *gin.Context) {
 // （他得先能进来才能点这个按钮——所以真正的自救仍然是回环豁免与 Force 确认那两条）。
 func (s *Server) handleClearFirewallBans(c *gin.Context) {
 	if s.firewall == nil {
-		respondError(c, http.StatusServiceUnavailable, "防火墙未就绪")
+		respondError(c, http.StatusServiceUnavailable, "入站防护未就绪")
 		return
 	}
 	var req struct {
@@ -104,12 +104,12 @@ func (s *Server) handleClearFirewallBans(c *gin.Context) {
 			return
 		}
 		ok := s.firewall.unban(req.IP)
-		s.deps.Log.Info("面板防火墙解除封禁", "ip", req.IP, "wasBanned", ok)
+		s.deps.Log.Info("面板入站防护解除封禁", "ip", req.IP, "wasBanned", ok)
 		respondOK(c, gin.H{"ok": true, "cleared": boolToInt(ok)})
 		return
 	}
 	n := s.firewall.clearBans()
-	s.deps.Log.Info("面板防火墙清空封禁名单", "cleared", n)
+	s.deps.Log.Info("面板入站防护清空封禁名单", "cleared", n)
 	respondOK(c, gin.H{"ok": true, "cleared": n})
 }
 

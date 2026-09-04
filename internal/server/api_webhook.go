@@ -790,11 +790,14 @@ func (s *Server) handleUpdateWebhookServer(c *gin.Context) {
 }
 
 // webhookServerResult 保存 / 开关的统一响应：带上刚重载出来的运行态。
+//
+// 下发的是状态**键名**与参数（见 module.Status.Code），前端按当前语言拼句子。
 func (s *Server) webhookServerResult() gin.H {
 	out := gin.H{"ok": true}
 	if s.deps.Webhook != nil {
 		st := s.deps.Webhook.Status()
-		out["message"] = st.Message
+		out["code"] = st.Code
+		out["args"] = st.Args
 		out["healthy"] = st.Healthy
 	}
 	return out
@@ -990,6 +993,8 @@ func (s *Server) checkWebhookServerReq(before *config.Config, req webhookServerR
 // ---- 动作 ----
 
 // handleWebhookStatus 返回模块运行态：监听情况与计数。
+//
+// code / args 是状态短语的键名与插值参数，不是拼好的句子（见 module.Status.Code）。
 func (s *Server) handleWebhookStatus(c *gin.Context) {
 	if s.deps.Webhook == nil {
 		respondOK(c, gin.H{"enabled": false})
@@ -998,7 +1003,8 @@ func (s *Server) handleWebhookStatus(c *gin.Context) {
 	st := s.deps.Webhook.Status()
 	received, rejected, dropped := s.deps.Webhook.Metrics()
 	out := gin.H{
-		"message":  st.Message,
+		"code":     st.Code,
+		"args":     st.Args,
 		"healthy":  st.Healthy,
 		"total":    st.Total,
 		"active":   st.Active,

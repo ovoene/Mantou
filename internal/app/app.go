@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"mantou/internal/config"
+	"mantou/internal/inboundfw"
 	"mantou/internal/logx"
 	"mantou/internal/module"
 	"mantou/internal/modules/cert"
@@ -40,6 +41,10 @@ type App struct {
 	Cert       *cert.Module
 	Notify     *notify.Module
 	Webhook    *webhook.Module
+
+	// GlobalFirewall 服务防护（连接层）的运行态，创建一次、共享给 Web 服务、消息路由与
+	// 服务器接口层——封禁表只有一份（见 internal/inboundfw）。
+	GlobalFirewall *inboundfw.Firewall
 }
 
 // Build 创建并注册所有功能模块，返回可用于装配服务器的 App。
@@ -55,6 +60,13 @@ func Build(log *logx.Logger, cfgMgr *config.Manager, dataDir string) *App {
 	certMod := cert.New(log, filepath.Join(dataDir, "certs"), cfgMgr)
 	notifyMod := notify.New(log, stats)
 	webhookMod := webhook.New(log, stats, filepath.Join(dataDir, "logs", "webhook.log"))
+
+	// 服务防护（连接层）：创建一份、共享给 Web 服务与消息路由两个监听，以及服务器接口层。
+	// 它在 Accept 处拦截、并把 TLS 握手异常回灌进自动封禁计数，与面板入站防护是两套独立机制
+	// （后者只管面板端口）。独立于业务模块创建，避免业务模块反向依赖防火墙包之外的编排逻辑。
+	gfw := inboundfw.New(cfgMgr, log)
+	webMod.SetGlobalFirewall(gfw)
+	webhookMod.SetGlobalFirewall(gfw)
 
 	// 证书解析器注入到 Web 服务（供 HTTPS 站点按 SNI 取证书）。
 	webMod.SetCertResolver(certMod.Resolver())
@@ -127,18 +139,19 @@ func Build(log *logx.Logger, cfgMgr *config.Manager, dataDir string) *App {
 	modMgr.Register(webhookMod)
 
 	return &App{
-		Log:        log,
-		CfgMgr:     cfgMgr,
-		Modules:    modMgr,
-		Stats:      stats,
-		DDNS:       ddnsMod,
-		WebService: webMod,
-		Forward:    fwdMod,
-		WOL:        wolMod,
-		Cron:       cronMod,
-		Cert:       certMod,
-		Notify:     notifyMod,
-		Webhook:    webhookMod,
+		Log:            log,
+		CfgMgr:         cfgMgr,
+		Modules:        modMgr,
+		Stats:          stats,
+		DDNS:           ddnsMod,
+		WebService:     webMod,
+		Forward:        fwdMod,
+		WOL:            wolMod,
+		Cron:           cronMod,
+		Cert:           certMod,
+		Notify:         notifyMod,
+		Webhook:        webhookMod,
+		GlobalFirewall: gfw,
 	}
 }
 
@@ -162,6 +175,7 @@ func (a *App) ServerDeps(base server.Deps) server.Deps {
 	base.Web = a.WebService
 	base.Notify = a.Notify
 	base.Webhook = a.Webhook
+	base.GlobalFirewall = a.GlobalFirewall
 	base.Stats = a.Stats
 	base.OnConfigChanged = a.ReloadAll
 	return base

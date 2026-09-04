@@ -55,6 +55,11 @@ type Config struct {
 	WebhookReceivers []WebhookReceiver `json:"webhookReceivers"` // 入站接收器（含规则）
 	NotifyTargets    []NotifyTarget    `json:"notifyTargets"`    // 出站通知目标
 	MessageTemplates []MessageTemplate `json:"messageTemplates"` // 消息模板库
+
+	// GlobalFirewall 服务防护（连接层）：保护 Web 服务与消息路由的入站连接，
+	// 与面板入站防护是两套独立机制（后者只管面板端口，见 PanelFirewall 的说明）。
+	// 它是顶层配置而非挂在 Settings 下：它管的是面板之外的业务端口，与「面板设置」语义不同。
+	GlobalFirewall GlobalFirewall `json:"globalFirewall"`
 }
 
 // UpdateConfig 版本更新相关配置。
@@ -203,12 +208,12 @@ type Security struct {
 	// 默认关闭，以兼容目标本就位于内网的自建取址 / 回调场景。
 	BlockPrivateNetwork bool `json:"blockPrivateNetwork"`
 
-	// Firewall 面板入站防火墙。与 BlockPrivateNetwork 正好是相反的两个方向：
+	// Firewall 面板入站防护。与 BlockPrivateNetwork 正好是相反的两个方向：
 	// 那个管「本机能往哪儿发」，这个管「谁能连进面板」。
 	Firewall PanelFirewall `json:"firewall"`
 }
 
-// 面板入站防火墙的取值边界。数字都写成常量，是因为它们要在三处保持一致：
+// 面板入站防护的取值边界。数字都写成常量，是因为它们要在三处保持一致：
 // normalizePanelFirewall 的夹取、API 层的入参校验、前端输入框的 min/max。
 const (
 	// MaxFirewallIPs 单张名单（允许 / 拒绝各一张）最多多少条。
@@ -240,7 +245,120 @@ const (
 	MaxFirewallAutoBanMinutes = 43200
 )
 
-// PanelFirewall 面板入站防火墙：只管「谁能连到面板」，不涉及本机其他端口，
+// 服务防护（连接层）的取值边界。与面板入站防护同口径：边界必须在三处保持一致——
+// normalizeGlobalFirewall 的夹取、API 层的入参校验、前端输入框的 min/max 共用同一份数。
+const (
+	// GlobalFirewallMaxIPs 单张名单（允许 / 拒绝各一张）最多多少条。
+	// 与面板入站防护同一护栏（见 MaxFirewallIPs 的说明）：名单每次配置变更全量重建，
+	// 一份「a-b」范围在 ipx.ParseCIDRs 里最多展开成 4096 个单 IP。
+	//
+	// 直接**取自** MaxFirewallIPs 而不是另写一个 256：两张名单都由同一个 normalizeIPList
+	// 整理，而它按 MaxFirewallIPs 截断。各写一份字面量的话，改动其中一个就会出现
+	// 「校验说 256 条以内合法、整理时截到 200 条」这种静默丢数据。
+	GlobalFirewallMaxIPs = MaxFirewallIPs
+
+	// 检测档位。前三个是预设档位：选中哪个，下面那组数值就**由档位决定**，
+	// 用户提交的数值一概不作数（规范化会照预设重写，见 normalizeGlobalFirewall）。
+	// custom 是唯一让手填数值生效的档位——把"用预设"与"我要自己填"分成两个明确的选择，
+	// 而不是靠猜「这组数是不是被人改过」。
+	GlobalFirewallLevelLoose    = "loose"    // 宽松
+	GlobalFirewallLevelBalanced = "balanced" // 均衡
+	GlobalFirewallLevelStrict   = "strict"   // 严格
+	GlobalFirewallLevelCustom   = "custom"   // 自定义：数值以用户填的为准
+
+	// 各档位对应的窗口 / 阈值 / 封禁时长（秒、次、分钟）。
+	// 三档必须**两两不同**，否则界面上换档位却什么都不变（见 TestGlobalFirewallPresetsDiffer）。
+	// 宽松给家用慢速探测留余地，严格压到贴近扫描特征。
+	gfwLooseWindowSeconds = 120
+	gfwLooseWindowLimit   = 20
+	gfwLooseBurstSeconds  = 5
+	gfwLooseBurstLimit    = 8
+	gfwLooseBanMinutes    = 60
+
+	gfwBalancedWindowSeconds = 60
+	gfwBalancedWindowLimit   = 12
+	gfwBalancedBurstSeconds  = 3
+	gfwBalancedBurstLimit    = 4
+	gfwBalancedBanMinutes    = 120
+
+	gfwStrictWindowSeconds = 30
+	gfwStrictWindowLimit   = 8
+	gfwStrictBurstSeconds  = 2
+	gfwStrictBurstLimit    = 3
+	gfwStrictBanMinutes    = 360
+
+	// DefaultGlobalFirewallMemoryMB 自动封禁表内存上限（MB）。
+	//
+	// 默认 5 MB、最大 15 MB：封禁表的键是**攻击者选的**地址，一个 IPv6 /64 就能提供
+	// 1.8e19 个来源，无上限等于把内存分配权交给对方（同面板入站防护封禁表的理由，见 config.BanEntriesForMemoryMB）。
+	// 它是**每张表**的上限：面板入站防护与服务防护各有一张封禁表，两张都按这一个数换算容量
+	// （折算函数见 config.BanEntriesForMemoryMB），最坏情况总占用是它的两倍。只能在此模块设置（见界面说明）。
+	DefaultGlobalFirewallMemoryMB = 5
+	MaxGlobalFirewallMemoryMB     = 15
+
+	// MaxGlobalFirewallBanMinutes 自动封禁时长上限：24 小时。
+	// 与面板同理——不提供「永久」：自动封禁是机器判断，判错代价是把人关在门外，
+	// 有限期意味着误判会自己愈合。要永久封就写进拒绝名单。
+	MaxGlobalFirewallBanMinutes = 1440
+
+	// 自定义档位的数值边界。四处必须一致：normalizeGlobalFirewall 的夹取、Valid 的校验、
+	// 接口下发给前端的 limits、前端输入框的 min/max。任一处对不上，都会出现
+	// 「界面上存得下、存进去被悄悄改成另一个数」。
+	MinGlobalFirewallWindowSeconds = 1
+	MaxGlobalFirewallWindowSeconds = 3600
+	MinGlobalFirewallLimit         = 1
+	MaxGlobalFirewallLimit         = 100000
+)
+
+// GlobalFirewall 服务防护（连接层）：保护 Web 服务与消息路由的入站连接，
+// 与面板入站防护是两套独立机制（后者只管面板端口，见 PanelFirewall 的说明）。
+//
+// 它在 TCP 建立、TLS 握手之前按来源 IP 行为自动拦截，属于 fail2ban 家族：
+// 判定顺序为 拒绝名单 → 局域网/回环豁免 → 允许名单 → 自动封禁 → 放行。
+//
+// 自动封禁的行为信号来自 TLS 握手失败（"TLS handshake error from <ip>"）：
+// 那条日志由 crypto/tls 在握手失败时产出，发生在 HTTP 层之前，任何中间件都看不到，
+// 只能从 http.Server.ErrorLog（一个 io.Writer）的写入链上 hook——详见 internal/inboundfw。
+//
+// 它不是 DDoS 防护：判据是 per-IP，分布式僵尸网络（上万来源、每个发一点点）
+// 永远触发不了任何阈值。它也不是包过滤防火墙：不做状态检测、NAT、端口/协议规则。
+type GlobalFirewall struct {
+	// Enabled 总开关。默认**关闭**（见 defaultGlobalFirewall 的说明）。
+	Enabled bool `json:"enabled"`
+
+	// Level 检测档位，是窗口 / 阈值 / 封禁时长的**权威来源**：
+	// loose / balanced / strict 三个预设档位下，下面那组数值一律由档位重写；
+	// 只有 custom 档位才以用户填的数值为准。空值与认不出的值按 balanced 处理。
+	Level string `json:"level"`
+
+	AllowIPs []string `json:"allowIps"` // 允许名单：命中即放行，并跳过自动封禁计数。
+	DenyIPs  []string `json:"denyIps"`  // 拒绝名单：命中即拒绝，优先于其他一切规则。
+
+	// AutoBan 是否在来源持续触发握手异常时自动拉黑（带 TTL）。
+	AutoBan bool `json:"autoBan"`
+
+	// 下面五个数值在预设档位（loose/balanced/strict）下由 Level 决定，手填不作数；
+	// Level=custom 时才以这里的值为准。落库的永远是**已经解析好的数值**，
+	// 于是运行态（internal/inboundfw）只读这几个字段，不必认识"档位"这个概念。
+	//
+	// WindowSeconds / WindowLimit 常规窗口：WindowSeconds 秒内累计 WindowLimit 次握手异常即封禁。
+	WindowSeconds int `json:"windowSeconds"`
+	WindowLimit   int `json:"windowLimit"`
+	// BurstSeconds / BurstLimit 突发窗口：更短窗口内 BurstLimit 次即封禁，专抓高速扫描。
+	BurstSeconds int `json:"burstSeconds"`
+	BurstLimit   int `json:"burstLimit"`
+	// BanMinutes 自动封禁维持多少分钟。
+	BanMinutes int `json:"banMinutes"`
+
+	// MemoryMB **每张**自动封禁表的内存上限（MB），只在此模块设置。
+	//
+	// 面板入站防护与服务防护各有一张封禁表，两张都按这一个数换算容量
+	//（见 BanEntriesForMemoryMB），因此最坏情况下的总占用是它的两倍——
+	// 写成"共用一个额度"曾是这里的说法，但那与代码不符：一个数、两张表、各自封顶。
+	MemoryMB int `json:"memoryMB"`
+}
+
+// PanelFirewall 面板入站防护：只管「谁能连到面板」，不涉及本机其他端口，
 // 也不改动系统防火墙——它是本进程自己在监听器与请求入口上的判断。
 //
 // 决策顺序是这份设计的核心，实现见 server.panelFirewall.decide，顺序为：

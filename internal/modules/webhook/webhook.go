@@ -32,6 +32,7 @@ import (
 	"golang.org/x/net/netutil"
 
 	"mantou/internal/config"
+	"mantou/internal/inboundfw"
 	"mantou/internal/ipx"
 	"mantou/internal/logx"
 	"mantou/internal/module"
@@ -122,6 +123,9 @@ type Module struct {
 	ln      net.Listener
 	lastErr string
 	closed  bool
+	// globalFirewall 服务防护（连接层）的运行态，由 app 装配时注入（见 SetGlobalFirewall）。
+	// 它保护本模块独立端口的入站连接，与面板入站防护是两套独立机制。
+	globalFirewall *inboundfw.Firewall
 
 	received atomic.Int64
 	rejected atomic.Int64
@@ -153,6 +157,24 @@ func (m *Module) SetNotifier(n Notifier) { m.notifier.Store(&n) }
 
 // SetCertResolver 注入证书解析器。
 func (m *Module) SetCertResolver(r CertResolver) { m.certs.Store(&r) }
+
+// SetGlobalFirewall 注入服务防护（连接层）。由 app 装配时调用一次。
+//
+// 只存指针：封禁表是全局唯一的，Web 服务与消息路由共享同一份，跨 Reload 存活。
+// 注入缺失时监听退化为不拦截（见 startListen 的 nil 处理），不影响正常服务。
+func (m *Module) SetGlobalFirewall(f *inboundfw.Firewall) {
+	m.mu.Lock()
+	m.globalFirewall = f
+	m.mu.Unlock()
+}
+
+// firewall 取当前注入的防火墙。**调用方不得持有 m.mu**（本函数自己要取）。
+// 起监听时只在这里读一次，把值传给下面两处使用点，见 startListen。
+func (m *Module) firewall() *inboundfw.Firewall {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.globalFirewall
+}
 
 // Name 实现 module.Module。
 func (m *Module) Name() string { return "webhook" }
@@ -294,6 +316,13 @@ func listenHost(s string) string {
 // 并把原因记进 lastErr（总览页与模块状态可见）。回落成明文会让一个
 // 以为自己在用 HTTPS 的用户把令牌与业务数据裸奔在网上——那比"服务没起来"严重得多。
 func (m *Module) startListen(spec listenSpec) error {
+	// 防火墙指针在锁内取一次，后面两处都用这个局部变量。
+	// 直接读 m.globalFirewall 是数据竞争：写它的 SetGlobalFirewall 持 m.mu，而本函数的调用方
+	// applyListen 在调进来之前已经把锁放掉了（它必须放——起监听要花时间，不能占着模块锁）。
+	// 实际装配顺序下这个竞争碰不上（注入只在启动时发生一次，早于任何 Reload），
+	// 但 -race 会报，而且"取两次可能取到不同值"本身就是个说不清的状态。
+	fw := m.firewall()
+
 	srv := &http.Server{
 		Handler:           m.handler(),
 		ReadHeaderTimeout: 15 * time.Second,
@@ -302,7 +331,8 @@ func (m *Module) startListen(spec listenSpec) error {
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,
-		ErrorLog:     m.log.Standard(slog.LevelWarn, "消息路由 TLS 或连接异常"),
+		// fw 为 nil 时 WrapErrorLog 原样返回 base：未注入防火墙等于不拦截，日志行为不变。
+		ErrorLog: fw.WrapErrorLog(m.log.Standard(slog.LevelWarn, "消息路由 TLS 或连接异常")),
 	}
 
 	if spec.tls {
@@ -321,7 +351,11 @@ func (m *Module) startListen(spec listenSpec) error {
 		m.log.Error("消息路由监听失败", "addr", spec.addr, "err", err.Error())
 		return nil
 	}
-	ln = netutil.LimitListener(ln, maxConns)
+	// 服务防护（连接层）夹在 LimitListener 与原始 listener 之间：Accept 处先按封禁/名单拦截，
+	// 被拒的连接不会进入 LimitListener 的并发连接计数。共享端口由 Web 服务持有、本模块不绑监听，
+	// 那份连接由 Web 服务那一侧的防火墙覆盖，不会漏。
+	// fw 为 nil 时 Wrap 原样返回 ln。
+	ln = netutil.LimitListener(fw.Wrap(ln), maxConns)
 
 	m.mu.Lock()
 	m.srv = srv
@@ -449,6 +483,17 @@ func (m *Module) setErr(s string) {
 // Name 必须是模块键名（与 Name() 一致），不能写中文标题：总览页拿它去查
 // overview.modName.<键名> 的译名，查不到就原样显示。写死中文的话英文界面会漏出中文，
 // 反过来漏掉译名就会在中文界面显示英文键名。
+//
+// Code / Args 同一条理由（见 module.Status.Code）：这里只给键名与数值，句子由前端按
+// 当前语言拼（web/src/views/MessageRoutes.vue 的 statusText）。本模块的取值：
+//
+//	disabled     模块开关关着
+//	shared       端口与 Web 服务共用（args: addr / domain / received[ / warnings]）
+//	notListening 该监听却没监听，且没留下错误
+//	startFailed  起监听失败（args: err——原始错误串，不翻译）
+//	listening    正常监听（args: proto / addr / received[ / warnings]）
+//
+// warnings 只在大于零时给，前端据此决定要不要追加"N 项配置需要检查"那一句。
 func (m *Module) Status() module.Status {
 	table := m.routes.Load()
 	m.mu.Lock()
@@ -458,30 +503,32 @@ func (m *Module) Status() module.Status {
 	st := module.Status{Name: "webhook", Total: table.total, Active: table.active, Healthy: true}
 	switch {
 	case !spec.enabled:
-		st.Message = "未启用"
+		st.Code = "disabled"
 	case spec.shared:
 		// 端口由 Web 服务持有，本模块没有自己的 net.Listener，不能按 listening 判健康。
-		st.Message = fmt.Sprintf("与 Web 服务共用 %s，域名 %s，已接收 %d 条",
-			spec.addr, spec.domain, m.received.Load())
+		st.Code = "shared"
+		st.Args = map[string]any{"addr": spec.addr, "domain": spec.domain, "received": m.received.Load()}
 		if table.warnings > 0 {
 			st.Healthy = false
-			st.Message += fmt.Sprintf("，%d 项配置需要检查", table.warnings)
+			st.Args["warnings"] = table.warnings
 		}
 	case !listening:
 		st.Healthy = false
-		st.Message = "未监听"
+		st.Code = "notListening"
 		if lastErr != "" {
-			st.Message = "启动失败：" + lastErr
+			st.Code = "startFailed"
+			st.Args = map[string]any{"err": lastErr}
 		}
 	default:
 		proto := "HTTP"
 		if spec.tls {
 			proto = "HTTPS"
 		}
-		st.Message = fmt.Sprintf("%s 监听 %s，已接收 %d 条", proto, spec.addr, m.received.Load())
+		st.Code = "listening"
+		st.Args = map[string]any{"proto": proto, "addr": spec.addr, "received": m.received.Load()}
 		if table.warnings > 0 {
 			st.Healthy = false
-			st.Message += fmt.Sprintf("，%d 项配置需要检查", table.warnings)
+			st.Args["warnings"] = table.warnings
 		}
 	}
 	return st

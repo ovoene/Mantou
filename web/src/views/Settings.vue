@@ -195,7 +195,7 @@ const savingLogin = ref(false)
 const security = reactive<{ blockPrivateNetwork: boolean }>({ blockPrivateNetwork: false })
 const savingSecurity = ref(false)
 
-/* ---------- 入站防火墙（面板自身的来源准入：范围 + 名单 + 限速 + 自动封禁） ---------- */
+/* ---------- 入站防护（面板自身的来源准入：范围 + 名单 + 限速 + 自动封禁） ---------- */
 // 名单在界面上是每行一条的文本框，配置里是字符串数组：两个方向都在 fwListToText /
 // fwTextToList 里转，不在模板里就地 split，好让"用户看到的"与"提交的"只有一处定义。
 interface FirewallCfg {
@@ -227,6 +227,9 @@ const firewallMeta = reactive<{ autoBanWindowMinutes: number; maxIps: number }>(
 const savingFirewall = ref(false)
 const firewallAllowText = ref('')
 const firewallDenyText = ref('')
+// 入站防护与服务防护共用同一份内存额度，而该额度只能在「服务防护」模块设置，
+// 因此这里只展示、不可改。值由服务防护接口下发（memory.limitMB）。
+const gfwMemoryMB = ref(0)
 
 // 当前封禁列表。total 与 items.length 可能不等（后端按 limit 截断）。
 const firewallBans = ref<FirewallBan[]>([])
@@ -287,7 +290,17 @@ async function clearFirewallBans() {
   }
 }
 
-// 保存入站防火墙。
+// 拉取服务防护的内存上限，供入站防护这一区只读展示（二者共用同一额度）。
+async function loadGfwMemory() {
+  try {
+    const res = await actions.globalFirewall()
+    if (res.memory && typeof res.memory.limitMB === 'number') gfwMemoryMB.value = res.memory.limitMB
+  } catch {
+    /* 只读展示，拉不到不影响本页 */
+  }
+}
+
+// 保存入站防护。
 //
 // 两段式：先照常提交，后端若判断这份设置会切断**当前这个人**的访问，回 409 并把原因
 // 说清楚（例如"你正从 203.0.113.5 访问，它不属于局域网"）；界面把那句话原样放进确认框，
@@ -771,7 +784,8 @@ const importEncrypted = ref(false)
 // 标识与后端 internal/server/import_scope.go 的 importModule 逐字对应（接口契约），
 // 顺序与左侧导航一致，好让用户在对话框里从上往下对着导航找。
 const importModuleKeys = [
-  'ddns', 'webservice', 'messageroute', 'forward', 'wol', 'cron', 'cert', 'credential', 'panel',
+  'ddns', 'webservice', 'messageroute', 'forward', 'wol', 'cron', 'cert', 'credential',
+  'globalfirewall', 'panel',
 ] as const
 // 模块标签复用导航文案，"面板与设置"另起一个键（它比导航上的「设置」多含账户与外观）。
 const importModuleLabels: Record<string, string> = {
@@ -783,10 +797,13 @@ const importModuleLabels: Record<string, string> = {
   cron: 'nav.cron',
   cert: 'nav.cert',
   credential: 'nav.cred',
+  globalfirewall: 'nav.gfw',
   panel: 'settings.importScopePanel',
 }
 // 硬依赖：勾了左边就必须一起导入右边。与后端 importDeps 是同一张表，
 // 两边都算一遍——前端算是为了让用户看见"为什么这一项锁住了"，后端算才是保证。
+// 服务防护刻意不在表里：它只有档位与两张 IP 名单，不引用任何别的模块，
+// 因此可以单独勾选（后端 importDeps 同款说明）。
 const importModuleDeps: Record<string, string[]> = {
   cert: ['credential'],
   ddns: ['credential'],
@@ -1068,6 +1085,8 @@ onActivated(async () => {
   // 证书下拉框数据现在随 /settings 一并返回，首屏因此只有一次往返。
   await loadSettings()
   loaded.value = true
+  // 入站防护这一区要只读展示与服务防护共用的内存额度，顺手拉一次。
+  loadGfwMemory()
   // 日志文件大小会随时间增长，切回来时顺手刷新；不阻塞首屏。
   refreshLogInfo()
   // keep-alive 记着上次停在哪一页，停在备份页时 watch 不会触发，这里补一次。
@@ -1489,6 +1508,18 @@ useCloseOnLeave(importAuthVisible)
               </el-form-item>
             </template>
           </template>
+          <!-- 内存上限：入站防护与服务防护各有一张封禁表，两张都按这一个数换算容量
+               （不是共用一份额度，最坏情况是它的两倍——见 gfw.panelMemoryHint）。
+               这个数只能在「服务防护」模块改，这里只读展示。 -->
+          <el-form-item :label="t('gfw.panelMemoryTitle')">
+            <!-- 说明放在数值**下方**而不是右边：el-form-item 的内容区是 flex 行，
+                 <p> 直接塞进去会变成数值右侧的兄弟节点，把整行撑高、标签也就跟着不齐平。
+                 套一层 width:100% 的块容器后，块级的 <p> 自然落到下一行（同下方封禁列表的写法）。 -->
+            <div style="width: 100%">
+              <span class="ro-mem">{{ gfwMemoryMB > 0 ? gfwMemoryMB + ' MB' : '—' }}</span>
+              <p class="mt-subtle hint">{{ t('gfw.panelMemoryHint') }}</p>
+            </div>
+          </el-form-item>
           <el-form-item>
             <el-button type="primary" :loading="savingFirewall" @click="saveFirewall(false)">
               {{ t('common.save') }}
@@ -1965,6 +1996,14 @@ useCloseOnLeave(importAuthVisible)
 }
 .fw-ban-row .hint {
   margin: 0;
+}
+/* 入站防护这一区只读展示的内存额度（与服务防护共用，只能由后者设置）。 */
+.ro-mem {
+  background: var(--mt-bg-soft, #f4f4f5);
+  color: var(--mt-text-soft, #909399);
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
 }
 /* 选择性导入的模块勾选：两列固定，九项排四行，对话框高度不会随语言变化跳动。 */
 .import-scope-head {

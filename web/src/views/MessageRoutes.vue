@@ -6,6 +6,7 @@ import { Plus, Setting, Refresh, CopyDocument } from '@element-plus/icons-vue'
 import api from '@/api/client'
 import PageCard from '@/components/PageCard.vue'
 import RowActions from '@/components/RowActions.vue'
+import GfwStatusChip from '@/components/GfwStatusChip.vue'
 import { useNarrow } from '@/composables/useNarrow'
 import { useResource, fmtTime, fmtTimeMs, fmtBytes } from '@/composables/useResource'
 import { useCloseOnLeave } from '@/composables/useCloseOnLeave'
@@ -335,10 +336,7 @@ async function saveServer() {
     serverVisible.value = false
     ElMessage.success(t('msg.saveOk'))
     // 后端保存后同步重载了监听，直接把它回来的状态摆出来，省一次手动刷新。
-    if (res?.message) {
-      if (res.healthy === false) ElMessage.warning(res.message)
-      else ElMessage.info(res.message)
-    }
+    serverActionTip(res)
     await loadStatus()
     // 监听地址等由后端决定的字段在弹窗关掉后由 @closed → reloadServer 统一读回。
   } catch (e: any) {
@@ -358,10 +356,7 @@ async function toggleServer(next: boolean) {
   togglingServer.value = true
   try {
     const res = await webhookActions.toggleServer(next)
-    if (res?.message) {
-      if (res.healthy === false) ElMessage.warning(res.message)
-      else ElMessage.info(res.message)
-    }
+    serverActionTip(res)
     await loadStatus()
     try {
       applyServer(await webhookActions.getServer())
@@ -377,6 +372,33 @@ async function toggleServer(next: boolean) {
 }
 
 // ---- 状态 / 历史 ----
+
+// statusText 把后端下发的状态键名 + 参数拼成一句当前语言的话。
+//
+// 后端不下发拼好的句子（见 Go 侧 module.Status.Code）：它原先塞的是中文，
+// 英文界面上就照原样漏出一行中文，而这种漏字没有任何报错、只能靠人眼撞见。
+//
+// disabled 刻意返回空串：旁边那个 el-tag 已经在显示 mroute.stopped（未启用 / Disabled），
+// 再拼一句同义的副文本只是把同一件事说两遍。
+// warnings 只在大于零时由后端带上，有则追加"N 项配置需要检查"。
+function statusText(st: { code?: string; args?: Record<string, string | number> | null }): string {
+  const code = st.code
+  if (!code || code === 'disabled') return ''
+  const args = st.args ?? {}
+  let out = t(`mroute.status.${code}`, args as Record<string, unknown>)
+  if (args.warnings) out += t('mroute.status.warnSuffix', { n: args.warnings })
+  return out
+}
+
+// serverActionTip 保存 / 拨开关之后把后端回来的运行态摆出来，省一次手动刷新。
+// 不健康用 warning：那句话（起监听失败的原因）正是照着改的依据。
+function serverActionTip(res?: { code?: string; args?: Record<string, string | number> | null; healthy?: boolean }) {
+  const msg = res ? statusText(res) : ''
+  if (!msg) return
+  if (res?.healthy === false) ElMessage.warning(msg)
+  else ElMessage.info(msg)
+}
+
 async function loadStatus() {
   try {
     status.value = await webhookActions.status(true)
@@ -962,10 +984,14 @@ useCloseOnLeave(serverVisible, sourceVisible, dryVisible, testVisible, ruleVisib
         <el-tag :type="server.enabled ? (status.healthy ? 'success' : 'danger') : 'info'" disable-transitions>
           {{ server.enabled ? (status.healthy ? t('mroute.running') : t('mroute.abnormal')) : t('mroute.stopped') }}
         </el-tag>
-        <span v-if="status.message" class="mt-subtle msg">{{ status.message }}</span>
+        <span v-if="statusText(status)" class="mt-subtle msg">{{ statusText(status) }}</span>
       </div>
     </template>
 
+    <!-- 计数行放在服务防护状态条**上方**：它是本模块自己的运行数据，紧跟标题里的运行状态
+         才连得上；服务防护状态条讲的是另一个模块的开关，是补充信息，压在下面。
+         注意这里是 v-if / v-else 一对，中间不能插入别的节点（插了就是编译错误），
+         所以停用时显示的那条提示要跟着一起搬。 -->
     <div v-if="server.enabled" class="metrics">
       <span>{{ t('mroute.mReceived') }} <b>{{ status.received ?? 0 }}</b></span>
       <span>{{ t('mroute.mRejected') }} <b>{{ status.rejected ?? 0 }}</b></span>
@@ -977,6 +1003,9 @@ useCloseOnLeave(serverVisible, sourceVisible, dryVisible, testVisible, ruleVisib
       </span>
     </div>
     <el-alert v-else type="info" :closable="false" :title="t('mroute.disabledHint')" class="al" />
+
+    <!-- 服务防护只读状态：仅展示当前启用状态与规则，不改任何业务页原有文案与布局。 -->
+    <GfwStatusChip />
 
     <el-tabs v-model="tab" @tab-change="(name: any) => name === 'history' && loadHistory()">
       <!-- ========== 模块设置 ==========

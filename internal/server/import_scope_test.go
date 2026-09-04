@@ -48,6 +48,9 @@ func TestParseImportScopePullsInDependencies(t *testing.T) {
 		{"wol", []importModule{modWOL}},
 		{"cron", []importModule{modCron}},
 		{"credential", []importModule{modCredential}},
+		// 服务防护尤其要能单独成行：它是一份自我完备的策略（档位 + 两张 IP 名单），
+		// 一旦被谁拖成必选，"只想恢复一份封禁名单"就得连着换掉别的模块。
+		{"globalfirewall", []importModule{modGlobalFirewall}},
 	}
 	for _, c := range cases {
 		sc, err := parseImportScope(c.raw)

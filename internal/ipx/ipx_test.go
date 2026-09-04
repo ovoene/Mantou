@@ -101,7 +101,7 @@ func TestIPMatcherEmpty(t *testing.T) {
 
 // TestIsLAN 钉住「哪些来源算局域网」。
 //
-// 这个判断是面板入站防火墙默认策略的全部内容，判宽一格就等于对一批本不该进来的
+// 这个判断是面板入站防护默认策略的全部内容，判宽一格就等于对一批本不该进来的
 // 来源开门，而症状（"防火墙开着，但外面还是连得上"）不会有任何报错。
 func TestIsLAN(t *testing.T) {
 	lan := []string{
@@ -156,7 +156,7 @@ func TestIsLAN(t *testing.T) {
 // 这一条钉的是一个真实缺陷：内核给的 sin6_scope_id 会进到 net.TCPAddr.Zone，
 // RemoteAddr 于是长成 `[fe80::1%eth0]:1234`，而 net.ParseIP 对带 zone 的字面量返回 nil。
 // 所有按来源做的判定都会把这个合法的局域网对端当成"地址解析不出来"处理——
-// 面板入站防火墙在连接层放行（那里拿的是 TCPAddr.IP，不带 zone）、在请求层却按
+// 面板入站防护在连接层放行（那里拿的是 TCPAddr.IP，不带 zone）、在请求层却按
 // 失败关闭回 403，同一个来源在两层上判得不一样。
 func TestClientIPStripsIPv6Zone(t *testing.T) {
 	cases := []struct {

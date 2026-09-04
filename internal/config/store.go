@@ -18,7 +18,7 @@ import (
 )
 
 // CurrentVersion 是当前配置结构版本，用于将来做迁移。
-const CurrentVersion = 10
+const CurrentVersion = 11
 
 // Manager 负责配置的加载、持久化与线程安全访问。
 type Manager struct {
@@ -513,14 +513,15 @@ func Default() *Config {
 			Security:   Security{Firewall: defaultPanelFirewall()},
 			Restart:    defaultRestart(),
 		},
-		Credentials:  []Credential{},
-		DDNS:         []DDNSRule{},
-		WebServices:  []WebService{},
-		Forwards:     []ForwardRule{},
-		WOLDevices:   []WOLDevice{},
-		CronTasks:    []CronTask{},
-		Certs:        []Certificate{},
-		ACMEAccounts: []ACMEAccount{},
+		GlobalFirewall: defaultGlobalFirewall(),
+		Credentials:    []Credential{},
+		DDNS:           []DDNSRule{},
+		WebServices:    []WebService{},
+		Forwards:       []ForwardRule{},
+		WOLDevices:     []WOLDevice{},
+		CronTasks:      []CronTask{},
+		Certs:          []Certificate{},
+		ACMEAccounts:   []ACMEAccount{},
 
 		Webhook: WebhookServer{
 			Enabled:        false,
@@ -665,7 +666,7 @@ func migrate(c *Config) {
 		c.Auth.SessionIdleMinutes = DefaultSessionIdleMinutes
 	}
 	if c.Version < 10 {
-		// v10 升级：新增面板入站防火墙（settings.security.firewall）。
+		// v10 升级：新增面板入站防护（settings.security.firewall）。
 		//
 		// 这一块把它显式置为**关闭**，而全新安装（Default）是**开启 + 只允许局域网**。
 		// 两边不一致是有意的，也是这次改动里唯一一处刻意的偏离，理由：
@@ -683,6 +684,23 @@ func migrate(c *Config) {
 		// 但用户进设置页打开这个开关时，看到的应该是一组合理的初值而不是一排 0。
 		c.Settings.Security.Firewall = defaultPanelFirewall()
 		c.Settings.Security.Firewall.Enabled = false
+	}
+	if c.Version < 11 {
+		// v11 升级：新增服务防护（连接层）（globalFirewall），整段重置为默认值。
+		//
+		// 这里可以放心整段覆盖，理由是这个功能与 v10 的面板入站防护**同一批**加进来、
+		// 还没有发布过任何带它的版本，因此不存在"用户已经配过一版"的情况。
+		// 若将来要改它的默认值，就不能再这么写了——那时候必须只补缺失的键。
+		//
+		// 必须有这一块，不能只靠加载期的 normalizeGlobalFirewall 兜底：AutoBan 是布尔值，
+		// 旧配置里没有这个键，反序列化后是 false，而 normalize 无法区分"没填"与"用户关了它"。
+		// 不写这一块的结果是：全新安装拿到 AutoBan=true，升级上来的拿到 AutoBan=false，
+		// 而界面上（在这次改动之前）根本没有这个开关，于是那批用户永远打不开自动封禁。
+		//
+		// 默认关闭这一点两边一致（见 defaultGlobalFirewall），所以升级不会给任何人
+		// 突然带上一道会掐连接的防护——这与 v10 那一块刻意让"升级"与"全新安装"取值不同的
+		// 情况正好相反，因为这次连全新安装都是关着的。
+		c.GlobalFirewall = defaultGlobalFirewall()
 	}
 	if c.Version < CurrentVersion {
 		c.Version = CurrentVersion
@@ -812,11 +830,13 @@ func migrate(c *Config) {
 		c.Settings.Restart = defaultRestart()
 	}
 	normalizeRestart(&c.Settings.Restart)
-	// 面板入站防火墙：统一模式取值、夹住数值、整理名单（见 firewall.go 顶部说明）。
+	// 面板入站防护：统一模式取值、夹住数值、整理名单（见 firewall.go 顶部说明）。
 	// 无条件执行的理由同上，但这一处更要紧——它是访问控制：
 	// 一个手改成 "Lan" 的 mode、一个负数限速、或一份两万条的名单，
 	// 都不该让「谁能进面板」这件事变成未定义行为。
 	normalizePanelFirewall(&c.Settings.Security.Firewall)
+	// 服务防护（连接层）：统一档位取值、夹住数值、整理名单（见 firewall_global.go 顶部说明）。
+	normalizeGlobalFirewall(&c.GlobalFirewall)
 }
 
 // clampInt 把 v 夹到 [lo, hi] 区间内。

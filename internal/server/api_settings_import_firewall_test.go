@@ -12,7 +12,7 @@ import (
 	"mantou/internal/config"
 )
 
-// 导入配置是入站防火墙策略的第二条入口，而且比保存设置那条更隐蔽：备份里那份策略是在
+// 导入配置是入站防护策略的第二条入口，而且比保存设置那条更隐蔽：备份里那份策略是在
 // **另一台机器**上定下的——"只允许局域网"在做备份的那台上完全成立，在这台上就可能等于
 // "把正在导入的人关在门外"。落盘之后的下一个请求就按新策略判，用户看到的是"导入成功"，
 // 然后再也打不开面板。
@@ -69,7 +69,7 @@ const backupFirewallRateLimit = 77
 // localFirewallRateLimit 目标机器本机那份策略的限速值。
 const localFirewallRateLimit = 99
 
-// exportWithLANFirewall 造一份"入站防火墙 = 启用 + 仅局域网"的加密备份。
+// exportWithLANFirewall 造一份"入站防护 = 启用 + 仅局域网"的加密备份。
 func exportWithLANFirewall(t *testing.T) []byte {
 	t.Helper()
 	source, sourceManager, sourceDir := newE2EEnv(t)

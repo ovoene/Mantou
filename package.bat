@@ -7,7 +7,7 @@ REM Output: ./mantou-<VERSION>-linux-<arch>.tar.gz in current dir
 REM Requires: go, node/npm, system tar (Win10+)
 
 set APP=mantou
-set VERSION=Ver 1.0.2
+set VERSION=Ver 1.0.3
 set BIN_DIR=bin
 set PKG_GOOS=linux
 if not "%~1"=="" ( set PKG_ARCHS=%~1 ) else ( set PKG_ARCHS=amd64 arm64 )

@@ -35,35 +35,37 @@ import (
 type importModule string
 
 const (
-	modDDNS       importModule = "ddns"
-	modWebService importModule = "webservice"
-	modMessage    importModule = "messageroute"
-	modForward    importModule = "forward"
-	modWOL        importModule = "wol"
-	modCron       importModule = "cron"
-	modCert       importModule = "cert"
-	modCredential importModule = "credential"
-	modPanel      importModule = "panel"
+	modDDNS           importModule = "ddns"
+	modWebService     importModule = "webservice"
+	modMessage        importModule = "messageroute"
+	modForward        importModule = "forward"
+	modWOL            importModule = "wol"
+	modCron           importModule = "cron"
+	modCert           importModule = "cert"
+	modCredential     importModule = "credential"
+	modGlobalFirewall importModule = "globalfirewall"
+	modPanel          importModule = "panel"
 )
 
 // importModules 全部模块，顺序与面板左侧导航一致：错误信息与日志按这个顺序列举，
 // 用户在界面上从上往下找得到对应那一行。
 var importModules = []importModule{
 	modDDNS, modWebService, modMessage, modForward, modWOL,
-	modCron, modCert, modCredential, modPanel,
+	modCron, modCert, modCredential, modGlobalFirewall, modPanel,
 }
 
 // importModuleNames 模块的中文名，只用于错误信息与日志。
 var importModuleNames = map[importModule]string{
-	modDDNS:       "动态域名 DDNS",
-	modWebService: "Web 服务",
-	modMessage:    "消息路由",
-	modForward:    "端口转发",
-	modWOL:        "网络唤醒",
-	modCron:       "计划任务",
-	modCert:       "SSL/TLS 证书",
-	modCredential: "域名服务商凭证",
-	modPanel:      "面板与设置",
+	modDDNS:           "动态域名 DDNS",
+	modWebService:     "Web 服务",
+	modMessage:        "消息路由",
+	modForward:        "端口转发",
+	modWOL:            "网络唤醒",
+	modCron:           "计划任务",
+	modCert:           "SSL/TLS 证书",
+	modCredential:     "域名服务商凭证",
+	modGlobalFirewall: "服务防护",
+	modPanel:          "面板与设置",
 }
 
 // importDeps 硬依赖：勾选左边的模块，右边的模块必须一起导入。
@@ -79,6 +81,9 @@ var importModuleNames = map[importModule]string{
 // 刻意**不**给计划任务加依赖：它的动作参数里放的是 ID 字符串，指不到就是这一次动作
 // 执行失败并记一条错误，代价可控；而按引用连带下去会把几乎所有模块都拖成必选，
 // 那样"可以只导一部分"这个功能就不存在了。
+//
+// 服务防护同样不在表里，但理由不同：它压根不引用别的模块——一份档位 + 两张 IP 名单，
+// 自我完备。所以它既不拖别人，也不被别人拖，是唯一能单独导入的安全策略。
 var importDeps = map[importModule][]importModule{
 	modCert:       {modCredential},
 	modDDNS:       {modCredential},
@@ -204,7 +209,9 @@ func mergeImportedConfig(base, imp *config.Config, sc importScope) *config.Confi
 		return base
 	}
 	if sc[modPanel] {
-		// 面板与设置：监听 / 访问前缀 / HTTPS、管理员账户与二次验证、外观与日志、更新源。
+		// 面板与设置：监听 / 访问前缀 / HTTPS、管理员账户与二次验证、外观与日志、更新源，
+		// 以及面板入站防护（Settings.Security.Firewall——它管的是"谁能进面板"，
+		// 因此归在面板这一段；连接层的服务防护是独立模块，见下方 modGlobalFirewall）。
 		// Auth.JWTSecret 一并被覆盖，但 Config.Replace 会无条件丢弃它换回本机密钥
 		//（防止有人拿一份"已知密钥"的备份换取伪造会话的能力），这里不必额外处理。
 		//
@@ -219,6 +226,21 @@ func mergeImportedConfig(base, imp *config.Config, sc importScope) *config.Confi
 		base.Settings = imp.Settings
 		base.Update = imp.Update
 		base.Settings.Restart.LastRunAt = lastRestartRun
+	}
+	if sc[modGlobalFirewall] {
+		// 服务防护（连接层）自成一个模块，既不跟着它保护的那两个模块走，也不跟着面板走。
+		//
+		// 不跟 Web 服务 / 消息路由：同一套档位与名单**同时**管着这两个模块，
+		// 归到任一侧都会出现"只导 Web 服务，却把消息路由的防护也换掉了"。
+		//
+		// 不跟「面板与设置」：那一段里装着管理员账户与面板监听端口，是整份配置中
+		// 覆盖代价最高的一段。把一份 IP 名单绑在它后面，等于"想恢复一份封禁名单，
+		// 就得连管理员账户一起换掉"——反过来也一样别扭。它在左侧导航里本就是独立一页，
+		// 导入范围里也该是独立一项。
+		//
+		// 名单与档位一起搬，不做逐字段挑选：这是一份**策略**，半新半旧的策略
+		// （比如取了备份的严格档、留了本机的允许名单）谁也说不清实际拦的是什么。
+		base.GlobalFirewall = imp.GlobalFirewall
 	}
 	if sc[modCredential] {
 		base.Credentials = imp.Credentials

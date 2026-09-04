@@ -13,6 +13,7 @@ import {
   ChatDotRound,
   Lock,
   Key,
+  Umbrella,
   Setting,
   InfoFilled,
   SwitchButton,
@@ -42,8 +43,13 @@ const menu = [
   { name: 'forward', label: 'nav.forward', icon: Switch },
   { name: 'wol', label: 'nav.wol', icon: AlarmClock },
   { name: 'cron', label: 'nav.cron', icon: Timer },
+  // 证书用挂锁（浏览器地址栏那一个，HTTPS 的通用符号），服务防护用伞。
+  // 两者一度都是 Lock，菜单上就成了两个一模一样的图标；而"锁"表达的是加密而非拦截，
+  // 所以让证书留着挂锁、换掉服务防护这一个。全表 12 个图标彼此不重复，也不与外壳上的
+  // 折叠 / 用户 / 退出等图标撞。
   { name: 'cert', label: 'nav.cert', icon: Lock },
   { name: 'cred', label: 'nav.cred', icon: Key },
+  { name: 'globalfirewall', label: 'nav.gfw', icon: Umbrella },
   { name: 'settings', label: 'nav.settings', icon: Setting },
   { name: 'about', label: 'nav.about', icon: InfoFilled },
 ]

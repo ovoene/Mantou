@@ -15,6 +15,7 @@ import (
 	"golang.org/x/net/netutil"
 
 	"mantou/internal/errpage"
+	"mantou/internal/inboundfw"
 	"mantou/internal/ipx"
 	"mantou/internal/logx"
 )
@@ -31,6 +32,9 @@ type listenServer struct {
 	tlsMinVer uint16 // TLS 最低版本（0 表示用 Go 默认）
 	resolver  CertResolver
 	log       *logx.Logger
+	// firewall 服务防护（连接层）：在 Accept 处拦截被封禁/拒绝的来源，并把 TLS 握手错误
+	// 回灌进自动封禁计数。nil 表示未注入（不应发生，但缺失时退化为不拦截、不影响正常服务）。
+	firewall *inboundfw.Firewall
 
 	// 域名 → 处理器；空域名作为默认处理器。
 	routes  map[string]http.Handler
@@ -62,6 +66,7 @@ func newListenServer(g *wsGroup, resolver CertResolver, m *Module, log *logx.Log
 		tlsMinVer: g.minVer,
 		resolver:  resolver,
 		log:       log,
+		firewall:  m.globalFirewall,
 		routes:    make(map[string]http.Handler),
 		conns:     newConnTracker(),
 		mod:       m,
@@ -230,7 +235,7 @@ func (ls *listenServer) start() error {
 		// 由此留下的两个缺口分别由两道停滞超时补上：请求正文那侧见 guardBodyRead，
 		// 响应体那侧（客户端不读、把写堵死）见 conntrack.go 的 writeGuard。
 		IdleTimeout: 120 * time.Second,
-		ErrorLog:    ls.log.Standard(slog.LevelWarn, "Web TLS 或连接异常"),
+		ErrorLog:    ls.firewall.WrapErrorLog(ls.log.Standard(slog.LevelWarn, "Web TLS 或连接异常")),
 	}
 
 	ln, err := net.Listen(network, bindAddr)
@@ -248,7 +253,9 @@ func (ls *listenServer) start() error {
 	// 那个缺口由两道停滞超时补上（请求正文侧见 guardBodyRead，响应体侧见 writeGuard）。
 	//
 	// 台账套在最外层：停机时要拿着这些连接自己关（见 close）。
-	ln = ls.conns.wrap(netutil.LimitListener(ln, maxConnsPerListener))
+	// 服务防护（连接层）夹在 LimitListener 与原始 listener 之间：它在 Accept 处先按封禁/名单
+	// 拦截，被拒的连接根本不会进入 LimitListener 的计数，也不会被 conns 台账跟踪。
+	ln = ls.conns.wrap(netutil.LimitListener(ls.firewall.Wrap(ln), maxConnsPerListener))
 	ls.ln = ln
 	ls.failed.Store(false)
 

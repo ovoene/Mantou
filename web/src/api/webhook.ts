@@ -149,10 +149,17 @@ export interface WebhookServer {
   https: { enabled: boolean; certId: string; domain?: string }
 }
 
+// ModuleStatusCode 模块运行态的状态**键名**，句子由前端按当前语言拼。
+// 后端不再下发拼好的中文（见 Go 侧 module.Status.Code 那段说明）。
+export type ModuleStatusCode = '' | 'disabled' | 'shared' | 'notListening' | 'startFailed' | 'listening'
+
 export interface WebhookStatus {
   // enabled 仅在模块整体不可用时由后端单独下发（此时其余字段全部缺省）。
   enabled?: boolean
-  message?: string
+  // code 空串表示"没有额外可说的"，此时不渲染状态副文本。
+  code?: ModuleStatusCode
+  // args 是 code 对应译文里的插值参数，键名随 code 变（见 statusText）。
+  args?: Record<string, string | number> | null
   healthy?: boolean
   total?: number
   active?: number
@@ -163,6 +170,16 @@ export interface WebhookStatus {
   failed?: number
   sendDropped?: number
   pending?: number
+}
+
+// WebhookServerResult 保存 / 开关模块设置的响应：带上刚重载出来的运行态，
+// 用户点完保存就能看到"HTTPS 监听 …"或失败原因，不用再手动刷新。
+// code / args 与 WebhookStatus 同源（后端是同一个 Status()），因此复用同一套译名。
+export interface WebhookServerResult {
+  ok: boolean
+  code?: ModuleStatusCode
+  args?: Record<string, string | number> | null
+  healthy?: boolean
 }
 
 // 执行历史一条。event 取值见后端 history.go：received / rejected / matched / sent / failed 等。
@@ -368,7 +385,7 @@ export const webhookActions = {
     api.get<WebhookStatus>('/webhook/status', undefined, silent ? { silent: true } : undefined),
   getServer: () => api.get<WebhookServer>('/webhook/server'),
   saveServer: (v: Omit<WebhookServer, 'listen' | 'created'>) =>
-    api.put<{ ok: boolean; message?: string; healthy?: boolean }>('/webhook/server', v),
+    api.put<WebhookServerResult>('/webhook/server', v),
   // 删除模块那一行：停止监听、抹掉端口/域名/证书，那一页回到"未创建"。
   // 接收器、模板、通知目标、规则一律不动——用户删的是这台机器上的入站监听，
   // 不是他配了半天的路由。仍有接收器启用中时后端会拒绝并点名是谁挡着。
@@ -376,10 +393,7 @@ export const webhookActions = {
   // 模块设置那一行的开关：只发 enabled，端口 / 域名 / HTTPS 一律沿用已存的那份
   // （与接收器、通知目标的开关同一种端点；启用时后端照样跑完整校验）。
   toggleServer: (enabled: boolean) =>
-    api.post<{ ok: boolean; enabled: boolean; message?: string; healthy?: boolean }>(
-      '/webhook/server/toggle',
-      { enabled },
-    ),
+    api.post<WebhookServerResult & { enabled: boolean }>('/webhook/server/toggle', { enabled }),
   meta: () => api.get<WebhookMeta>('/webhook/meta'),
   // 随机入站路径由后端生成：它是这个入口的主要保护，不该依赖浏览器的随机源。
   newPath: () => api.get<{ path: string }>('/webhook/newpath'),
