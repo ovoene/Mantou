@@ -208,10 +208,33 @@ async function doSelfUpdate(opt: any) {
   } catch {
     return
   }
+  // 没配公钥这条路要当场再验一次密码：后端在这一支上要求凭据（见 handleSelfUpdate），
+  // 这里先问，免得白传一次几十 MB 才收一个 403。配了公钥则不问——签名本身就是授权。
+  let password = ''
+  if (!update.signKey) {
+    try {
+      const r = await ElMessageBox.prompt(t('about.uploadUnsignedPwd'), t('about.uploadTitle'), {
+        inputType: 'password',
+        confirmButtonText: t('common.confirm'),
+        cancelButtonText: t('common.cancel'),
+        inputValidator: (v: string) => (v && v.length > 0) || t('common.required'),
+      })
+      password = r.value || ''
+    } catch {
+      return
+    }
+    if (!password) return
+  }
   selfUpdating.value = true
   ElMessage.info(t('about.uploading'))
   try {
     const fd = new FormData()
+    // 凭据必须排在 file **之前**：后端是流式消费 multipart 的（不把整个包收进内存），
+    // 取到 file 那一部分就开始解包，排在它后面的字段读不到（见 multipartFilePartFields）。
+    if (password) {
+      fd.append('account', auth.username)
+      fd.append('password', password)
+    }
     fd.append('file', file)
     const resp = await actions.selfUpdate(fd)
     // 后端 respondOK 把 {ok,restarting} 包在 data 字段下：{ data: { ok, restarting } }
@@ -250,13 +273,16 @@ onActivated(() => {
 
 <template>
   <PageCard :title="t('about.title')" :subtitle="t('about.subtitle')">
-    <!-- 标题旁项目图标：默认指向 GitHub 仓库（ovoene/Mantou，可由设置 GitHubRepo 覆盖），于新标签页打开。 -->
+    <!-- 标题旁项目图标：默认指向 GitHub 仓库（ovoene/Mantou，可由设置 GitHubRepo 覆盖），于新标签页打开。
+         noreferrer 与 noopener 一起给：仅 noopener 时 Referer 照发，会把面板 origin 与访问路径前缀
+         （basePath）送到外站的访问日志里。服务端的 Referrer-Policy: same-origin 已经拦了一道，
+         这里是第二道——那个头是全局的，将来若为某个场景放宽，这些外链不该跟着一起放开。 -->
     <template #title-extra>
       <a
         v-if="repoUrl"
         :href="repoUrl"
         target="_blank"
-        rel="noopener"
+        rel="noopener noreferrer"
         class="gh-link"
         :title="repoUrl"
       >
@@ -331,7 +357,7 @@ onActivated(() => {
               <!-- 远端有更新：红色加粗 + 动态徽标；已配置下载页则渲染外链，否则仅展示版本号。
                    徽标独立成小红方块，白色上箭头，外圈双层错位脉冲 + 整体弹性上下跳动 + 呼吸阴影。 -->
               <a v-if="system.check.hasUpdate && system.check.latestVersion && releaseLink"
-                 :href="releaseLink" target="_blank" rel="noopener"
+                 :href="releaseLink" target="_blank" rel="noopener noreferrer"
                  class="ver-latest is-new">
                 Ver {{ system.check.latestVersion }}<span class="up-badge" aria-hidden="true">
                   <span class="up-badge-ring up-badge-ring-1"></span>

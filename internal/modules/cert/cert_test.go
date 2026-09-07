@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"math/big"
@@ -38,15 +39,30 @@ func (w *testConfigWriter) UpdateState(mutate func(*config.Config)) error {
 	return w.Update(mutate)
 }
 
+// Get 返回**深拷贝**，与 config.Manager.Get 的实现一致（那边也是一次 JSON 往返）。
+//
+// 别改回值拷贝。config.Config 里的 Certs 是切片，值拷贝只复制切片头，元素仍在同一片
+// 底层数组上——而 IssueAsync 的后台 goroutine 正是通过 Update 就地改写 Certs[i] 的
+// IssueStatus / RenewStatus（见 cert.go 的 updateOperationStatus）。于是"在锁内拷一份
+// 出去、在锁外读元素"读的还是那块正在被写的内存，-race 会如实报出数据竞争。
+// 深拷贝之后调用方拿到的是自己那一份，与写入方再无交集。
 func (w *testConfigWriter) Get() *config.Config {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	cfg := w.cfg
-	return &cfg
+	data, err := json.Marshal(&w.cfg)
+	if err != nil {
+		panic(err)
+	}
+	out := &config.Config{}
+	if err := json.Unmarshal(data, out); err != nil {
+		panic(err)
+	}
+	return out
 }
 
-// Snapshot 在测试里同样返回值拷贝：真实实现返回共享的只读快照，
-// 而测试断言只读取字段，返回拷贝可额外保证测试用例之间不会互相影响。
+// Snapshot 在测试里也返回深拷贝。真实实现返回的是共享只读快照，靠"Update 从不就地改
+// 已发布的配置、而是克隆后整体换指针"来保证读者安全；测试这份 writer 恰恰是就地改的，
+// 所以这里只能靠拷贝来兑现同一个承诺。
 func (w *testConfigWriter) Snapshot() *config.Config { return w.Get() }
 
 type countingIssuer struct {

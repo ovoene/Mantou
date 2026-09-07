@@ -1,7 +1,6 @@
 package server
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +10,13 @@ import (
 )
 
 // multipartFilePart 从 multipart 请求里取出名为 "file" 的文件部分，返回可流式读取的 part。
+// 等价于 multipartFilePartFields(r, nil)——不需要顺带收表单字段时用这个。
+func multipartFilePart(r *http.Request) (*multipart.Part, error) {
+	return multipartFilePartFields(r, nil)
+}
+
+// multipartFilePartFields 取出名为 "file" 的文件部分，并顺带收下排在它**之前**的表单字段：
+// want 的键是字段名，值是接收字符串的指针（nil map 表示不收任何字段）。
 //
 // 刻意不用 c.FormFile：那会先把整个上传体读进内存（gin 的 MaxMultipartMemory 默认 32 MB，
 // 更新包与备份文件正好落在这个量级内，于是全量驻留），超出部分还要落一份临时文件，
@@ -21,14 +27,19 @@ import (
 // 调用方拿到 part 后自己负责 Close，以及自己卡住体积上限——这个函数只负责定位那一部分，
 // 不替调用方决定"多大算大"（更新包、备份、背景图三条路的上限各不相同）。
 //
-// 只取第一个叫 file 的部分，它之前的部分被读掉丢弃。这决定了同一份表单里的其它字段
-// 只有排在 file **之前**才拿得到，排在后面的读不到——需要同时收字段与文件的调用方
-// 必须自己遍历 part（见 handleImportConfig）。
-func multipartFilePart(r *http.Request) (*multipart.Part, error) {
+// 只取第一个叫 file 的部分，在它之后的部分一概没读到（读了就得把文件流缓存下来，
+// 那正是上面要避的事）。于是 want 里的字段**必须排在 file 之前**，调用方要负责
+// 让前端按这个顺序 append；排在后面的字段拿不到，而这里只会当它没填。
+// 两样都要且顺序不受控的调用方得自己遍历（见 readImportUpload）。
+//
+// 未出现的字段保持调用方给的初值不动，重复出现只认第一个：同名字段第二次出现时
+// 覆盖前一次，就等于让请求方用一个附加字段改写前面那个值。
+func multipartFilePartFields(r *http.Request, want map[string]*string) (*multipart.Part, error) {
 	mr, err := r.MultipartReader()
 	if err != nil {
 		return nil, errors.New("不是有效的 multipart 上传请求")
 	}
+	seen := make(map[string]bool, len(want))
 	for {
 		part, err := mr.NextPart()
 		if err == io.EOF {
@@ -37,28 +48,98 @@ func multipartFilePart(r *http.Request) (*multipart.Part, error) {
 		if err != nil {
 			return nil, fmt.Errorf("读取上传数据失败：%w", err)
 		}
-		if part.FormName() == "file" {
+		name := part.FormName()
+		if name == "file" {
 			return part, nil
+		}
+		if dst := want[name]; dst != nil && !seen[name] {
+			seen[name] = true
+			s, err := readField(part, name)
+			if err != nil {
+				_ = part.Close()
+				return nil, err
+			}
+			*dst = s
 		}
 		_ = part.Close()
 	}
 }
 
-// maxImportFieldBytes 导入表单里单个非文件字段的长度上限。
+// readField 把一个非文件部分读成字符串，超过 maxMultipartFieldBytes 即报错。
+// 上限必须在这里执行：手工遍历 multipart 之后没有别的地方管这件事了
+// （走 gin 的表单解析时它是被 MaxMultipartMemory 顺带管着的）。
+func readField(part *multipart.Part, name string) (string, error) {
+	var sb strings.Builder
+	if _, err := io.Copy(&sb, io.LimitReader(part, maxMultipartFieldBytes+1)); err != nil {
+		return "", fmt.Errorf("读取表单字段 %s 失败", name)
+	}
+	if sb.Len() > maxMultipartFieldBytes {
+		return "", fmt.Errorf("表单字段 %s 过长", name)
+	}
+	return sb.String(), nil
+}
+
+// maxMultipartFieldBytes 手工遍历的 multipart 表单里单个非文件字段的长度上限。
 //
 // 手工遍历 multipart 之后，「字段不能无限长」这件事就成了这里的责任——走 gin 的表单解析时
-// 它是被 MaxMultipartMemory 顺带管着的。modules 是一串逗号分隔的模块标识、account 与
-// password 是凭证，实际都远在这个数以下；留到 64 KB 只是为了不去卡一个写得离谱但合法的密码。
-const maxImportFieldBytes = 64 << 10
+// 它是被 MaxMultipartMemory 顺带管着的。这些字段是模块标识串（一串逗号分隔的名字）与凭证，
+// 实际都远在这个数以下；留到 64 KB 只是为了不去卡一个写得离谱但合法的密码。
+const maxMultipartFieldBytes = 64 << 10
 
 // importPrealloc 读取备份内容时的预分配上限。
 //
 // 常见的备份（配置 JSON + 证书 + 背景图）都在这个量级以下，一次分配到位可省掉
-// bytes.Buffer 反复扩容的那串拷贝；更大的备份让它自己长。
+// 反复扩容的那串拷贝；更大的备份让它自己长（见 readCapped）。
 //
 // 用 Content-Length 当提示但**不**照着它全额预分配：那是客户端说的数，
 // 照着它分配等于让一个一百字节的请求也能要走 128 MB。
 const importPrealloc = 8 << 20
+
+// importPreallocUnknown Content-Length 缺失（分块传输）时的起始容量。
+// 只是个起点，读多少长多少。
+const importPreallocUnknown = 64 << 10
+
+// readCapped 把 r 读进一片自增长的缓冲，容量**始终不超过 limit+1**，
+// 多出的那一个字节留给调用方判断"源比上限长"。
+//
+// 不用 bytes.Buffer / io.ReadAll：它们只知道"还不够，再大一点"，扩到最后一档时
+// 会为一份正好 128 MB 的文件要走一片明显更大的数组，而扩容的那一瞬新旧两片同时在手上。
+// 导入这条路上紧接着还要几片同等大小的缓冲（见 config_crypt.go 的 cipherBytes），
+// 峰值差的这一两百 MB 在 512MB 那类小主机上就是导入成不成的分界。
+// 知道硬上限就该把它用上：翻倍到 limit+1 为止，绝不越过。
+func readCapped(r io.Reader, limit, hint int64) ([]byte, error) {
+	room := limit + 1
+	if hint < 1 {
+		hint = 1
+	}
+	if hint > room {
+		hint = room
+	}
+	buf := make([]byte, 0, hint)
+	for {
+		if len(buf) == cap(buf) {
+			if int64(cap(buf)) >= room {
+				// 已经攒满 limit+1 个字节，够调用方判定超限了，不再往下读。
+				return buf, nil
+			}
+			grow := int64(cap(buf)) * 2
+			if grow > room {
+				grow = room
+			}
+			next := make([]byte, len(buf), grow)
+			copy(next, buf)
+			buf = next
+		}
+		n, err := r.Read(buf[len(buf):cap(buf)])
+		buf = buf[:len(buf)+n]
+		if err == io.EOF {
+			return buf, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+}
 
 // importUpload 是导入请求里需要的全部东西：备份文件内容，以及几个表单字段。
 //
@@ -120,31 +201,25 @@ func readImportUpload(r *http.Request, maxFile int64) (*importUpload, error) {
 		case name == "file" && !seenFile:
 			// 同名部分出现多次时只认第一个，与 gin 的 FormFile 口径一致。
 			seenFile = true
-			var buf bytes.Buffer
-			if n := r.ContentLength; n > 0 {
-				hint := n
-				if hint > importPrealloc {
-					hint = importPrealloc
-				}
-				buf.Grow(int(hint))
+			hint := int64(importPreallocUnknown)
+			if n := r.ContentLength; n > 0 && n < importPrealloc {
+				hint = n
+			} else if n >= importPrealloc {
+				hint = importPrealloc
 			}
-			// 多读一个字节：能读到就说明源比上限长。
-			if _, err := io.Copy(&buf, io.LimitReader(part, maxFile+1)); err != nil {
+			raw, err := readCapped(part, maxFile, hint)
+			if err != nil {
 				_ = part.Close()
 				return nil, errors.New("读取上传文件失败")
 			}
-			up.raw = buf.Bytes()
+			up.raw = raw
 		case fields[name] != nil:
-			var sb strings.Builder
-			if _, err := io.Copy(&sb, io.LimitReader(part, maxImportFieldBytes+1)); err != nil {
+			s, err := readField(part, name)
+			if err != nil {
 				_ = part.Close()
-				return nil, errors.New("读取上传文件失败")
+				return nil, err
 			}
-			if sb.Len() > maxImportFieldBytes {
-				_ = part.Close()
-				return nil, fmt.Errorf("表单字段 %s 过长", name)
-			}
-			*fields[name] = sb.String()
+			*fields[name] = s
 		default:
 			// 不认识的部分整份丢掉：不占内存，也不因此让整个导入失败
 			// （多一个无关字段不该是错误）。

@@ -38,6 +38,33 @@ func freePort(t *testing.T) int {
 	return port
 }
 
+// freeUDPPort 借一个当前空闲的本机 UDP 端口。
+//
+// 不能拿 freePort 的结果去开 UDP 监听：两个协议各有一套端口空间，Windows 上更进一步——
+// Hyper-V / Docker 会成段预留 UDP 端口（`netsh interface ipv4 show excludedportrange protocol=udp`
+// 看得到，例如 52761-52860），那些端口用 TCP 探测一律显示空闲，真去 bind UDP 却报
+// 「以一种访问权限不允许的方式做了一个访问套接字的尝试」。于是测试会指着 runner 报
+// 「UDP 监听失败」，而代码一点问题都没有。按协议各探各的才对。
+func freeUDPPort(t *testing.T) int {
+	t.Helper()
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := conn.LocalAddr().(*net.UDPAddr).Port
+	_ = conn.Close()
+	return port
+}
+
+// freeListenPort 按协议借一个空闲的监听端口。
+func freeListenPort(t *testing.T, proto string) int {
+	t.Helper()
+	if proto == "udp" {
+		return freeUDPPort(t)
+	}
+	return freePort(t)
+}
+
 // freePortRange 借 n 个连号的空闲端口，返回起点。
 // 连号是重点：3-D 的场景正是"一条规则写成端口范围、展开出许多 runner"。
 func freePortRange(t *testing.T, n int) int {
@@ -116,7 +143,7 @@ func startRunner(t *testing.T, gate *connGate, proto string, targetPort int) (*r
 	t.Helper()
 	rule := config.ForwardRule{
 		ID: "rule-" + proto, Name: "测试规则", Enabled: true, Protocol: proto,
-		ListenPort: freePort(t), TargetHost: "127.0.0.1", TargetPort: targetPort,
+		ListenPort: freeListenPort(t, proto), TargetHost: "127.0.0.1", TargetPort: targetPort,
 		Bind: "127.0.0.1",
 	}
 	run := newRunner(rule, logx.New(logx.Options{}), gate)
@@ -417,7 +444,7 @@ func TestUDPDialFailureReleasesTotalSlot(t *testing.T) {
 	var g connGate
 	rule := config.ForwardRule{
 		ID: "rule-bad", Name: "目标写错的规则", Enabled: true, Protocol: "udp",
-		ListenPort: freePort(t), TargetHost: "bad_host!", TargetPort: 53,
+		ListenPort: freeUDPPort(t), TargetHost: "bad_host!", TargetPort: 53,
 		Bind: "127.0.0.1",
 	}
 	run := newRunner(rule, logx.New(logx.Options{FileWriter: fails}), &g)

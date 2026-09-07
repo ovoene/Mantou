@@ -288,16 +288,25 @@ func compileBranch(label string, b config.RuleBranch, tmpls map[string]config.Me
 }
 
 // allowIP 判断来源 IP 是否放行，第二个返回值是拒绝原因（放行时为空）。
-// ip 为 nil（解析不出对端地址）时放行：那只会在非 TCP 的测试传输上出现，
-// 在这里拒绝会让"配了名单的接收器在某些环境下全挂"。
+//
+// ip 为 nil 表示对端地址解析不出来（RemoteAddr 不是 IP:端口 的形态）。这时两侧名单的
+// 处理**刻意不对称**，口径与 webservice/middleware.go 的 withIPFilter 逐字一致：
+//
+//   - 白名单：按"不在名单里"处理，也就是拒绝。白名单只能往关的方向失败——
+//     放行的话，一个畸形的 RemoteAddr 就等于把整份白名单绕过去了，而这个模块的入站端口
+//     通常是直接对着公网的。
+//   - 黑名单：放行。nil 匹配不上任何网段，"解析不出地址"本身也不是"在黑名单里"的证据；
+//     这一侧本来就是默认开门、命中才关，没有可绕过的东西。
+//
+// 两侧都没配（r.allow 与 r.deny 皆为 nil）时直接放行，与总开关未开、名单为空的情形同路。
 func (r *receiverRT) allowIP(ip net.IP) (bool, string) {
-	if ip == nil || (r.allow == nil && r.deny == nil) {
+	if r.allow == nil && r.deny == nil {
 		return true, ""
 	}
-	if r.deny != nil && r.deny.Match(ip) {
+	if ip != nil && r.deny != nil && r.deny.Match(ip) {
 		return false, "命中 IP 黑名单"
 	}
-	if r.allow != nil && !r.allow.Match(ip) {
+	if r.allow != nil && (ip == nil || !r.allow.Match(ip)) {
 		return false, "不在 IP 白名单内"
 	}
 	return true, ""

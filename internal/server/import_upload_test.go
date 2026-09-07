@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"testing/iotest"
 )
 
 // 本文件盯的是备份导入那侧的流式读取（3-C 的第二半）。
@@ -167,7 +168,7 @@ func TestReadImportUploadRejections(t *testing.T) {
 		},
 		{
 			name:  "字段超长",
-			parts: []importPart{{name: "password", body: strings.Repeat("p", maxImportFieldBytes+1)}, {name: "file", body: "备份内容", file: true}},
+			parts: []importPart{{name: "password", body: strings.Repeat("p", maxMultipartFieldBytes+1)}, {name: "file", body: "备份内容", file: true}},
 			limit: 1 << 20,
 			want:  "表单字段 password 过长",
 		},
@@ -204,7 +205,7 @@ func TestReadImportUploadAcceptsExactlyAtLimit(t *testing.T) {
 
 // 字段正好等于长度上限也要放过：这个上限是防滥用的，不该去卡一个写得离谱但合法的密码。
 func TestReadImportUploadAcceptsFieldExactlyAtLimit(t *testing.T) {
-	long := strings.Repeat("p", maxImportFieldBytes)
+	long := strings.Repeat("p", maxMultipartFieldBytes)
 	req := buildImportBody(t, []importPart{
 		{name: "file", body: "备份内容", file: true},
 		{name: "password", body: long},
@@ -229,6 +230,54 @@ func TestReadImportUploadRejectsNonMultipart(t *testing.T) {
 		t.Fatal("非 multipart 请求应报错")
 	} else if !strings.Contains(err.Error(), "未找到上传的配置文件") {
 		t.Fatalf("报错不对：%v", err)
+	}
+}
+
+// readCapped 要的容量一个字节都不能超过 limit+1，读到的内容也必须与源逐字节相同。
+//
+// 这不是抠字节。备份上限是 128 MB，而"还不够就再大一点"式的扩容在最后一档会为它
+// 要走一片明显更大的数组，且扩容那一瞬新旧两片同时在手上；导入紧接着还要几片同等
+// 大小的缓冲（见 config_crypt.go 的 cipherBytes），峰值差的这一两百 MB
+// 在 512MB 那类小主机上就是导入成不成的分界。
+//
+// 用逐字节返回的 reader 读：这样每一次扩容都真的走到，而不是一次 Read 就填满。
+func TestReadCappedNeverOverAllocates(t *testing.T) {
+	const limit = 64
+	for _, size := range []int{0, 1, 4, 5, 63, 64, 65, 200} {
+		src := strings.Repeat("a", size)
+		buf, err := readCapped(iotest.OneByteReader(strings.NewReader(src)), limit, 4)
+		if err != nil {
+			t.Fatalf("%d 字节读失败: %v", size, err)
+		}
+		// 超限时只多读一个字节就收手——调用方靠这一个字节判定"源比上限长"。
+		want := size
+		if want > limit+1 {
+			want = limit + 1
+		}
+		if len(buf) != want {
+			t.Errorf("源 %d 字节，读回 %d 字节，应为 %d", size, len(buf), want)
+		}
+		if string(buf) != src[:want] {
+			t.Errorf("源 %d 字节，读回的内容与源不一致", size)
+		}
+		if cap(buf) > limit+1 {
+			t.Errorf("源 %d 字节，容量要到 %d，超过了 limit+1=%d", size, cap(buf), limit+1)
+		}
+	}
+}
+
+// 提示值（来自 Content-Length，客户端说的数）不能越过上限：
+// 照着它分配就等于让一个几十字节的请求也能要走 128 MB。
+func TestReadCappedClampsHintToLimit(t *testing.T) {
+	buf, err := readCapped(strings.NewReader("abc"), 8, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(buf) != "abc" {
+		t.Fatalf("读回 %q", buf)
+	}
+	if cap(buf) > 9 {
+		t.Fatalf("提示值 1MB 被照单分配了：容量 %d，应不超过 limit+1=9", cap(buf))
 	}
 }
 

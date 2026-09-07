@@ -2,15 +2,18 @@ package forward
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"mantou/internal/config"
+	"mantou/internal/ipx"
 	"mantou/internal/logx"
 	"mantou/internal/module"
 )
@@ -41,6 +44,11 @@ const (
 	copyBufSize = 32 * 1024
 	// udpDatagramMax 单个 UDP 数据报的理论上限，读缓冲不能小于它，否则超长数据报会被截断。
 	udpDatagramMax = 64 * 1024
+	// acceptRetryMin / acceptRetryMax 是 Accept 遇到"过一会儿就好"的错误时的退避区间
+	// （见 acceptTCP）。指数退避，从 5ms 翻到 1s 为止——足够熬过一阵文件描述符紧张，
+	// 又不至于在真的恢复之后还傻等。
+	acceptRetryMin = 5 * time.Millisecond
+	acceptRetryMax = time.Second
 )
 
 // ConfigWriter 供模块回写规则运行态（LastError）。
@@ -104,6 +112,10 @@ func (m *Module) Name() string { return "forward" }
 func (m *Module) Reload(cfg *config.Config) error {
 	m.mu.Lock()
 
+	// 启动错误按父规则聚合，最后回写到规则 LastError。
+	// 在展开之前就声明：监听端口或目标撞上面板端口的运行项在展开阶段就被剔掉，那也是要让用户看见的错误。
+	errsByRule := make(map[string][]string)
+
 	// 展开期望运行项。
 	desired := make(map[string]expandedRule)
 	for _, r := range cfg.Forwards {
@@ -111,6 +123,43 @@ func (m *Module) Reload(cfg *config.Config) error {
 			continue
 		}
 		for _, er := range expandRule(r) {
+			// 运行期防御一：监听端口不得撞上**面板管理端口**（审计 L-01）。
+			//
+			// 面板监听 0.0.0.0（Panel.Listen 固定值），而 ReloadAll 在面板 Start 之前跑，
+			// 先绑端口的是这里。撞上的后果分平台，两边都很难自查：
+			// Linux 上面板 bind 失败、进程直接退出（面板自锁，只能手改 config.json）；
+			// Windows 上两者共存，回环仍回面板但所有非回环网卡落到转发上，远程管理入口静默消失。
+			//
+			// 保存接口已经拦过一道（internal/server 的 validateForward / forwardListensOnPanel），
+			// 这里拦的是没走过保存校验的那三条路：整份导入、版本迁移、手改 config.json。
+			// 这一道尤其要紧——它是「已经存进去的坏配置」唯一的解药：面板照常起得来，
+			// 用户能进界面把规则改掉。
+			if cfg.Panel.Port > 0 && er.rule.ListenPort == cfg.Panel.Port {
+				m.log.Warn("端口转发的监听端口与面板管理端口冲突，已跳过该端口",
+					"rule", er.rule.Name, "listen", er.rule.ListenPort, "panelPort", cfg.Panel.Port)
+				errsByRule[er.parentID] = append(errsByRule[er.parentID],
+					fmt.Sprintf("端口 %d：与面板管理端口冲突，已跳过", er.rule.ListenPort))
+				continue
+			}
+			// 运行期防御二：目标不得是**本机的面板端口**。
+			//
+			// 保存接口已经拦过一道（internal/server 的 validateForward / forwardTargetsPanel，
+			// 那里也写着完整理由），这里是第二道——配置还能经整份导入、版本迁移、手改
+			// config.json 三条路进来，而那三条都不走保存校验。与 webservice 模块对
+			// 「服务端口撞面板端口」的处理同一形状：跳过该项 + 告警，不让整次 Reload 失败。
+			//
+			// 为什么必须有这一道：一条 `8443 → 127.0.0.1:面板端口` 的规则会让面板收到的
+			// 每个连接对端都变成本机地址，于是入站防护的来源判定（仅局域网 / 拒绝名单 /
+			// 自动封禁）、登录限流的分桶与审计日志里的来源**同时**失效。
+			if er.rule.TargetPort == cfg.Panel.Port && ipx.IsLocalHost(er.rule.TargetHost) {
+				m.log.Warn("端口转发目标指向本机面板端口，已跳过该端口",
+					"rule", er.rule.Name, "listen", er.rule.ListenPort,
+					"target", er.rule.TargetHost, "targetPort", er.rule.TargetPort)
+				errsByRule[er.parentID] = append(errsByRule[er.parentID],
+					fmt.Sprintf("端口 %d：目标 %s:%d 指向本机面板端口，已跳过",
+						er.rule.ListenPort, er.rule.TargetHost, er.rule.TargetPort))
+				continue
+			}
 			desired[er.key] = er
 		}
 	}
@@ -126,8 +175,7 @@ func (m *Module) Reload(cfg *config.Config) error {
 		}
 	}
 
-	// 启动或重建规则，按父规则聚合启动错误。
-	errsByRule := make(map[string][]string)
+	// 启动或重建规则，按父规则聚合启动错误（errsByRule 在展开之前就已声明）。
 	for key, er := range desired {
 		existing, ok := m.runners[key]
 		if ok && existing.signature == ruleSignature(er.rule) {
@@ -315,6 +363,7 @@ type runner struct {
 	firstUDPLogged atomic.Bool  // 是否已记录首条 UDP 会话（用于日志降级）
 	capWarned      atomic.Bool  // 是否已就并发达上限告警过一次（避免刷屏）
 	totalWarned    atomic.Bool  // 是否已就模块级连接总数达上限告警过一次
+	acceptWarned   atomic.Bool  // 是否已就 Accept 暂时失败（退避重试）告警过一次
 }
 
 func newRunner(rule config.ForwardRule, log *logx.Logger, conns *connGate) *runner {
@@ -421,19 +470,44 @@ func (r *runner) startTCP() error {
 	return nil
 }
 
+// acceptTCP 接受连接直到监听被关闭。
+//
+// 两类失败必须分开对待，这也是这里不是一句 return 了事的原因：
+//
+//   - 文件描述符耗尽（EMFILE / ENFILE）是"过一会儿就好"的：全进程一时间开的连接太多，
+//     或者宿主机的 ulimit 偏低。就地退出会让这个端口从此再不接客，而进程还活着、
+//     别的规则还在正常转发，用户完全看不出这一条已经死了。所以退避重试。
+//
+//   - 其余错误（含监听器被外力关掉）意味着这个监听已经废了。此时**必须**点上 failed：
+//     Status() 数的是 m.runners 的条数，一个早已不再 accept 的 runner 若不点这个标记，
+//     总览页照旧把它算成"活跃且健康"——那是用户唯一能看到的信号，绿着就等于没人知道。
 func (r *runner) acceptTCP(ln net.Listener) {
 	defer r.wg.Done()
+	var delay time.Duration
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			select {
 			case <-r.ctx.Done():
-				return
+				return // stop() 关的监听，正常收摊
 			default:
-				r.log.Warn("TCP accept 失败", "rule", r.rule.Name, "err", err.Error())
-				return
 			}
+			if isTempAcceptErr(err) {
+				delay = nextAcceptDelay(delay)
+				r.logAcceptRetry(err, delay)
+				select {
+				case <-time.After(delay):
+					continue
+				case <-r.ctx.Done():
+					return
+				}
+			}
+			r.failed.Store(true)
+			r.log.Warn("TCP accept 失败，该端口已停止接收连接", "rule", r.rule.Name,
+				"listen", r.listenAddr(), "err", err.Error())
+			return
 		}
+		delay = 0 // 接住一条就说明缓过来了，下次再遇到从最小退避重新开始
 		// 并发上限：超过则立即关闭本次连接并跳过，避免连接无限堆积。
 		// 两道闸：本端口的（maxConnsPerRunner）与全部规则合计的（maxConnsTotal）。
 		// 先判本端口的——它是本地计数，且"某条规则自己太忙"是更常见的情形。
@@ -452,6 +526,44 @@ func (r *runner) acceptTCP(ln net.Listener) {
 		r.wg.Add(1)
 		go r.handleTCP(conn)
 	}
+}
+
+// isTempAcceptErr 判断一个 Accept 错误值不值得退避重试。
+//
+// 只认"资源一时不够"这一类：EMFILE（本进程 fd 用满）、ENFILE（系统 fd 用满）。
+// 这两个常量在 Linux 与 Windows 的 syscall 包里都有定义，所以不必按平台分文件；
+// Windows 上真正的句柄耗尽报的是 WSAEMFILE，落不进这里，于是退化成"标记 failed 后退出"，
+// 与其它未知错误同路——宁可报不健康，也不要悄悄地不再接客。
+//
+// 刻意不用 net.Error.Temporary()：它已被废弃，且语义含糊到标准库自己都在改口。
+func isTempAcceptErr(err error) bool {
+	if errors.Is(err, net.ErrClosed) {
+		return false
+	}
+	return errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE)
+}
+
+// nextAcceptDelay 按上一次的退避时长算下一次：0 → 最小值，其后翻倍并封顶。
+func nextAcceptDelay(prev time.Duration) time.Duration {
+	if prev <= 0 {
+		return acceptRetryMin
+	}
+	if next := prev * 2; next < acceptRetryMax {
+		return next
+	}
+	return acceptRetryMax
+}
+
+// logAcceptRetry 记录一次 Accept 退避重试：首次 WARN（这通常是要动 ulimit 的信号），
+// 其后降级为 DEBUG，避免 fd 持续紧张时以 1 秒一条的节奏刷满日志。
+func (r *runner) logAcceptRetry(err error, delay time.Duration) {
+	if r.acceptWarned.CompareAndSwap(false, true) {
+		r.log.Warn("TCP accept 暂时失败，稍后重试", "rule", r.rule.Name, "listen", r.listenAddr(),
+			"err", err.Error(), "retryMs", delay.Milliseconds())
+		return
+	}
+	r.log.Debug("TCP accept 暂时失败，稍后重试", "rule", r.rule.Name, "listen", r.listenAddr(),
+		"err", err.Error(), "retryMs", delay.Milliseconds())
 }
 
 func (r *runner) handleTCP(client net.Conn) {
@@ -552,9 +664,16 @@ func (r *runner) serveUDP(conn *net.UDPConn) {
 	}()
 
 	// 清理空闲会话。
+	//
+	// 这个 goroutine 要挂进 r.wg：它碰的是 sessions 与模块级的连接名额（经 dropLocked），
+	// 而 stop() 的语义是"返回之后这条规则不再动任何共享状态"。不挂的话 wg.Wait 早早返回，
+	// 而它还在后面跑一小会儿——Close() 之后仍有人往总闸上还名额，这类竞态在测试里
+	// 表现为"名额数偶尔不对"，在线上则是查不出来的偶发。
 	ticker := time.NewTicker(udpIdleTimeout)
 	defer ticker.Stop()
+	r.wg.Add(1)
 	go func() {
+		defer r.wg.Done()
 		for {
 			select {
 			case <-r.ctx.Done():
@@ -574,12 +693,16 @@ func (r *runner) serveUDP(conn *net.UDPConn) {
 	for {
 		n, clientAddr, err := conn.ReadFromUDP(buf)
 		if err != nil {
+			// 与 acceptTCP 同一个道理：读循环一退，这个端口就再也收不到数据报了。
+			// 不是 stop() 关的，就得点上 failed，否则总览页会一直说它健康。
 			select {
 			case <-r.ctx.Done():
-				return
 			default:
-				return
+				r.failed.Store(true)
+				r.log.Warn("UDP 读取失败，该端口已停止接收数据报", "rule", r.rule.Name,
+					"listen", r.listenAddr(), "err", err.Error())
 			}
+			return
 		}
 		key := clientAddr.String()
 

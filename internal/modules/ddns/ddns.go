@@ -79,31 +79,69 @@ func (m *Module) Reload(cfg *config.Config) error {
 	return nil
 }
 
-// Close 停止全部规则。
+// closeGrace 是 Close 等待各规则那一轮探测收尾的上限。
+//
+// 5 秒足够：cancel 之后剩下的活儿只有把当次结果写进 state.json（各 DNS 服务商的
+// HTTP 请求都带 ctx，见 dnsprovider，取消即刻返回）。给出上限而不是无限等，
+// 是因为"关不掉"比"少等一轮"严重——进程退不出去没有任何补救办法。
+const closeGrace = 5 * time.Second
+
+// Close 停止全部规则，并给正在执行的那一轮留一点收尾时间。
+//
+// 只 cancel 不等的话，被掐断的那一轮会一边跑一边和配置管理器的最后一次落盘赛跑：
+// 它末尾的 setStatus 要写 state.json，而那时管理器可能已经 flush 完了。
+//
+// 等待放在锁外：一轮探测里可能压着多次 DNS 接口调用，占着 m.mu 会把同时到来的
+// Status 查询（总览页）一起卡住。
 func (m *Module) Close() error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	runners := make([]*ruleRunner, 0, len(m.runners))
 	for id, run := range m.runners {
-		run.stop()
+		runners = append(runners, run)
 		delete(m.runners, id)
+	}
+	m.mu.Unlock()
+
+	for _, run := range runners {
+		run.stop()
+	}
+	// 一个共享的截止时刻，而不是每条规则各等 closeGrace：规则数没有上界，
+	// 逐条计时会让"关闭最多花 5 秒"变成"最多花 5 秒 × 规则数"。
+	deadline := time.After(closeGrace)
+	for _, run := range runners {
+		select {
+		case <-run.done:
+		case <-deadline:
+			m.log.Warn("DDNS 探测未在关闭窗口内结束，放弃等待", "timeout", closeGrace.String())
+			return nil
+		}
 	}
 	return nil
 }
 
 // Status 实现 module.StatusReporter。
+//
+// Total 是正在跑的规则数（停用的规则不建 runner），Active 是其中最近一轮成功的那些——
+// 与端口转发模块同一口径（见 forward.Module.Status）：两个模块的形态相同（每条规则一个
+// 带健康状态的 runner），报出来的数就该是同一种意思。原先 Active 直接取 len(m.runners)，
+// 于是总览页永远显示"N / N"，一条规则连着失败也看不出来，Healthy 那个布尔又只说得出
+// "有没有出问题"、说不出"几条出了问题"。
 func (m *Module) Status() module.Status {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	active := 0
 	healthy := true
 	for _, run := range m.runners {
-		if !run.lastOK() {
+		if run.lastOK() {
+			active++
+		} else {
 			healthy = false
 		}
 	}
 	return module.Status{
 		Name:    "ddns",
 		Total:   len(m.runners),
-		Active:  len(m.runners),
+		Active:  active,
 		Healthy: healthy,
 	}
 }
@@ -146,6 +184,10 @@ type ruleRunner struct {
 
 	ctx    context.Context
 	cancel context.CancelFunc
+	// done 在探测协程退出后关闭，供 Close 等待收尾。
+	// 只有 start() 起过协程的 runner 会关闭它；RunOnceCtx 里那个临时 runner
+	// 不进 m.runners，也就没人等它。
+	done chan struct{}
 
 	lastIP    string
 	lastOKVal bool
@@ -159,6 +201,7 @@ func newRuleRunner(rule config.DDNSRule, log *logx.Logger, cfgMgr ConfigWriter) 
 		cfgMgr:    cfgMgr,
 		ctx:       ctx,
 		cancel:    cancel,
+		done:      make(chan struct{}),
 		lastIP:    rule.LastIP, // 从持久化基准播种：使「首次增加」才强制同步，重启不再误判为首次
 		lastOKVal: true,
 	}
@@ -198,6 +241,7 @@ func (r *ruleRunner) name() string {
 
 func (r *ruleRunner) start() {
 	go func() {
+		defer close(r.done)
 		// 启动后先立即执行一次。
 		if _, err := r.execute(r.ctx); err != nil {
 			r.log.Warn("DDNS 首次执行失败", "rule", r.name(), "err", err.Error())
@@ -221,6 +265,19 @@ func (r *ruleRunner) start() {
 
 func (r *ruleRunner) stop() { r.cancel() }
 
+// stoppedEarly 判断这一轮是不是被外部掐断的（模块 Close、Reload 删掉了这条规则）。
+//
+// 掐断的那一轮什么也没测出来，它的"失败"不该被写进 state.json 当成规则的最近状态——
+// 否则每次正常退出都会给当时在跑的规则留下一句「取址失败: context canceled」，
+// 下次启动面板上就显示成一条出错的规则，而它其实好得很。
+//
+// 只看 ctx 不看返回的 error：取消会穿过 http 客户端、服务商实现好几层包装回来，
+// 哪一层有没有保住 errors.Is 的链子说不准，而 ctx 自己的状态是确定的。
+//
+// 只认 Canceled、不认 DeadlineExceeded：后者是"给了预算而没跑完"（计划任务那条路会设，
+// 见 RunOnceCtx），那是一个真实结果，该记下来让用户看见。
+func stoppedEarly(ctx context.Context) bool { return errors.Is(ctx.Err(), context.Canceled) }
+
 // execute 探测 IP 并在变化时更新全部目标。
 func (r *ruleRunner) execute(ctx context.Context) (string, error) {
 	r.mu.Lock()
@@ -233,6 +290,9 @@ func (r *ruleRunner) execute(ctx context.Context) (string, error) {
 
 	ip, err := detectIP(ctx, rule.Source, rule.Stack, blockPrivate)
 	if err != nil {
+		if stoppedEarly(ctx) {
+			return "", err
+		}
 		if errors.Is(err, netguard.ErrBlocked) {
 			// 内网防护拦截属安全事件，以 WARN 记录，便于审计是否有人试图诱导服务端访问内网。
 			r.log.Warn("内网防护已拦截取址请求", "rule", rule.Name, "source", rule.Source.Type, "err", err.Error())
@@ -312,6 +372,9 @@ func (r *ruleRunner) execute(ctx context.Context) (string, error) {
 	}
 
 	if firstErr != nil {
+		if stoppedEarly(ctx) {
+			return ip, firstErr
+		}
 		// 部分目标更新失败：仅当确有记录被成功写入时才刷新时间。
 		r.setStatus(false, "部分目标更新失败: "+firstErr.Error(), anyUpdated)
 		return ip, firstErr

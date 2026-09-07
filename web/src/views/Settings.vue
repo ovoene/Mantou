@@ -55,7 +55,12 @@ interface UpdateCfg {
   releaseUrl: string
   githubRepo: string
   signKey: string
+  // allowUnsignedUpdate 是后端算出来的**当前是否有效**，不是配置里那个布尔值：
+  // 打开它只换来一段有限的窗口（allowUnsignedTtlHours 小时），过期后这里就是 false。
   allowUnsignedUpdate: boolean
+  // allowUnsignedExpiresAt 窗口到期时刻（Unix 秒），没有有效窗口时为 0。
+  allowUnsignedExpiresAt: number
+  allowUnsignedTtlHours: number
 }
 const lang = ref<'zh-CN' | 'en-US'>(currentLocale())
 const panel = reactive<PanelInfo>({ port: 0, basePath: '', https: { enabled: false, certId: '', domain: '' } })
@@ -181,8 +186,20 @@ watch(activeTab, (tab) => {
 /* ---------- 在线更新（更新源 / 签名密钥） ---------- */
 // 默认值与后端保持一致：manifestUrl/releaseUrl/githubRepo 留空表示走默认行为（GitHub ovoene/Mantou）。
 // signKey 默认空，此时是否接收更新包由 allowUnsignedUpdate 决定，默认关闭（后端同样默认拒收）。
-const update = reactive<UpdateCfg>({ manifestUrl: '', releaseUrl: '', githubRepo: '', signKey: '', allowUnsignedUpdate: false })
+const update = reactive<UpdateCfg>({
+  manifestUrl: '', releaseUrl: '', githubRepo: '', signKey: '',
+  allowUnsignedUpdate: false, allowUnsignedExpiresAt: 0, allowUnsignedTtlHours: 24,
+})
 const savingUpdate = ref(false)
+// 载入时那一刻的窗口状态。用来判断这次保存是不是一次「打开」——只有打开才要验密码，
+// 关掉、改清单地址、填公钥都不用（后端口径见 handleUpdateSettings）。
+const allowUnsignedLoaded = ref(false)
+
+// 窗口到期时刻的本地时间文案，供开关下方的提示使用；没有有效窗口时为空串。
+const allowUnsignedExpiresText = computed(() => {
+  if (!update.allowUnsignedExpiresAt) return ''
+  return new Date(update.allowUnsignedExpiresAt * 1000).toLocaleString()
+})
 
 // 路径前缀只允许 ASCII（英文 / 数字 / 符号）。检测到中文等非 ASCII 字符则判定非法，禁止保存。
 const basePathInvalid = computed(() => /[^\x00-\x7F]/.test(panel.basePath.trim()))
@@ -437,6 +454,9 @@ async function loadSettings() {
       update.githubRepo = s.update.githubRepo ?? ''
       update.signKey = s.update.signKey ?? ''
       update.allowUnsignedUpdate = !!s.update.allowUnsignedUpdate
+      update.allowUnsignedExpiresAt = typeof s.update.allowUnsignedExpiresAt === 'number' ? s.update.allowUnsignedExpiresAt : 0
+      if (s.update.allowUnsignedTtlHours > 0) update.allowUnsignedTtlHours = s.update.allowUnsignedTtlHours
+      allowUnsignedLoaded.value = update.allowUnsignedUpdate
     }
     if (s.security) {
       security.blockPrivateNetwork = !!s.security.blockPrivateNetwork
@@ -656,17 +676,45 @@ async function saveUpdate() {
   // releaseUrl 空 → 回退清单/GitHub 返回的下载页）。留空即代表「用默认」，与后端 trimSpace 行为一致。
   // signKey 留空且未打开 allowUnsignedUpdate 时，后端不接收更新包——这是默认状态，不在这里拦，
   // 因为「暂时不打算用在线覆盖更新」的用户本就该能把这两项都留在默认值上保存。
+  //
+  // 打开「允许未验签的更新包」要当场再验一次密码：那一项一开，任何一条有效会话都能
+  // 上传一个包把面板二进制换掉。后端在这一次提交上要求凭据（见 handleUpdateSettings），
+  // 这里先问，免得白提交一次收一个 403。关掉它、以及窗口已经开着时的其它保存都不问。
+  const needAuth = update.allowUnsignedUpdate && !allowUnsignedLoaded.value
+  let password = ''
+  if (needAuth) {
+    try {
+      const r = await ElMessageBox.prompt(t('settings.updateAllowUnsignedPwd'), t('settings.updateAllowUnsigned'), {
+        inputType: 'password',
+        confirmButtonText: t('common.confirm'),
+        cancelButtonText: t('common.cancel'),
+        inputValidator: (v: string) => (v && v.length > 0) || t('common.required'),
+      })
+      password = r.value || ''
+    } catch {
+      return // 用户取消：这一段整个不提交，开关也保持界面上的样子
+    }
+    if (!password) return
+  }
   savingUpdate.value = true
   try {
-    await api.put('/settings', {
+    const res = await api.put<any>('/settings', {
       update: {
         manifestUrl: update.manifestUrl,
         releaseUrl: update.releaseUrl,
         githubRepo: update.githubRepo,
         signKey: update.signKey,
         allowUnsignedUpdate: update.allowUnsignedUpdate,
+        ...(needAuth ? { account: auth.username, password } : {}),
       },
     })
+    // 窗口的生效状态与到期时刻由后端算，用响应里的那份回填——自己按 TTL 推算的话，
+    // 浏览器与服务器时钟一有偏差，提示上的时间就是错的。
+    if (res?.update) {
+      update.allowUnsignedUpdate = !!res.update.allowUnsignedUpdate
+      update.allowUnsignedExpiresAt = typeof res.update.allowUnsignedExpiresAt === 'number' ? res.update.allowUnsignedExpiresAt : 0
+      allowUnsignedLoaded.value = update.allowUnsignedUpdate
+    }
     ElMessage.success(t('msg.saveOk'))
   } catch (e: any) {
     ElMessage.error(e?.message || t('common.failed'))
@@ -760,6 +808,15 @@ function resetAppearance() {
 
 /* ---------- 备份与恢复 ---------- */
 const exporting = ref(false)
+// 导出弹窗。原来这里是一个 ElMessageBox.prompt，它只放得下一个输入框；
+// 现在「登录密码」之外还有一栏可选的独立备份口令，只能改成真正的弹窗。
+const exportVisible = ref(false)
+const exportPassword = ref('')
+const exportPassphrase = ref('')
+// 与服务端的 minBackupPassphraseLen / maxBackupPassphraseLen 对齐（见 config_crypt.go）。
+// 这两个数在这里只用于「省一次往返」的即时提示，真正说了算的是服务端那侧。
+const exportPassphraseMin = 8
+const exportPassphraseMax = 256
 const importing = ref(false)
 // 加密备份所需的凭据对话框（导入时），以及暂存待导入文件。
 const importCredsVisible = ref(false)
@@ -846,24 +903,52 @@ function normalizeImportModules() {
   importModules.value = importModuleKeys.filter((k) => set.has(k))
 }
 
-// 导出：备份始终以「登录账户名 + 密码」加密，账户名自动取当前登录账户，仅需用户输入密码。
-async function exportConfig() {
-  let password = ''
-  try {
-    const r = await ElMessageBox.prompt(t('settings.exportPwdHint'), t('settings.exportEncrypt'), {
-      inputType: 'password',
-      confirmButtonText: t('common.confirm'),
-      cancelButtonText: t('common.cancel'),
-      inputValidator: (v: string) => (v && v.length > 0) || t('common.required'),
-    })
-    password = r.value || ''
-  } catch {
-    return // 用户取消
+// 导出：备份以「登录账户名 + 备份口令」加密，账户名自动取当前登录账户。
+// 备份口令默认就是登录密码，也可以另设一个独立口令（理由见 confirmExport）。
+function exportConfig() {
+  exportPassword.value = ''
+  exportPassphrase.value = ''
+  exportVisible.value = true
+}
+
+// onExportClosed 弹窗一关（确认、取消、✕、Esc、切页）就把两个口令清掉。
+// 导出是一次性动作，留着它们只是让口令在内存里多躺一会儿。
+function onExportClosed() {
+  exportPassword.value = ''
+  exportPassphrase.value = ''
+}
+
+// passphraseBytes 按**字节**量长度，与服务端的 len(req.Passphrase) 同口径。
+// 用 .length 会把一个汉字算成 1，于是「4 个汉字」（12 字节，服务端收）会被这里拦下来。
+function passphraseBytes(s: string) {
+  return new TextEncoder().encode(s).length
+}
+
+async function confirmExport() {
+  const password = exportPassword.value
+  if (!password) {
+    ElMessage.warning(t('common.required'))
+    return
   }
-  if (!password) return
+  const passphrase = exportPassphrase.value
+  if (passphrase) {
+    const n = passphraseBytes(passphrase)
+    if (n < exportPassphraseMin || n > exportPassphraseMax) {
+      ElMessage.warning(
+        t('settings.exportPassphraseLen', { min: exportPassphraseMin, max: exportPassphraseMax }),
+      )
+      return
+    }
+  }
   exporting.value = true
   try {
-    const resp = await api.raw.post('/settings/export', { account: auth.username, password })
+    const resp = await api.raw.post('/settings/export', {
+      account: auth.username,
+      password,
+      // 没填就**整个字段都不发**。服务端只在这字段非空时才改用它，发一个空串虽然等效，
+      // 但那样「没填」与「填了个空」在网络上长得一样，两边都少一道能自查的信号。
+      ...(passphrase ? { passphrase } : {}),
+    })
     const text = JSON.stringify(resp.data, null, 2)
     const blob = new Blob([text], { type: 'application/json' })
     const url = URL.createObjectURL(blob)
@@ -877,6 +962,8 @@ async function exportConfig() {
     a.remove()
     URL.revokeObjectURL(url)
     ElMessage.success(t('msg.configExported'))
+    // 只有成功才关：口令填错（403）时弹窗留在原处，用户改一个字就能重试。
+    exportVisible.value = false
   } catch (e: any) {
     ElMessage.error(e?.message || t('common.failed'))
   } finally {
@@ -1117,9 +1204,11 @@ onDeactivated(restoreSavedAppearance)
 // keep-alive 缓存被销毁时（退出登录 / 整个布局卸载）同样要还原，否则未保存的预览会残留到登录页。
 onBeforeUnmount(restoreSavedAppearance)
 
-// 导入备份时那两个弹窗（身份验证、解密口令与范围）都在切页时收起（理由见 useCloseOnLeave）。
+// 导入备份时那两个弹窗（身份验证、解密口令与范围）都在切页时收起（理由见 useCloseOnLeave），
+// 导出那个同理：它里面躺着登录密码与备份口令。
 useCloseOnLeave(importCredsVisible)
 useCloseOnLeave(importAuthVisible)
+useCloseOnLeave(exportVisible)
 </script>
 
 <template>
@@ -1702,7 +1791,10 @@ useCloseOnLeave(importAuthVisible)
           </el-form-item>
           <el-form-item :label="t('settings.updateAllowUnsigned')">
             <el-switch v-model="update.allowUnsignedUpdate" />
-            <p class="mt-subtle hint">{{ t('settings.updateAllowUnsignedHint') }}</p>
+            <p class="mt-subtle hint">{{ t('settings.updateAllowUnsignedHint', { hours: update.allowUnsignedTtlHours }) }}</p>
+            <p v-if="allowUnsignedExpiresText" class="mt-subtle hint">
+              {{ t('settings.updateAllowUnsignedExpires', { time: allowUnsignedExpiresText }) }}
+            </p>
           </el-form-item>
           <el-form-item>
             <el-button type="primary" :loading="savingUpdate" @click="saveUpdate">
@@ -1807,6 +1899,48 @@ useCloseOnLeave(importAuthVisible)
               </p>
             </div>
           </el-form-item>
+
+          <!-- 导出：确认身份的登录密码 + 可选的独立备份口令。
+               两栏都在一个弹窗里，因为它们要一起决定「这份文件用什么解开」 -->
+          <el-dialog
+            v-model="exportVisible"
+            :title="t('settings.exportEncrypt')"
+            width="min(560px, 94vw)"
+            append-to-body
+            :close-on-click-modal="false"
+            @closed="onExportClosed"
+          >
+            <el-alert :title="t('settings.exportPwdHint')" type="info" :closable="false" show-icon />
+            <el-form label-position="top" style="margin-top: 12px" @submit.prevent="confirmExport">
+              <el-form-item :label="t('settings.exportPassword')">
+                <el-input
+                  v-model="exportPassword"
+                  type="password"
+                  show-password
+                  autocomplete="off"
+                  @keyup.enter="confirmExport"
+                />
+              </el-form-item>
+              <el-form-item :label="t('settings.exportPassphrase')">
+                <div style="width: 100%">
+                  <el-input
+                    v-model="exportPassphrase"
+                    type="password"
+                    show-password
+                    autocomplete="off"
+                    @keyup.enter="confirmExport"
+                  />
+                  <p class="mt-subtle hint">{{ t('settings.exportPassphraseHint') }}</p>
+                </div>
+              </el-form-item>
+            </el-form>
+            <template #footer>
+              <el-button @click="exportVisible = false">{{ t('common.cancel') }}</el-button>
+              <el-button type="primary" :loading="exporting" @click="confirmExport">
+                {{ t('settings.exportBtn') }}
+              </el-button>
+            </template>
+          </el-dialog>
 
           <!-- 导入第一步：验证本机管理员身份。与下一个弹窗刻意分开，界面上只出现一个密码框 -->
           <el-dialog

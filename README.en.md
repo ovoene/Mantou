@@ -29,6 +29,18 @@ The interface is **designed from scratch**: colors, background image, blur, corn
 - Frontend: Vue 3 + Vite + TypeScript + Element Plus + ECharts + vue-i18n
 - Deployment: one executable file with the interface packed inside; a Docker image is provided too (amd64 and arm64)
 
+### Three dependencies deliberately held back
+
+Everything else tracks upstream (vite 8, pinia 4, vue-router 5, vue-i18n 11, echarts 6, gopsutil v4 were all current at the time). The three below are a **decision**, not an oversight. `package.json` and `go.mod` cannot show that difference, so it is written down here — together with what should bring each one back up for review. Without a trigger, a judgement that was right at the time turns into a permanent freeze by inertia.
+
+| Held at | Why | When to revisit |
+| --- | --- | --- |
+| `typescript` 5.9.x | TypeScript 7 is tsgo, the Go rewrite; its npm package no longer exports `./lib/tsc`, and `vue-tsc` embeds the TS compiler API, so it breaks outright on top of it. The `typescript >=5.0.0` peer range that `vue-tsc` declares is misleadingly permissive. | Once a `vue-tsc` release note states tsgo / TS 7 support. The check is straightforward: `cd web && npm i -D typescript@7 && npx vue-tsc --noEmit` passing means it can go up — and it must go up in the same step as `vue-tsc`. |
+| `vue` 3.5.x | 3.6 replaces the reactivity implementation, and the capabilities it brings (Vapor and friends) are used nowhere in this panel — not worth a full regression pass over the whole UI. | Vue 3.5 stops receiving security fixes, or any of element-plus / vue-router / pinia raises its peer to `>=3.6` (`npm ls vue` will report the peer conflict directly). |
+| `gin` v1.10.1 | Same trade: every route, middleware and multipart upload in the panel would have to be re-verified for a gain we do not need. | The `govulncheck ./...` step in CI's non-blocking "dependency vulnerability scan" job starts reporting gin, or this project needs an API only newer versions have. A security advisory ends the trade-off — upgrade then. |
+
+One more deliberate inconsistency, do not flatten it: the **toolchain floor** and the **actual build version** are separate — `go.mod` says `go 1.26.0` while CI and the image use Go 1.27; `package.json`'s `engines.node` says `>=22.12.0` while CI and the image use Node 24. The lower number is "the least a user needs to compile this themselves"; the higher one is "what we compile with". Flattening them only raises the bar for building from source.
+
 ## Quick start
 
 ```bash
@@ -150,8 +162,8 @@ This section covers the full pipeline: building from source, packaging locally, 
 
 | Dependency | Version | Purpose |
 |------------|---------|---------|
-| Go | ≥ 1.25 (go.mod floor; 1.26 recommended) | Compile the backend binary |
-| Node.js + npm | ≥ 20 (22 LTS recommended) | Build the frontend `web/dist` |
+| Go | ≥ 1.26 (go.mod floor; CI/images build with 1.27) | Compile the backend binary |
+| Node.js + npm | ≥ 22.12 (package.json engines floor; CI/images build with 24 LTS) | Build the frontend `web/dist` |
 | make + tar | Linux / macOS | Makefile packaging script |
 | Docker (optional) | 20.10+ | Build images / run containers |
 | git | any | Publish to GitHub |
@@ -240,7 +252,15 @@ docker build \
 docker compose up -d --build
 ```
 
-Multi-stage build: `node:22-alpine` (frontend) → `golang:1.26-alpine` (backend) → `alpine:3.24` (runtime), final image ~18–25 MB. If pulling base images stalls on restricted networks, switch mirrors via the `MIRROR` prefix.
+Multi-stage build: `node:24-alpine` (frontend) → `golang:1.27-alpine` (backend) → `alpine:3.24` (runtime), final image ~18–25 MB. If pulling base images stalls on restricted networks, switch mirrors via the `MIRROR` prefix.
+
+All three base images are pinned by `@sha256:` digest in the Dockerfile, so `MIRROR` only changes **where** the bytes come from, not **what** they are (a mirror serving different content fails the build; Go deps are verified by `go.sum`, npm deps by the integrity hashes in `package-lock.json`). Locally built images are still not official artifacts — official images are built by GitHub Actions and pushed to `ghcr.io` with build provenance, and self-built images record the mirrors they used in `io.mantou.build.*` labels (`docker image inspect`).
+
+Release assets carry build provenance too, so you can verify they came from this repository's release pipeline:
+
+```bash
+gh attestation verify mantou-linux-amd64.tar.gz --repo ovoene/Mantou
+```
 
 ### 6. Cross-compile binaries for different platforms
 
@@ -484,7 +504,8 @@ Everything else (ports, the various rules, appearance settings) is still plainte
 
 Two routes, pick one:
 
-1. **Export from the panel (recommended, works straight away elsewhere)**: Settings → Backup & restore → Export configuration. The whole exported file is encrypted, with the key derived from **your login account name plus your login password**. So **importing it on a new machine just works**: appearance, theme, every module's rules and the account keys all come back, and you don't need to bring `master.key` along — the importing side re-encrypts with its own freshly generated key. The trade-off: **if you forget the account name and password used at export time, it cannot be recovered**.
+1. **Export from the panel (recommended, works straight away elsewhere)**: Settings → Backup & restore → Export configuration. The whole exported file is encrypted, with the key derived from **your login account name plus the backup passphrase** (which defaults to your login password). So **importing it on a new machine just works**: appearance, theme, every module's rules and the account keys all come back, and you don't need to bring `master.key` along — the importing side re-encrypts with its own freshly generated key. The trade-off: **if you forget the account name and passphrase used at export time, it cannot be recovered**.
+   > The “separate backup passphrase” field in the export dialog is optional: set it and only that passphrase opens the file — the login password no longer does. Use it when handing the backup to someone else, or when you no longer want “I changed my login password” and “those old backups on my disk” to drift apart. The backup holds **plaintext credentials** (DDNS, webhooks, certificate private keys — all of it), so the passphrase must be at least 8 bytes, and longer is better. Leave it empty and nothing changes.
    > Sign in afterwards with **the account name and password from the backup** (the login account is overwritten along with everything else). Import **deliberately keeps the new machine's local** session signing key rather than the one inside the backup — otherwise anyone could make a backup with a known signing key and forge an admin identity right after importing it. So if the backup's account name differs from the current one, your current sign-in is invalidated immediately and you sign in again.
 2. **Copying the data directory directly**: `config.json` and `master.key` must be copied **together**. If only the config file is restored, the program **fails at startup and tells you how to handle it** rather than staying quiet about it — otherwise DNS updates and certificate renewals would surface a scattering of "account verification failed" errors one cycle later, which is far harder to track down. On this route the certificate private keys travel along in plaintext, so treat the copy as "this copy contains usable private keys" (see the previous section).
 

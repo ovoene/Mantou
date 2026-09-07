@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"mantou/internal/fsx"
 )
 
 // maxCertFileBytes 路径证书（Method="path"）单个文件的读取上限。
@@ -141,7 +143,9 @@ func (s *Store) Save(id string, certPEM, keyPEM []byte) error {
 	s.fileMu.Lock()
 	defer s.fileMu.Unlock()
 
-	if err := os.MkdirAll(s.dir, 0o755); err != nil {
+	// 证书目录 0700：私钥是 0600，但目录 0755 会把"有哪些域名、什么时候签的"
+	// 摊给同机的每个用户看（见 fsx.DirMode）。
+	if err := fsx.EnsureDir(s.dir); err != nil {
 		return err
 	}
 	certTmp, err := writeTempFile(s.dir, id+"-*.crt", certPEM, 0o644)

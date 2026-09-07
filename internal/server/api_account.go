@@ -14,6 +14,7 @@ import (
 
 	"mantou/internal/auth"
 	"mantou/internal/config"
+	"mantou/internal/fsx"
 )
 
 // changeAccountReq 是修改账户请求：可同时/分别修改登录用户名与密码。
@@ -29,6 +30,11 @@ type changeAccountReq struct {
 // 修改用户名会使既有会话主体失效，前端需据 usernameChanged 提示重新登录。
 // 只改密码则作废所有旧会话、给当前浏览器换发一条新的，前端无需为此做任何事。
 func (s *Server) handleChangeAccount(c *gin.Context) {
+	// 与导出、导入、身份预检、更新那两处（打开未验签开关、上传未验签的包）共用的失败计数
+	//（见 reauth.go）：这几条都是「拿一条会话反复试当前密码」，只限其中几条等于没限。
+	if !s.reauthAllowed(c) {
+		return
+	}
 	var req changeAccountReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		respondError(c, http.StatusBadRequest, "请求参数无效")
@@ -46,15 +52,27 @@ func (s *Server) handleChangeAccount(c *gin.Context) {
 	}
 	// 任何账户变更都要求验证当前密码。
 	if !auth.VerifyPassword(cfg.Auth.PasswordHash, req.OldPassword) {
+		s.reauthFail(c)
 		respondError(c, http.StatusUnauthorized, "当前密码错误")
 		return
 	}
+	s.reauthOK(c)
 	if changeName && len(newName) < 3 {
 		respondError(c, http.StatusBadRequest, "用户名至少 3 个字符")
 		return
 	}
+	// 上下限与初始化那条路径同源（见 handleInitSetup）：两处各写一份界限，
+	// 迟早会出现"初始化时存不进的名字，改账户时能存进去"。
+	if changeName && len(newName) > maxLoginUserKeyLen {
+		respondError(c, http.StatusBadRequest, fmt.Sprintf("用户名最多 %d 个字节", maxLoginUserKeyLen))
+		return
+	}
 	if changePass && len(req.NewPassword) < 6 {
 		respondError(c, http.StatusBadRequest, "新密码至少 6 个字符")
+		return
+	}
+	if changePass && len(req.NewPassword) > auth.MaxPasswordBytes {
+		respondError(c, http.StatusBadRequest, fmt.Sprintf("新密码最多 %d 个字节（超过的部分不会参与校验）", auth.MaxPasswordBytes))
 		return
 	}
 
@@ -119,13 +137,16 @@ type verifyIdentityReq struct {
 // 它**不是**那些操作的安全边界——真正的闸在各自的接口里（见 handleImportConfig 里那道
 // 同款校验）。前端拿到 200 不等于后面那一步就免验了，谁也不许把它当令牌用。
 //
-// 已鉴权路由，不额外做失败计数。这不是因为猜密码没意义，而是这条路给不出任何
-// 改账户与加密导出还没给出的东西：那两条一样是"拿一条会话反复试当前密码"，
-// 一样只有 bcrypt 的百毫秒级成本兜着。真要限，得三处一起限；
-// 只在这一条上加，攻击者换另外两条即可，界面上却多出一处会把人锁住的地方。
+// 失败计数与改账户、加密导出、导入校验、以及更新那两处（打开未验签开关、上传未验签的包）
+// **共用一份**（见 reauth.go）：这几条都是"拿一条会话反复试当前密码"，只给其中一条加限制，
+// 攻击者换另一条接着试，界面上却多出一处会把人锁住的地方。所以要么一起限，要么都不限；
+// 现在是一起限。
 //
 // 也刻意不与登录限流共用计数：那样一条被盗的会话就能把真正的管理员锁在登录页外面。
 func (s *Server) handleVerifyIdentity(c *gin.Context) {
+	if !s.reauthAllowed(c) {
+		return
+	}
 	var req verifyIdentityReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		respondError(c, http.StatusBadRequest, "请求参数无效")
@@ -135,9 +156,11 @@ func (s *Server) handleVerifyIdentity(c *gin.Context) {
 	// 403 而不是 401：会话是好的，只是密码填错了，不该让前端把人强制登出。
 	if strings.TrimSpace(req.Account) != cfg.Auth.Username ||
 		!auth.VerifyPassword(cfg.Auth.PasswordHash, req.Password) {
+		s.reauthFail(c)
 		respondError(c, http.StatusForbidden, "当前账户或密码不正确")
 		return
 	}
+	s.reauthOK(c)
 	respondOK(c, gin.H{"ok": true})
 }
 
@@ -253,7 +276,7 @@ func (s *Server) handleUploadBackground(c *gin.Context) {
 	}
 
 	uploadDir := filepath.Join(s.deps.DataDir, "uploads")
-	if err := os.MkdirAll(uploadDir, 0o755); err != nil {
+	if err := fsx.EnsureDir(uploadDir); err != nil {
 		respondError(c, http.StatusInternalServerError, "创建上传目录失败")
 		return
 	}

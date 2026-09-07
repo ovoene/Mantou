@@ -255,6 +255,61 @@ func TestScanStorageListsRestoreLeftovers(t *testing.T) {
 	}
 }
 
+// 原子写用的临时文件名带随机串（config.Manager 走 os.CreateTemp，见 internal/config 的
+// createTempFor），断电留下的残留必须照样被认出来——否则清理页从此对它们瞎了，
+// 而这些文件正是一份完整配置的大小。
+//
+// 名字这里用 os.CreateTemp 按同一个模式真造一遍，不手写字面量：手写的话，
+// 哪天 createTempFor 换了模式，这条测试照样绿着。
+func TestScanStorageListsRandomizedTempLeftovers(t *testing.T) {
+	_, router, dir := newStorageTest(t)
+	names := make([]string, 0, 3)
+	for _, base := range []string{"config.json", "state.json", "master.key"} {
+		f, err := os.CreateTemp(dir, base+".*.tmp")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.WriteString("half-written"); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+		backdate(t, f.Name())
+		name := filepath.Base(f.Name())
+		if name == base+".tmp" {
+			t.Fatalf("os.CreateTemp 没有插入随机串，这条测试就白跑了：%q", name)
+		}
+		names = append(names, name)
+	}
+
+	items := listStorage(t, router)
+	for _, name := range names {
+		it, listed := items[name]
+		if !listed {
+			t.Fatalf("%s 没被列出来：断电留下的残留从此没人清得掉（%v）", name, items)
+		}
+		if it.Kind != "temp" || it.IsDir {
+			t.Fatalf("%s 条目不对：%+v", name, it)
+		}
+	}
+	// 除了这几个残留，什么都不该列——尤其不能因为名字沾了 config.json / master.key
+	// 就把真正的配置和密钥带下水。
+	if len(items) != len(names) {
+		t.Fatalf("列了 %d 条，期望只有 %d 个 .tmp 残留：%v", len(items), len(names), items)
+	}
+	// 列得出还要删得掉：这两步是同一条路径上的两头。
+	r := cleanupStorage(t, router, names...)
+	if !r.OK || r.Removed != len(names) || r.Skipped != 0 {
+		t.Fatalf("清理结果不对：%+v", r)
+	}
+	for _, name := range names {
+		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
+			t.Fatalf("%s 还在：%v", name, err)
+		}
+	}
+}
+
 // 太新的暂存目录与 .tmp 一律不列：它们在一次正在进行的导入、或一次正在写的配置保存
 // 中途也会存在，列出来就有可能被顺手删掉，把人家写一半的东西毁了。
 func TestScanStorageSkipsFreshLeftovers(t *testing.T) {

@@ -56,6 +56,24 @@ func (m *Module) RegisterHandler(actionType string, fn ActionFunc) {
 	m.handlers[actionType] = fn
 }
 
+// ValidateSpec 判断一条 cron 表达式能否被本模块的调度器接受。
+//
+// 存在的理由是「保存成功但永不执行」（审计 L-05）：下面 Reload 里 c.AddFunc 失败只写
+// 一条 ERROR 日志就 continue，任务在列表里照旧显示「启用」、模块状态照旧健康，
+// 唯一的线索埋在程序日志里。这种失败必须在保存那一刻就说出来。
+//
+// 刻意复用 robfig.ParseStandard 而不是自己数字段：它正是 robfig.New() 默认装的那个解析器
+// （5 段「分 时 日 月 周」，外加 @every / @daily 这类描述符），于是"校验放行"与"调度器收得下"
+// 是同一个判断，两边不可能给出不同答案。自己写一套的话，每次依赖升级都要重新对齐口径，
+// 而对不齐的表现就是本条审计项本身——界面上说存好了，实际排不进去。
+//
+// 不对 spec 做任何整理（连首尾空格都不去）：交给校验的必须与交给 AddFunc 的是同一个字符串。
+// robfig 内部用 strings.Fields 切分，首尾空格本就无害；纯空白串两边都会报错。
+func ValidateSpec(spec string) error {
+	_, err := robfig.ParseStandard(spec)
+	return err
+}
+
 // Reload 重建 cron 调度器并挂载所有启用的任务。
 func (m *Module) Reload(cfg *config.Config) error {
 	m.reloadMu.Lock()

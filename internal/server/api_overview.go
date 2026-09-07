@@ -108,7 +108,7 @@ func (s *Server) handleGetSettings(c *gin.Context) {
 				"domain":  cfg.Panel.HTTPS.Domain,
 			},
 		},
-		"update": cfg.Update,
+		"update": updateSettings(cfg.Update, time.Now()),
 		"auth": gin.H{
 			"sessionHours":       cfg.Auth.SessionHours,
 			"sessionIdleMinutes": cfg.Auth.SessionIdleMinutes,
@@ -122,6 +122,39 @@ func (s *Server) handleGetSettings(c *gin.Context) {
 		"restart": restartSettings(cfg.Settings.Restart),
 		"certs":   s.certOptions(cfg),
 	})
+}
+
+// updateSettings 组装「在线更新」那一段设置的响应体。
+//
+// 逐字段列出而不是直接把 config.UpdateConfig 序列化出去：这一段要在原始字段之外
+// 再带上算出来的窗口状态，而且往那个结构里新增字段时也不该顺带出现在接口上。
+//
+// allowUnsignedUpdate 报的是**此刻是否有效**，而不是配置里那个布尔值。
+// 这不是图省事，是必须：界面上那个开关就是拿这个值渲染的，若报原始值，
+// 一段已经过期的窗口会显示成"开着"，用户此后在这一页做的任何一次保存都会带上
+// allowUnsignedUpdate: true，于是被判成一次"重新打开"、要求输密码——
+// 而用户压根没想动这一项。报有效值则这次保存带的是 false，正好把它清干净。
+//
+// allowUnsignedExpiresAt 是窗口到期的 Unix 秒，没有有效窗口时为 0。
+// allowUnsignedTtlHours 让界面上的说明文字与后端的 TTL 取同一个数，不必各写一遍。
+func updateSettings(u config.UpdateConfig, now time.Time) gin.H {
+	expiresAt := int64(0)
+	if u.UnsignedUpdateAllowed(now) {
+		if exp, ok := u.UnsignedUpdateExpiry(now); ok {
+			expiresAt = exp.Unix()
+		}
+	}
+	return gin.H{
+		"manifestUrl":            u.ManifestURL,
+		"releaseUrl":             u.ReleaseURL,
+		"githubRepo":             u.GitHubRepo,
+		"signKey":                u.SignKey,
+		"allowUnsignedUpdate":    expiresAt > 0,
+		"allowUnsignedExpiresAt": expiresAt,
+		"allowUnsignedTtlHours":  int(config.AllowUnsignedUpdateTTL / time.Hour),
+		"about":                  u.About,
+		"description":            u.Description,
+	}
 }
 
 // certOption 是「面板 HTTPS → 选择证书」下拉框需要的最小证书信息。
@@ -189,6 +222,11 @@ type updateSettingsReq struct {
 		// 若按值接收，任何一次没带这个字段的设置提交都会把它重置成关闭。
 		AllowUnsignedUpdate *bool   `json:"allowUnsignedUpdate"`
 		About               *string `json:"about"`
+		// Account / Password 只在「打开 AllowUnsignedUpdate」这一次提交上要求，
+		// 其余字段都不需要（见 handleUpdateSettings 里那段口令复核）。
+		// 放在 update 这一层而不是请求顶层：它属于这一项改动的凭据，不是整份设置的。
+		Account  string `json:"account"`
+		Password string `json:"password"`
 	} `json:"update"`
 	Auth *struct {
 		SessionHours *int `json:"sessionHours"`
@@ -420,6 +458,59 @@ func (s *Server) handleUpdateSettings(c *gin.Context) {
 		}
 	}
 
+	// 打开「允许未验签的更新包」要当场再验一次管理员口令。
+	//
+	// 这个开关一旦为真，任何一条有效会话都能上传一个 tar.gz 把面板二进制换掉，
+	// 也就是在这台机器上执行任意代码。它与「导出/导入备份」同级，用同一套复核
+	//（见 handleExportConfig），而不是只靠会话本身——会话是这条链上最容易被拿到的一环
+	//（XSS、借来的浏览器、忘了登出的机器），而它下面这一项能把整个程序换掉。
+	//
+	// 只在**从没有有效窗口到有**这一次要求，理由有两条：其一，关掉它、改清单地址、
+	// 填公钥都不需要凭据——那些改动要么在收紧，要么与这道口子无关；其二，窗口已经开着
+	// 的时候不再问，否则用户在这一页上动任何一项都要输一遍密码。
+	//
+	// 用 before 判"当前有没有窗口"，与下面 Update 闭包里的记时判定是同一个口径；
+	// 两者之间的并发窗口不影响结论：并发的两次打开里至多一次会记起点，而两次都过了口令。
+	unsignedNow := time.Now()
+	if req.Update != nil && req.Update.AllowUnsignedUpdate != nil && *req.Update.AllowUnsignedUpdate &&
+		!before.Update.UnsignedUpdateAllowed(unsignedNow) {
+		// 这次校验与另外五处「已登录之后再验一次当前密码」共用一份失败计数（见 reauth.go）。
+		//
+		// 闸只包住这一支、不放在处理器开头：这个接口保存的是整页设置，其中绝大多数改动
+		// 根本不问密码，把闸提到外面就变成"在别处猜错几次密码，连主题色都改不了"。
+		//
+		// 提前返回不会留下半套设置：这里还在校验段，落盘的 Update 闭包在后面
+		//（与下面那一支 403 同理）。
+		if !s.reauthAllowed(c) {
+			return
+		}
+		if !adminCredentialsOK(before.Auth, req.Update.Account, req.Update.Password) {
+			s.reauthFail(c)
+			// 403 而非 401：401 会让前端拦截器强制登出跳登录页，而这里只是这一项改动的
+			// 凭据没对上，应当停在设置页提示（与 handleExportConfig 同）。
+			s.deps.Log.Warn("设置：打开「允许未验签的更新包」的身份复核失败，已拒绝",
+				"operator", operator(c), "ip", c.ClientIP())
+			respondError(c, http.StatusForbidden, "账户或密码错误，「允许未验签的更新包」未打开")
+			return
+		}
+		s.reauthOK(c)
+	}
+
+	// 访问路径前缀：它会被原样拼进 gin 的路由组，也会被写进入口页的 <base href>。
+	// 两个去处都不容错——冒号星号在路由组里是通配符语法，引号能从 HTML 属性里逃出去，
+	// ".." 能把整页的资源引用挪到上一层。所以在这里就把形状挡掉，而不是等
+	// normalizeBasePath 把非法值悄悄归零（那样界面上会显示保存成功、前缀却没生效）。
+	//
+	// 判据直接借用 normalizeBasePath 本身：填了内容却归一化成空，就是非法。
+	// 这样校验与落盘用的是同一套规则，不会哪天各自漂走。全是斜杠视同留空（即根路径）。
+	if req.Panel != nil && req.Panel.BasePath != nil {
+		raw := strings.TrimSpace(*req.Panel.BasePath)
+		if strings.Trim(raw, "/") != "" && normalizeBasePath(raw) == "" {
+			respondError(c, http.StatusBadRequest, "访问路径前缀只能用字母、数字与 - _ . ~，多级用 / 分隔（如 /mantou 或 /admin/mantou）")
+			return
+		}
+	}
+
 	// 面板入站防护：同样先按加载期的规则规范化，再校验，最后确认它不会把
 	// 提交这次改动的人本人关在门外（见 checkFirewallLockout）。
 	//
@@ -497,7 +588,20 @@ func (s *Server) handleUpdateSettings(c *gin.Context) {
 				cfg.Update.SignKey = strings.TrimSpace(*req.Update.SignKey)
 			}
 			if req.Update.AllowUnsignedUpdate != nil {
-				cfg.Update.AllowUnsignedUpdate = *req.Update.AllowUnsignedUpdate
+				if *req.Update.AllowUnsignedUpdate {
+					// 记起点只在此刻没有有效窗口时做：窗口开着的时候不重新计时，
+					// 否则这一页上任何一次保存都会顺手把它续期，那这个窗口就又变成
+					// 一扇不会关的门了（见 config.UpdateConfig.AllowUnsignedSince）。
+					if !cfg.Update.UnsignedUpdateAllowed(unsignedNow) {
+						cfg.Update.AllowUnsignedSince = unsignedNow.Unix()
+					}
+					cfg.Update.AllowUnsignedUpdate = true
+				} else {
+					// 关闭时把起点一并清掉：留着它只会让下次打开时算出一段
+					// 从上次算起、可能早已过期的窗口。
+					cfg.Update.AllowUnsignedUpdate = false
+					cfg.Update.AllowUnsignedSince = 0
+				}
 			}
 			if req.Update.About != nil {
 				cfg.Update.About = *req.Update.About
@@ -571,6 +675,22 @@ func (s *Server) handleUpdateSettings(c *gin.Context) {
 		s.limiter.update(after.Auth.LoginMaxFails, 5*time.Minute, lockFor)
 	}
 
+	// 「允许未验签的更新包」的开合留一条审计记录：这一项决定的是「能不能不验签就把
+	// 面板二进制换掉」，事后要查得到是谁在什么时候打开的、有效到几点。
+	// 打开用 Warn（这是一段主动放宽的时间），关闭用 Info。
+	//
+	// 判据同时看布尔值与起点：重新打开一段已过期的窗口时布尔值没变，只有起点在动。
+	if before.Update.AllowUnsignedUpdate != after.Update.AllowUnsignedUpdate ||
+		before.Update.AllowUnsignedSince != after.Update.AllowUnsignedSince {
+		if exp, ok := after.Update.UnsignedUpdateExpiry(unsignedNow); ok {
+			s.deps.Log.Warn("设置：已打开「允许未验签的更新包」，到期后自动失效",
+				"operator", operator(c), "ip", c.ClientIP(), "expiresAt", exp.Format(time.RFC3339))
+		} else {
+			s.deps.Log.Info("设置：已关闭「允许未验签的更新包」",
+				"operator", operator(c), "ip", c.ClientIP())
+		}
+	}
+
 	restartRequired := before.Panel.Port != after.Panel.Port ||
 		normalizeBasePath(before.Panel.BasePath) != normalizeBasePath(after.Panel.BasePath) ||
 		before.Panel.HTTPS.Enabled != after.Panel.HTTPS.Enabled ||
@@ -580,7 +700,11 @@ func (s *Server) handleUpdateSettings(c *gin.Context) {
 	// panelFirewall.current），保存完下一个连接与下一个请求就按新规则走。
 	// 把它算进重启项只会让一次"加个白名单"变成一次面板重启。
 
-	respondOK(c, gin.H{"ok": true, "restartRequired": restartRequired})
+	// 响应里带上「在线更新」那一段的当前状态：窗口到期时刻是算出来的，
+	// 前端拿不到它就只能自己按 TTL 猜一个，两边的时钟一有偏差提示就不对了。
+	// 顺带也让「过期后这次保存把开关清掉」这件事在界面上立刻可见，不必重载整页设置
+	//（重载会把用户在其它段里还没保存的输入一起冲掉）。
+	respondOK(c, gin.H{"ok": true, "restartRequired": restartRequired, "update": updateSettings(after.Update, unsignedNow)})
 
 	if restartRequired {
 		s.requestPanelRestart("面板监听或 HTTPS 配置已变更，正在优雅重启面板")

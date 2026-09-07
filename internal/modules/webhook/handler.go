@@ -8,9 +8,11 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path"
 	"strings"
 	"time"
 
+	"mantou/internal/config"
 	"mantou/internal/errpage"
 	"mantou/internal/ipx"
 	"mantou/internal/modules/notify"
@@ -52,23 +54,24 @@ func (m *Module) serve(w http.ResponseWriter, r *http.Request) {
 	// 启用 HTTPS 后强制校验 Host：既挡住拿 IP 直连绕过域名的探测，
 	// 也保证证书与访问域名始终对得上（见 config.WebhookServer 的说明）。
 	// 共享端口时同样校验：那条监听上还挂着别人的站点，只有域名能证明这个请求是找本模块的。
-	m.mu.Lock()
-	spec := m.spec
-	m.mu.Unlock()
+	//
+	// 无锁读（见 Module.spec 的说明）：这里是每条入站请求都要走的路，
+	// 而 m.mu 上压着 Reload 里那些会阻塞的监听启停动作。
+	spec := m.spec.Load()
 	if (spec.tls || spec.shared) && !hostMatches(r.Host, spec.domain) {
 		m.reject(w, r, nil, nil, remote, http.StatusMisdirectedRequest, "访问域名不匹配", start, false)
 		return
 	}
 
-	path := strings.Trim(r.URL.Path, "/")
+	routeKey := lookupPath(r.URL)
 	table := m.routes.Load()
-	rc := table.byPath[path]
+	rc := table.byPath[routeKey]
 	// 停用的接收器只在它自己的试运行开着时才开门（见 testrun.go）。
 	// 这是"先调通再上线"的唯一走法：把一个还没配好的接收器挂到公网上去试，
 	// 意味着调试期间的每一条消息都会真的发进群里。
 	testing := false
 	if rc == nil {
-		if cand := table.byPathAll[path]; cand != nil && m.tests.active(cand.cfg.ID, start) {
+		if cand := table.byPathAll[routeKey]; cand != nil && m.tests.active(cand.cfg.ID, start) {
 			rc, testing = cand, true
 		}
 	} else {
@@ -86,13 +89,13 @@ func (m *Module) serve(w http.ResponseWriter, r *http.Request) {
 			Title:  "这个推送地址不存在",
 			Detail: "地址对上了主机，但后面这段路径没有对应的接收器。",
 			Hint:   "请核对第三方系统里填的推送地址。",
-			Where:  strutil.Truncate(r.Host+"/"+path, 160, "…"),
+			Where:  strutil.Truncate(r.Host+"/"+routeKey, 160, "…"),
 			Plain:  "not found",
 		})
 		// 记录要配额，计数不要：计数是纯 atomic，不吃内存也不写盘，
 		// 而扫描期间它是面板上唯一还在动的信号（总览的"拒收"取自 Metrics）。
 		if ok, merged := m.anon.take(start); ok {
-			reason := "入站路径不存在：" + strutil.Truncate(path, 128, "…") + mergedNote(merged)
+			reason := "入站路径不存在：" + strutil.Truncate(routeKey, 128, "…") + mergedNote(merged)
 			// 这一条的原文只有方法、路径与请求头——正文在这里还没读（检查顺序见本文件顶部）。
 			// 留存它仍然值得：第三方系统把地址填错（多了一层前缀、少了一段路径）时，
 			// 面板上能看到对方实际请求的是哪个路径，这是最常见的一类"配好了却收不到"。
@@ -159,7 +162,7 @@ func (m *Module) serve(w http.ResponseWriter, r *http.Request) {
 			Title:  "这个推送地址工作正常",
 			Detail: "它只接收第三方系统推送过来的消息，用浏览器直接打开不会产生任何消息。",
 			Hint:   "把当前这段地址整个填进第三方系统的推送 / 回调地址里即可。",
-			Where:  strutil.Truncate(r.Host+"/"+path, 160, "…"),
+			Where:  strutil.Truncate(r.Host+"/"+routeKey, 160, "…"),
 		})
 		return
 	}
@@ -706,6 +709,34 @@ func sameSecret(got, want string) bool {
 }
 
 // ---- 小工具 ----
+
+// lookupPath 把请求的 URL 路径折成与配置里同一套写法的查找键。
+//
+// 表里的键全都是 config.NormalizeWebhookPath 的输出（去首尾斜杠、折叠重复斜杠、
+// 逐段去空白），三条写入路径——面板保存、整份导入、手改 config.json——都过它。
+// 请求侧要是只做 strings.Trim(r.URL.Path, "/")，两边的写法就对不齐：
+//
+//	POST /hook//abc      → "hook//abc"    配置里是 "hook/abc" ⇒ 404
+//	POST /./hook         → "./hook"                          ⇒ 404
+//	POST /x/../hook      → "x/../hook"                       ⇒ 404
+//
+// 这三种都是"地址明明是对的，第三方系统那边却一直报推送失败"，而面板上除了一条
+// "入站路径不存在"什么线索都没有——多余的斜杠尤其常见，粘贴地址时带出一个就中。
+//
+// path.Clean 负责消掉 `.`/`..` 段与重复斜杠；先补一个前导 `/` 是必须的，
+// 否则 `..` 会被留在结果里（Clean 只在绝对路径下才把它收到根）。剩下的交给
+// 与配置侧同一个函数，规范化只留一处实现——两处各写一遍，迟早会有一处漏掉。
+//
+// 用已解码的 r.URL.Path 而不是 EscapedPath()：`%2F` 之类的编码由 net/url 还原成
+// 普通字符后一并参与折叠，"编码过的写法也能命中"是这里想要的。这不会放宽任何鉴权：
+// 折出来的键必须与某个接收器**完全相等**才算命中，对不上仍然是 404（连"路径存在
+// 但停用"都不区分，见 serve 里那段说明），而路径本身的熵一点没少。
+func lookupPath(u *url.URL) string {
+	if u == nil {
+		return ""
+	}
+	return config.NormalizeWebhookPath(path.Clean("/" + strings.TrimSpace(u.Path)))
+}
 
 // allowedMethod 允许的请求方法。
 // GET 也放行：有些系统只能在 URL 上带参数推送（见 event.go 的 query 说明）。

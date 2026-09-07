@@ -4,10 +4,13 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
 	"unicode/utf8"
+
+	"mantou/internal/fsx"
 )
 
 func TestReplaceRestoresCurrentConfigWhenSaveFails(t *testing.T) {
@@ -89,6 +92,34 @@ func TestLoadNormalizesMigratedFlatWebServiceTLSMinVersion(t *testing.T) {
 	child := got[0].Children[0]
 	if !child.TLS || child.TLSMinVersion != "1.2" {
 		t.Fatalf("expected migrated HTTPS child with TLS 1.2, got %#v", child)
+	}
+}
+
+// TestLoadRaisesWeakWebServiceTLSMinVersion 加载期把显式写下的 1.0 / 1.1 抬到 1.2（审计 L-06）。
+//
+// 上面两条盯的是"没写"（空值、旧扁平结构迁移过来），这条盯的是"写了个弱的"。
+// 保存接口本来就只收 1.2/1.3（validateWebService），所以能带着 1.0 进来的只有三条路：
+// 手改 config.json、导入旧备份、老版本迁移——三条都不过保存校验，只剩这里兜着。
+func TestLoadRaisesWeakWebServiceTLSMinVersion(t *testing.T) {
+	for _, weak := range []string{"1.0", "1.1"} {
+		t.Run(weak, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.json")
+			data := `{"version":1,"panel":{"listen":"0.0.0.0","port":25666},"webServices":[{"id":"parent","name":"site","enabled":true,"port":443,"ipFamily":"both","children":[{"id":"child","enabled":true,"tls":true,"tlsMinVersion":"` + weak + `"}]}]}`
+			if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			manager := NewManager(path)
+			if err := manager.Load(); err != nil {
+				t.Fatal(err)
+			}
+			got := manager.Get().WebServices
+			if len(got) != 1 || len(got[0].Children) != 1 {
+				t.Fatalf("unexpected Web services: %#v", got)
+			}
+			if v := got[0].Children[0].TLSMinVersion; v != "1.2" {
+				t.Fatalf("expected weak %s to be raised to 1.2, got %q", weak, v)
+			}
+		})
 	}
 }
 
@@ -412,5 +443,51 @@ func TestMigrateWOLClampsAndIsIdempotent(t *testing.T) {
 		if got := c.WOLDevices[i].Schedule; got != want[i] {
 			t.Fatalf("设备 %d 二次迁移后被改动为 %+v，期望保持 %+v", i, got, want[i])
 		}
+	}
+}
+
+// TestSaveTightensDataDir 每次保存配置都会把配置所在目录收紧到 0700。
+//
+// 这个目录里有 config.json（各模块凭据的密文）与 master.key（解开它们的唯一钥匙），
+// 两个文件本身是 0600，但目录 0755 意味着同机任何一个用户都能列出它们、看到
+// master.key 在不在、配置多大、什么时候改的。
+//
+// 特意从一个**已经存在的 0755 目录**出发：升级上来的实例就是这个样子，
+// 而 os.MkdirAll 对已存在的目录不改权限——只改它的 mode 参数救不了这批人。
+// 保存配置是面板最常走的写路径（改任何一项设置都会走到），把收紧挂在这里，
+// 等于给启动时那次（cmd/mantou/main.go）加了一道随时会补上的兜底。
+func TestSaveTightensDataDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows 不按 POSIX 权限位表达目录权限（走 ACL）")
+	}
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil { // 绕开 umask，确保起点真的是 0755
+		t.Fatal(err)
+	}
+
+	manager := NewManager(filepath.Join(dir, "config.json"))
+	if err := manager.Load(); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Update(func(c *Config) { c.Panel.Port = 25777 }); err != nil {
+		t.Fatal(err)
+	}
+
+	fi, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fi.Mode().Perm(); got != fsx.DirMode {
+		t.Fatalf("保存配置后目录权限是 %#o，期望 %#o", got, fsx.DirMode)
+	}
+	// 收紧不能把内容弄丢：这条路上写的正是那份配置本身。
+	if manager.Snapshot().Panel.Port != 25777 {
+		t.Fatal("配置没保存进去")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "config.json")); err != nil {
+		t.Fatalf("配置文件不见了：%v", err)
 	}
 }

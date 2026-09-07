@@ -120,7 +120,7 @@ func parseSeg(seg string) segment {
 	}
 }
 
-// maxLookupVisits 一次取值最多访问多少个值。
+// maxLookupVisits 一次取值最多**交出**多少个值。
 //
 // 请求体本身有体积上限（MaxBodyKB，最大 4 MB），但那管不住展开的规模：
 // [*] 的每一层都按数组长度乘一次，而 4 MB 的 JSON 里能塞进两百万个数组元素。
@@ -129,6 +129,21 @@ func parseSeg(seg string) segment {
 // 给到 10000：一条带两万行数据的消息已经超出"配个模板转发一下"的范围，
 // 而真实场景里几十到几百行是常态。封顶之后仍然如实作答（见 lookupVisit 的说明）。
 const maxLookupVisits = 10000
+
+// maxLookupSteps 一次取值最多**走过**多少个数组元素。
+//
+// 上面那道闸数的是交出去的值，而真正花钱的是走过的节点，两者在一种很常见的路径形态下
+// 差得极远：body.列表[*].不存在的字段——每个元素都要做一次 map 查找，一个值也交不出来，
+// 于是那道闸永远不响，整份载荷从头走到尾。4 MB 里能塞进约两百万个数组元素，
+// 一个接收器又允许 50 条规则 × 20 个条件 = 1000 次取值，一条请求就能换来二十亿次
+// map 查找（而入站路径默认不限流、鉴权可以是 none）。这正是上面那道闸想防住、
+// 却因为数错了对象而没防住的东西。
+//
+// 取值上限的两倍：每个元素都产出一个值时步数≈值数，留一倍余量给中间层，
+// 于是"元素确实在产出值"的遍历一律先撞上面那道值闸，行为与从前完全一致；
+// 这道闸只在"走得多、产出少"时才响——正是漏掉的那一半。
+// 它响之后的答案与值封顶同向（见 lookupVisit 的说明）：给出的是下界，不是猜测。
+const maxLookupSteps = 2 * maxLookupVisits
 
 // lookupVisit 按段深度优先取值，对每个命中的值调用 fn，返回访问到的值个数。
 //
@@ -139,7 +154,8 @@ const maxLookupVisits = 10000
 // fn 返回 false 表示"够了"，整趟立刻结束——绝大多数算子只要第一个命中就能定论，
 // 原来的写法非要先把全部值算出来才开始比。
 //
-// capped 为真表示访问数撞上了 maxLookupVisits，后面还有值没看。
+// capped 为真表示这一趟没走完：交出的值撞上了 maxLookupVisits，或走过的元素撞上了
+// maxLookupSteps，两种情形下后面都还有值没看。
 // 调用方必须自己决定这时候怎么答（见 condRT.test 里逐个算子的处理）：
 // 一律当成"看完了"会让条件的含义随载荷大小悄悄改变。
 func lookupVisit(root any, segs []segment, fn func(any) bool) (n int, capped bool) {
@@ -156,7 +172,8 @@ func lookupVisit(root any, segs []segment, fn func(any) bool) (n int, capped boo
 // pathVisitor lookupVisit 的一次遍历状态。
 type pathVisitor struct {
 	fn     func(any) bool
-	n      int
+	n      int // 已交出的值个数，对 maxLookupVisits 计
+	steps  int // 已走过的数组元素个数，对 maxLookupSteps 计
 	capped bool
 }
 
@@ -199,6 +216,13 @@ func (p *pathVisitor) descend(v any, segs []segment) bool {
 		// 顺序与原来那版逐层平铺的结果一致（按下标从左到右），
 		// lookupOne 取的"第一个"因此没有变。
 		for _, it := range items {
+			// 步数在**进入元素之前**就计：这一层每次循环都是实打实的一次类型断言
+			// 加一次 map 查找，无论下面能不能产出值。计在 emit 里就是原先漏掉的那半。
+			if p.steps >= maxLookupSteps {
+				p.capped = true
+				return false
+			}
+			p.steps++
 			if !p.descend(it, segs[1:]) {
 				return false
 			}
@@ -442,6 +466,9 @@ func order(op string, v any, s, want string) bool {
 // 由此得出的结论对**任何小于上限的阈值**都仍然是准的：
 // 真实数量既然不小于 10000，那么"多于 500"必然成立、"少于 500"必然不成立。
 // 只有阈值本身写到 10000 以上时，这个答案才可能与数完之后不同。
+//
+// 撞上 maxLookupSteps（走得多、产出少）时返回的同样是一个下界，只是这个下界可能
+// 远小于上限——那种载荷里每个元素都取不到值，本来也数不出用户心里那个数。
 func countPath(root any, segs []segment) float64 {
 	var first any
 	got := false

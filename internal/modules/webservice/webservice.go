@@ -38,10 +38,28 @@ type Module struct {
 	log      *logx.Logger
 	servers  map[string]*listenServer // key = family|port
 	resolver CertResolver
+	// live 是 servers 的只读快照，供 Status 无锁读取。
+	//
+	// 为什么 Status 不能直接读 servers：Reload 关掉一个监听要走 srv.Shutdown，那是**最多 5 秒**
+	// 的等待（在途请求或 WebSocket 长连接都会让它等满），而 Reload 全程持 m.mu。
+	// Status 从前也取这把锁，于是「保存一次 Web 服务配置」期间 /api/overview 整个卡住——
+	// 总览页是用户此刻最可能盯着的那一页，而它卡住的时长与被重建的监听数成正比。
+	//
+	// 快照里存的是 *listenServer 而不是算好的计数：健康与否是运行期变化的
+	// （serve goroutine 退出时会 failed.Store(true)），存成定值就会一直显示保存那一刻的样子。
+	// healthy() 是一次原子读，放在读侧算没有代价。
+	live atomic.Pointer[[]*listenServer]
 	// webhookPeer 消息路由模块；与它共用端口时挂成一条域名路由（见 SetWebhookPeer）。
 	webhookPeer WebhookPeer
 	// closed 使 Close 幂等（见 Close 的说明）。同时保证 Close 之后不再有监听被拉起。
 	closed bool
+
+	// panelPort 是面板自己的管理端口，每次 Reload 刷新，供拨号闸读取（见 dialguard.go）。
+	//
+	// 用原子而不是普通字段：读它的是反代与探测的 Control 钩子，跑在各自的拨号
+	// goroutine 上，而写它的是 Reload——那条路持 m.mu，钩子那侧不可能也去取这把锁
+	//（Reload 关监听时会占住它数秒，见 live 字段的说明）。
+	panelPort atomic.Int64
 
 	// 运行态统计：独立于 servers 的重建，跨 Reload 保留，避免每次改配置连接数清零。
 	statMu sync.Mutex
@@ -147,22 +165,24 @@ func groupSignature(g *wsGroup) string {
 // New 创建 Web 服务模块。
 func New(log *logx.Logger) *Module {
 	m := &Module{
-		log:                 log,
-		servers:             make(map[string]*listenServer),
-		conns:               make(map[string]*int64),
-		accessCap:           logx.DefaultLogEntries, // Reload / SetAccessCap 会按实际配置覆盖
-		linkStatus:          make(map[string]linkState),
-		linkLogState:        make(map[string]bool),
-		suppressor:          newLogSuppressor(),
-		logRate:             newLogRateLimiter(),
-		rateLimiter:         ipx.NewIPLimiter(),
-		scanBan:             newScanBanner(),
-		probeStop:           make(chan struct{}),
-		probeKick:           make(chan struct{}, 1),
-		probeNext:           make(map[string]time.Time),
-		probeClientSecure:   newProbeClient(false),
-		probeClientInsecure: newProbeClient(true),
+		log:          log,
+		servers:      make(map[string]*listenServer),
+		conns:        make(map[string]*int64),
+		accessCap:    logx.DefaultLogEntries, // Reload / SetAccessCap 会按实际配置覆盖
+		linkStatus:   make(map[string]linkState),
+		linkLogState: make(map[string]bool),
+		suppressor:   newLogSuppressor(),
+		logRate:      newLogRateLimiter(),
+		rateLimiter:  ipx.NewIPLimiter(),
+		scanBan:      newScanBanner(),
+		probeStop:    make(chan struct{}),
+		probeKick:    make(chan struct{}, 1),
+		probeNext:    make(map[string]time.Time),
 	}
+	// 探测客户端要在 m 之后建：它们的拨号钩子是 m 的方法（见 dialguard.go），
+	// 写在上面那个复合字面量里引用不到 m。
+	m.probeClientSecure = m.newProbeClient(false)
+	m.probeClientInsecure = m.newProbeClient(true)
 	// 启动周期主动探测（独立于真实流量与日志限速），Close 时通过 probeStop 退出并等待。
 	m.probeWG.Add(1)
 	go m.runProbe()
@@ -181,10 +201,18 @@ func New(log *logx.Logger) *Module {
 // 从前这里两侧还各错一半：忽略证书那一版显式写着 ProxyFromEnvironment，另一版没给
 // Transport、于是用了同样采信环境变量的 http.DefaultTransport。合成一个构造函数之后，
 // 这条红线只有一处、两边不可能再走散。
-func newProbeClient(insecure bool) *http.Client {
+func (m *Module) newProbeClient(insecure bool) *http.Client {
 	tr := &http.Transport{
-		Proxy:                 nil,
-		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		Proxy: nil,
+		// 与反代 transport 挂同一个拨号钩子（见 buildChildHandler 处的说明）。
+		// 探测与真实转发必须走同一条红线：否则一条指向 169.254.169.254（或解析到本机
+		// 面板端口）的后端会在面板上显示"链接正常"（探测放行），而实际请求被拨号层拦下——
+		// 界面上绿着、访问却是 502，最难排查的正是这种。
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+			Control:   m.dialGuard,
+		}).DialContext,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          10,
 		IdleConnTimeout:       90 * time.Second,
@@ -242,6 +270,12 @@ func (m *Module) Reload(cfg *config.Config) error {
 	// 设置页保存时也会直接调用 SetAccessCap（不依赖 Reload），改完立即生效。
 	m.SetAccessCap(cfg.Settings.Log.MaxEntries)
 
+	// 面板端口交给拨号闸（见 dialguard.go）。必须在下面装配监听之前写：
+	// 新建的反代 Transport 一旦开始拨号就会读它，写晚了就有一个窗口是"闸门还不知道
+	// 面板端口是几号"。放在这里也顺带覆盖了「用户改了面板端口」那一路——
+	// 改设置同样会走 ReloadAll。
+	m.panelPort.Store(int64(cfg.Panel.Port))
+
 	// 按 (地址族, 端口) 聚合启用父项下的启用子项。
 	groups := make(map[string]*wsGroup)
 	var order []string
@@ -271,6 +305,33 @@ func (m *Module) Reload(cfg *config.Config) error {
 			ch := ws.Children[ci]
 			if !ch.Enabled {
 				continue
+			}
+			// 运行时防御第二道：反代后端不得指向本机的面板管理端口。
+			//
+			// 与上面那条父项端口检查是同一个性质——保存期已经拦过（见
+			// validateWebService），这里拦的是**没走过保存期**的配置：导入的备份、
+			// 手改的 config.json、旧版本迁移上来的数据。判定与保存期共用
+			// config.WebChild.UpstreamTargetingLocalPort，那里写着为什么要拦。
+			//
+			// 跳过整个子项而不是只摘掉那一条后端：留下的那半份后端列表意味着
+			// 用户以为在用的负载均衡少了一个成员，而界面上看不出来。整条跳过
+			// 至少会在访问时明确地打不开，跟着这条告警能找到原因。
+			if up, ok := ch.UpstreamTargetingLocalPort(cfg.Panel.Port); ok {
+				m.log.Warn("Web 服务子项的反代后端指向面板管理端口，已跳过该子项",
+					"service", ws.Name, "note", ch.Note, "upstream", up, "panelPort", cfg.Panel.Port)
+				continue
+			}
+			// 子项 ID 是运行期各项台账的键：连接数、访问日志过滤、链接状态、探测排期，
+			// 以及每 IP 限流的桶键。撞了 ID，这几样就在几个站点之间混成一份，
+			// 而界面上看不出异常——只是数字对不上、日志里出现别的站点的请求。
+			//
+			// 保存那一路已经保证唯一（见 server.normalizeWebChildIDs），这里拦的是
+			// 没走过保存期的配置：导入的备份、手改的 config.json。只告警、不跳过——
+			// 混账是可以看懂的错，而跳过等于让一个本来能用的站点直接打不开；
+			// 打开那个服务再保存一次就会自动补发新 ID。
+			if ch.ID == "" || present[ch.ID] {
+				m.log.Warn("Web 服务子项 ID 为空或与别处重复，其连接数/访问日志/限流将与另一子项混在一起，请打开该服务重新保存一次",
+					"service", ws.Name, "note", ch.Note, "childId", ch.ID)
 			}
 			present[ch.ID] = true
 			label := ws.Name
@@ -349,12 +410,19 @@ func (m *Module) Reload(cfg *config.Config) error {
 	}
 
 	// 关闭并移除：已不存在、配置已变化（需重建路由/TLS），或不健康（需重建重试）的监听。
+	//
+	// 并发关而不是逐个关：单个 s.close() 里那个 srv.Shutdown 最多等 5 秒，串行起来
+	// 就是 5 秒 × 监听数，而这段时间用户的「保存」请求一直悬着（页面上是转圈的按钮）。
+	// 各监听的 close 只碰自己那一份状态（自己的 srv / ln / 连接台账 / 连接池），
+	// 唯一共享的是那个并发安全的 logger，所以同时关是安全的。
+	var stale []*listenServer
 	for key, s := range m.servers {
 		if _, wanted := groups[key]; !wanted || s.sig != desiredSig[key] || !s.healthy() {
-			s.close()
+			stale = append(stale, s)
 			delete(m.servers, key)
 		}
 	}
+	closeListeners(stale)
 
 	// 启动新增或重建的监听；配置未变的已有监听保持运行（不重建、不重记启动日志）。
 	for _, key := range order {
@@ -378,6 +446,7 @@ func (m *Module) Reload(cfg *config.Config) error {
 		}
 		m.servers[key] = s
 	}
+	m.publishLive()
 	// 刷新主动探测目标：依据当前启用的子项重建清单（仅含已配置后端链接的子项），
 	// 并立即触发一次探测，避免改配置后等待一个完整探测周期才反映最新可达性。
 	m.refreshProbeTargets(groups)
@@ -393,18 +462,17 @@ func (m *Module) Reload(cfg *config.Config) error {
 // 两边差一点就会出现"端口被抢"或"根本没人监听"（见 config.NormalizeIPFamily）。
 func normalizeFamily(f string) string { return config.NormalizeIPFamily(f) }
 
-// tlsMinVersion 将配置中的版本字符串映射为 crypto/tls 常量；空或未知按 TLS 1.2。
+// tlsMinVersion 将配置中的版本字符串映射为 crypto/tls 常量。
+//
+// 只认 1.3，其余一律 1.2（含空值与任何无法识别的写法）。刻意不给 1.0/1.1 留分支：
+// 保存接口只接受 1.2/1.3（validateWebService），加载期又把非 1.3 的值统一抬到 1.2
+// （config/store.go 的 Load），所以那两个值到不了这里；真到了也说明上游的收紧被拆掉了，
+// 此时按 1.2 兜底才是对的方向（审计 L-06）。
 func tlsMinVersion(s string) uint16 {
-	switch strings.TrimSpace(s) {
-	case "1.0":
-		return tls.VersionTLS10
-	case "1.1":
-		return tls.VersionTLS11
-	case "1.3":
+	if strings.TrimSpace(s) == "1.3" {
 		return tls.VersionTLS13
-	default:
-		return tls.VersionTLS12
 	}
+	return tls.VersionTLS12
 }
 
 // Close 关闭全部 Web 服务，并停止周期主动探测 goroutine（等待其退出，避免写已释放状态）。
@@ -417,11 +485,14 @@ func (m *Module) Close() error {
 		return nil
 	}
 	m.closed = true
+	all := make([]*listenServer, 0, len(m.servers))
 	for key, s := range m.servers {
-		s.close()
+		all = append(all, s)
 		delete(m.servers, key)
 	}
-	close(m.probeStop) // 通知探测 goroutine 退出
+	m.publishLive()
+	closeListeners(all) // 并发关，理由同 Reload 里那处
+	close(m.probeStop)  // 通知探测 goroutine 退出
 	m.mu.Unlock()
 	m.probeWG.Wait() // 等待探测 goroutine 完全退出后再返回
 	// 主动探测那两个客户端的连接池同样要自己关（与 listener.close 里同一个道理：Go 不会
@@ -441,12 +512,48 @@ func (m *Module) Close() error {
 	return nil
 }
 
-// Status 实现 module.StatusReporter。
-func (m *Module) Status() module.Status {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	active, healthy := 0, true
+// publishLive 把当前监听集合发布成一份只读快照，供 Status 无锁读取。
+// **调用方须持有 m.mu**，且必须在每一次改动 m.servers 之后调用一次。
+func (m *Module) publishLive() {
+	out := make([]*listenServer, 0, len(m.servers))
 	for _, s := range m.servers {
+		out = append(out, s)
+	}
+	m.live.Store(&out)
+}
+
+// closeListeners 并发关掉一批监听，全部收尾后才返回。
+// 空切片直接返回，不起 goroutine 也不建 WaitGroup。
+func closeListeners(list []*listenServer) {
+	if len(list) == 0 {
+		return
+	}
+	if len(list) == 1 {
+		list[0].close()
+		return
+	}
+	var wg sync.WaitGroup
+	wg.Add(len(list))
+	for _, s := range list {
+		go func(s *listenServer) {
+			defer wg.Done()
+			s.close()
+		}(s)
+	}
+	wg.Wait()
+}
+
+// Status 实现 module.StatusReporter。
+//
+// 读的是 live 那份快照，不取 m.mu：Reload / Close 期间那把锁可能被 srv.Shutdown 占住数秒
+// （见 live 字段的说明），而总览页每隔几秒就要问一次本模块的状态。
+func (m *Module) Status() module.Status {
+	var servers []*listenServer
+	if p := m.live.Load(); p != nil {
+		servers = *p
+	}
+	active, healthy := 0, true
+	for _, s := range servers {
 		if s.healthy() {
 			active++
 		} else {
@@ -455,7 +562,7 @@ func (m *Module) Status() module.Status {
 	}
 	return module.Status{
 		Name:    "webservice",
-		Total:   len(m.servers),
+		Total:   len(servers),
 		Active:  active,
 		Healthy: healthy,
 	}

@@ -44,6 +44,11 @@ const (
 	sessionCookieLegacy = "mantou_session"        // 修复前的旧名字（只读，永不写入）
 )
 
+// ctxSessionToken 是 authRequired 校验通过后，把「本次请求真正用的那条令牌」
+// 存进 gin 上下文的键名。退出登录、关标签信标、改密码换发这些接口都要作用在
+// **同一条**令牌上，各自再去请求里猜一遍必然会与鉴权那次的结论分叉（见 extractToken）。
+const ctxSessionToken = "sessionToken"
+
 // requestLogger 仅记录服务端异常（5xx）。普通请求（2xx/3xx/4xx）不再逐条刷屏，
 // 避免日志被面板访问记录淹没。如需排查访问情况，可将全局日志级别调为 debug，
 // 此时访问日志会以 debug 级别输出（默认 info 级别下不出现）。
@@ -65,6 +70,60 @@ func (s *Server) requestLogger() gin.HandlerFunc {
 			return
 		}
 		log.Debug("面板访问", args...)
+	}
+}
+
+// securityHeaders 给面板的每一个响应带上四道与内容无关的安全头。
+//
+// 起因（审计 NEW-3）：这三类头此前只存在于**用户站点**那一侧
+// （internal/modules/webservice/middleware.go 的 withSecurityHeaders，由 WebChild.FrameDeny
+// 控制），面板自己一个都不发。
+//
+// # 逐项理由与取值
+//
+//   - frame-ancestors 'none' + X-Frame-Options: DENY —— 反点击劫持。
+//     两个都发：CSP 的 frame-ancestors 是现行标准且优先级更高，X-Frame-Options 留给
+//     老浏览器兜底（与 webservice 那侧同一取舍）。取 none/DENY 而不是 self/SAMEORIGIN：
+//     面板前端一个 iframe 都不用（web/src 全域无 iframe），没有需要放行的自嵌套场景，
+//     那就取最严的一格。
+//
+//     单独看，这一道今天挡不住什么：会话 Cookie 是 SameSite=Lax，跨站 iframe 里根本
+//     带不上 Cookie，被框住的只会是登录页。它的价值在于**不依赖那个前提**——
+//     哪天有人为了适配某个反代把 SameSite 放宽成 None，这道头是唯一还站着的那个。
+//
+//   - Referrer-Policy: same-origin —— 同源请求照旧带完整 Referer（面板内部本来就没人读它，
+//     CSRF 判定走 Sec-Fetch-Site / Origin，见 csrfGuard），跨源一律不带。
+//     挡的是「关于」页与「Web 服务」页那些 target=_blank 外链把面板 origin + 访问路径前缀
+//     （basePath，常被当作一层隐蔽性）送给第三方站点。
+//     浏览器默认的 strict-origin-when-cross-origin 仍会送出 origin，不够。
+//
+//   - X-Content-Type-Options: nosniff —— 此前只有 /uploads/* 与错误页带（server.go:327、
+//     internal/errpage），API 的 JSON 与前端静态资源都没有。JSON 里能出现用户填的字符串，
+//     被嗅探成 HTML 就是一条同域脚本执行路径；代价只有"类型标错的脚本/样式表会被拦"，
+//     而这些资源的 Content-Type 由 buildAssetETags 那一侧的 embed FS 决定，不会标错。
+//
+// # 为什么不发 default-src / script-src
+//
+// 那是另一件事（抗 XSS），且面板前端是 Vue + Element Plus：运行期会注入 style 标签，
+// 收紧 script-src/style-src 必须配合构建产物一起改并逐页验证。本次只补齐审计点到的三类；
+// 真要上完整 CSP，得先有一轮浏览器侧的回归。
+//
+// # 为什么排在最外层（仅次于恢复中间件）
+//
+// firewallGuard 的注释写着"除恢复之外没有东西该排在访问控制前面——被拒的来源不该有机会
+// 触发日志、压缩、CSRF 判定等任何工作"。这一条是那句话的**唯一例外**，理由是它的成本就是
+// 四次 header map 写入，与它自己那句 errpage.Write（渲染 + 写一整页 HTML）差着数量级，
+// 谈不上"给被拒的来源做工作"。换来的是一条没有例外的性质：面板发出的每个响应都带这四道头，
+// 包括防护自己的 403 与 429、恢复中间件兜下的 500。有例外的话，日后每加一条早退路径
+// 都得重新问一遍"这条带不带头"。
+func (s *Server) securityHeaders() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		h := c.Writer.Header()
+		h.Set("Content-Security-Policy", "frame-ancestors 'none'")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "same-origin")
+		h.Set("X-Content-Type-Options", "nosniff")
+		c.Next()
 	}
 }
 
@@ -162,10 +221,14 @@ func hasSessionCookie(r *http.Request) bool {
 // authRequired 校验会话令牌；未登录返回 401。
 // 校验分两层：先验 JWT 签名与有效期，再验服务端会话状态——
 // 关闭最后一个标签 / 显式退出后即使 JWT 未过期也应失效；刷新页面在宽限内复用同一会话则保活。
+//
+// 请求可能同时带来多条候选令牌（Bearer 头 + 几个名字的 Cookie，见 sessionTokens），
+// 这里**逐条试到有一条通过为止**。只认第一条的话，浏览器里任何一条过期或残留的 Cookie
+// 都能把同一个请求里那条有效的令牌挡在门外，而使用者看到的只是一个无从解释的 401。
 func (s *Server) authRequired() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		token := s.extractToken(c)
-		if token == "" {
+		tokens := s.sessionTokens(c)
+		if len(tokens) == 0 {
 			respondUnauthorized(c, "未登录")
 			c.Abort()
 			return
@@ -173,20 +236,6 @@ func (s *Server) authRequired() gin.HandlerFunc {
 		// Snapshot 而非 Get：本中间件在**每个已认证 API 请求**上执行，只读三个字段
 		// （JWT 密钥、用户名、闲置超时），没有理由为此深拷贝整份配置（面板轮询本就持续产生请求）。
 		cfg := s.deps.Config.Snapshot()
-		username, err := auth.ParseToken(cfg.Auth.JWTSecret, token)
-		if err != nil {
-			respondUnauthorized(c, "会话无效或已过期")
-			c.Abort()
-			return
-		}
-		// 账户主体一致性校验：修改用户名后，旧令牌的 subject 不再等于当前用户名，
-		// 其余旧会话应一并失效（此前仅注销当前会话，旧会话因未比对 sub 而残留有效）。
-		if username != cfg.Auth.Username {
-			respondUnauthorized(c, "会话已失效，请重新登录")
-			c.Abort()
-			return
-		}
-		// 服务端会话校验：关闭/退出后失效；刷新场景在宽限内被 valid() 救活。
 		// 后台轮询/信标请求带 X-Mantou-Silent:1，revive=false → 不触发救活，
 		// 使「关闭最后一个标签页」能可靠到期失效，不受周期轮询干扰。
 		//
@@ -195,34 +244,101 @@ func (s *Server) authRequired() gin.HandlerFunc {
 		// 各管一头；用途是给关窗口注销兜底——信标发不出去时（崩溃/强杀/断电）由它收尾。
 		silent := c.GetHeader("X-Mantou-Silent") == "1"
 		idle := time.Duration(cfg.Auth.SessionIdleMinutes) * time.Minute
-		if _, ok := s.sessions.valid(token, username, !silent, idle); !ok {
-			respondUnauthorized(c, "会话已失效，请重新登录")
+
+		var token, username, reason string
+		for _, cand := range tokens {
+			name, err := auth.ParseToken(cfg.Auth.JWTSecret, cand)
+			if err != nil {
+				// 只留第一条（优先级最高那条）的原因：单条候选时与逐条判定的旧行为逐字一致。
+				if reason == "" {
+					reason = "会话无效或已过期"
+				}
+				continue
+			}
+			// 账户主体一致性校验：修改用户名后，旧令牌的 subject 不再等于当前用户名，
+			// 其余旧会话应一并失效（此前仅注销当前会话，旧会话因未比对 sub 而残留有效）。
+			if name != cfg.Auth.Username {
+				if reason == "" {
+					reason = "会话已失效，请重新登录"
+				}
+				continue
+			}
+			// 服务端会话校验：关闭/退出后失效；刷新场景在宽限内被 valid() 救活。
+			// 排在最后一个：它带副作用（保活/救活），不该为一条签名都对不上的候选去碰会话表。
+			if _, ok := s.sessions.valid(cand, name, !silent, idle); !ok {
+				if reason == "" {
+					reason = "会话已失效，请重新登录"
+				}
+				continue
+			}
+			token, username = cand, name
+			break
+		}
+		if token == "" {
+			respondUnauthorized(c, reason)
 			c.Abort()
 			return
 		}
+		c.Set(ctxSessionToken, token)
 		c.Set("username", username)
 		c.Next()
 	}
 }
 
-// extractToken 依次从 Cookie 与 Authorization 头提取令牌。
+// sessionTokens 收集本次请求带来的候选会话令牌，按「优先采信」的顺序返回，去重。
 //
-// 三个名字都要试，且先试与当前协议相符的那个（见 sessionCookie / sessionCookieSecure /
-// sessionCookieLegacy）：协议切换后浏览器可能同时存着多条，只认一个名字会在切回去时
-// 拿到另一时期的旧令牌。取相符者优先即可；旧名字排在最后，仅用于让升级前已登录的会话继续有效。
-func (s *Server) extractToken(c *gin.Context) string {
+// Bearer 排在 Cookie 之前：请求头是调用方**显式**写上去的，Cookie 是浏览器自动附带的。
+// 两者同时出现时，显式的那条才是调用方的意思——反过来排，一条早先留在浏览器里的
+// 残留 Cookie 就能永久盖掉脚本手动带上的有效令牌，且没有任何办法从服务端清掉它
+// （清除也是一条 Set-Cookie，见本文件顶部三个 Cookie 名字的由来）。
+//
+// 三个 Cookie 名字都要试，且先试与当前协议相符的那个：协议切换后浏览器可能同时存着多条，
+// 只认一个名字会在切回去时拿到另一时期的旧令牌。旧名字排在最后，仅用于让升级前已登录的
+// 会话继续有效。
+func (s *Server) sessionTokens(c *gin.Context) []string {
+	out := make([]string, 0, 4)
+	add := func(v string) {
+		if v == "" {
+			return
+		}
+		for _, had := range out {
+			if had == v {
+				return
+			}
+		}
+		out = append(out, v)
+	}
+	if h := c.GetHeader("Authorization"); strings.HasPrefix(h, "Bearer ") {
+		add(strings.TrimSpace(strings.TrimPrefix(h, "Bearer ")))
+	}
 	names := [3]string{sessionCookie, sessionCookieSecure, sessionCookieLegacy}
 	if c.Request.TLS != nil {
 		names = [3]string{sessionCookieSecure, sessionCookie, sessionCookieLegacy}
 	}
 	for _, name := range names {
-		if v, err := c.Cookie(name); err == nil && v != "" {
-			return v
+		if v, err := c.Cookie(name); err == nil {
+			add(v)
 		}
 	}
-	h := c.GetHeader("Authorization")
-	if strings.HasPrefix(h, "Bearer ") {
-		return strings.TrimSpace(strings.TrimPrefix(h, "Bearer "))
+	return out
+}
+
+// extractToken 返回本次请求的会话令牌。
+//
+// authRequired 跑过之后一律取它验过的那一条：退出登录、关标签信标、改密码换发这几个接口
+// 都要作用在鉴权认定的那条令牌上。各自重新猜一遍的话，请求里带着多条候选时就会与鉴权
+// 那次的结论分叉——例如改密码那条路上 revokeAll(除本条之外全撤) 会把真正在用的会话撤掉，
+// 留下一条早已失效的。
+//
+// 上下文里没有（未经 authRequired 的直接调用，例如单元测试）时退回候选里优先级最高的一条。
+func (s *Server) extractToken(c *gin.Context) string {
+	if v, ok := c.Get(ctxSessionToken); ok {
+		if tok, _ := v.(string); tok != "" {
+			return tok
+		}
+	}
+	if toks := s.sessionTokens(c); len(toks) > 0 {
+		return toks[0]
 	}
 	return ""
 }

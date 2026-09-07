@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -15,6 +16,8 @@ import (
 
 	"mantou/internal/auth"
 	"mantou/internal/config"
+	"mantou/internal/ipx"
+	"mantou/internal/modules/cron"
 	"mantou/internal/modules/wol"
 	"mantou/internal/runstats"
 )
@@ -168,10 +171,122 @@ func normalizeBackendURL(u string) string {
 	if u == "" {
 		return u
 	}
-	if strings.Contains(u, "://") {
+	if hasURLScheme(u) {
 		return u
 	}
 	return "http://" + u
+}
+
+// hasURLScheme 判断地址开头是不是已经带了协议（形如 scheme://）。
+//
+// 不写成 strings.Contains(u, "://")：那是"字符串里任何位置出现过 :// 就算带了协议"，
+// 于是 example.com/go?next=http://x 这种地址被判成已带协议、原样存下去，
+// 而它其实缺前缀——渲染成链接后点开跳的是面板自己那一页。协议前缀只可能在开头，
+// 判据也就只该看开头这一段。
+//
+// 协议名的字符集按 RFC 3986：首字符必须是字母，其后可以是字母、数字、+、-、.
+func hasURLScheme(u string) bool {
+	i := strings.Index(u, "://")
+	if i <= 0 {
+		return false
+	}
+	for j := 0; j < i; j++ {
+		c := u[j]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
+		case j > 0 && (c >= '0' && c <= '9' || c == '+' || c == '-' || c == '.'):
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// checkBackendURL 后端地址（反代上游 / 跳转目标）只允许 http 与 https。
+//
+// 从前这一层什么都不查："像不像个地址"全交给 normalizeBackendURL 补前缀，而它只看有没有
+// 出现过 "://"，于是 javascript://%0aalert(1) 这种值被当作"已经带了协议"原样存进配置。
+// 它有两个去处：面板的 Web 服务列表把后端地址渲染成可点的链接（见 WebServices.vue 的
+// backendHref），点一下就是在面板自己的源上执行脚本；反代那侧把它交给 Transport，
+// 换回一个"不支持的协议"，界面上只看到 502，没人知道为什么。
+//
+// label 用于报错文案（"后端地址" / "跳转目标地址"），raw 为空时不判——空值另有去处：
+// 反代无可用后端回 502，跳转没填目标回 500，都已经有各自的提示。
+func checkBackendURL(label, raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("%s %q 不是合法的 URL：%v", label, raw, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("%s %q 的协议不受支持，只允许 http:// 或 https://", label, raw)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("%s %q 缺少主机名", label, raw)
+	}
+	return nil
+}
+
+// normalizeWebChildIDs 保证这一次保存的每个子项都有一个**全局唯一**的 ID（审计 L-04）。
+//
+// 子项 ID 从来是客户端给的：后端只给父项分配 ID，子项 ID 由页面自己生成
+// （见 WebServices.vue 的 genChildId）。于是"给了什么就存什么"这件事有两条现实路径会出问题：
+//   - 直接调 API 保存一份不带 id 的子项列表 → 所有子项的 ID 都是空串；
+//   - 把一个服务的 JSON 原样 POST 一遍当"复制站点"用 → 新父项换了 ID，子项 ID 却和老的一样。
+//
+// 而运行期几乎所有按子项的账都以这个 ID 为键：连接数（Module.conns）、访问日志过滤
+// （ChildLogs）、链接状态、主动探测排期、以及每 IP 限流的桶键。ID 撞上就意味着两个站点
+// 共用一份计数、一条日志流、一只令牌桶——界面上看不出任何异常，只是数字对不上。
+// 更实际的一处在 app.MigrateWebBasicAuth：那里已经为"ID 重复"写了一道兜底注释，
+// 因为撞 ID 会让一个站点的 Basic 认证口令哈希被写到另一个站点上去。
+//
+// 这里选择**改（补发新 ID）而不是拒绝**：一是它能顺手修好从备份导入或手改进来的坏数据，
+// 保存一次就干净了；二是拒绝要落在 validateWebService 上，而那个函数同时挂在子项启停
+// 那条路上（见 handleToggleWebServiceChild），一份已经存着重复 ID 的配置会连"把站点关掉"
+// 都做不到——那是最不该被拦住的操作。
+//
+// cfg 为 nil（拿不到快照）时只在本次载荷内部去重：跨父项那一半没法判，但空串与
+// 载荷内重复这两种最常见的形状照样修得掉。
+func normalizeWebChildIDs(cfg *config.Config, ws *config.WebService) {
+	taken := make(map[string]bool)
+	if cfg != nil {
+		for i := range cfg.WebServices {
+			// 跳过自己：这份载荷就是要替换掉那一条，它现有的子项 ID 不算"别人占着的"。
+			if ws.ID != "" && cfg.WebServices[i].ID == ws.ID {
+				continue
+			}
+			for j := range cfg.WebServices[i].Children {
+				if id := cfg.WebServices[i].Children[j].ID; id != "" {
+					taken[id] = true
+				}
+			}
+		}
+	}
+	for i := range ws.Children {
+		id := strings.TrimSpace(ws.Children[i].ID)
+		ws.Children[i].ID = id
+		if id != "" && !taken[id] {
+			taken[id] = true
+			continue
+		}
+		// 重发一个。genID 失败（随机源不可用）时保持原样：宁可留下一个坏 ID，
+		// 也不要退回某个固定字符串——那会让所有补发的子项共用同一个 ID，
+		// 正是本函数要消灭的形状。
+		for range 8 {
+			next, err := genID()
+			if err != nil {
+				break
+			}
+			if !taken[next] {
+				ws.Children[i].ID = next
+				taken[next] = true
+				break
+			}
+		}
+	}
 }
 
 func normalizeWebService(ws *config.WebService) {
@@ -295,6 +410,35 @@ func validateWebService(cfg *config.Config, ws config.WebService, dataDir string
 		}
 		if err := validateStaticRoot(child.Static.Root, dataDir); err != nil {
 			return err
+		}
+	}
+
+	// 后端地址协议白名单（见 checkBackendURL）。
+	//
+	// 只查启用的子项，理由与上面子项数上限那条相同：保存与启停走的是同一个校验，
+	// 一份手改过、协议非法的配置若在这里被无条件拒绝，用户连把它关掉都做不到。
+	for _, child := range ws.Children {
+		if !child.Enabled {
+			continue
+		}
+		for _, up := range child.Upstreams {
+			if err := checkBackendURL("后端地址", up.URL); err != nil {
+				return err
+			}
+		}
+		if child.Type == "redirect" {
+			if err := checkBackendURL("跳转目标地址", child.Redirect.Target); err != nil {
+				return err
+			}
+		}
+		// 后端不许是本机的面板管理端口。判定与运行期跳过共用
+		// config.WebChild.UpstreamTargetingLocalPort（那里写着为什么要拦、
+		// 以及为什么跳转目标不在此列），两侧结论必然一致——否则会出现
+		// "存进去了、运行期却被跳过"的哑规则，而界面上看不出任何异常。
+		if up, ok := child.UpstreamTargetingLocalPort(cfg.Panel.Port); ok {
+			return fmt.Errorf("后端地址 %s 指向本机的面板管理端口 %d，会让面板收到的所有请求都变成本机来源，"+
+				"入站防护的来源判定与审计日志将全部失效；请改用其他后端，或在「设置 → 面板」里改面板端口",
+				up, cfg.Panel.Port)
 		}
 	}
 
@@ -452,6 +596,11 @@ func validateStaticRoot(root, dataDir string) error {
 			return fmt.Errorf("静态站点根目录不能是系统根目录")
 		}
 	}
+	// 系统目录排在数据目录之前：数据目录那道闸拦的是"泄露本程序自己的秘密"，
+	// 这一条拦的是"把整台机器交出去"，后者更严重，也更应该先说给用户听。
+	if hit := sensitiveSystemRoot(clean); hit != "" {
+		return fmt.Errorf("静态站点根目录不能是系统目录 %s 或它下面的路径（那里是系统凭据与内核/设备结点，不是网站内容）", hit)
+	}
 	const dataDirErr = "静态站点根目录不能是数据目录、也不能包含数据目录（那里有配置与证书私钥）"
 	// 容器镜像里数据目录固定挂在 /data，这一条对任何平台都先拦一道。
 	if slash == "/data" || strings.HasPrefix(slash, "/data/") {
@@ -465,6 +614,63 @@ func validateStaticRoot(root, dataDir string) error {
 		}
 	}
 	return nil
+}
+
+// sensitiveSystemRoots 这些目录连同它们下面的一切都不可能是网站内容，一律拒收。
+//
+// 与数据目录那道闸的分工：那边拦的是"泄露本程序自己的秘密"（配置与证书私钥），
+// 这边拦的是"把整台机器交出去"。面板通常以 root 运行（要改防火墙、管服务），
+// 所以这些目录对静态处理器是真的读得动，逐个的理由：
+//
+//	/etc     /etc/shadow 是密码哈希，/etc/ssh/ssh_host_*_key 是主机私钥，
+//	         还有一堆服务的凭据文件——都是普通文件，会被原样发出去
+//	/root    root 的家目录（.ssh/id_*、.bash_history 里常有明文密码）
+//	/proc    内核给出的进程状态。/proc/self/environ 是本进程的全部环境变量
+//	/sys     内核与硬件参数
+//	/dev     设备结点。/dev/sda 这类块设备的"文件大小"就是整块盘的容量，
+//	         而 http.ServeContent 的长度正是靠 seek 到末尾问出来的（见 webservice
+//	         的 staticFiles）——等于把一份裸盘镜像挂上去给人下载
+//	/boot    内核与引导配置
+//	/windows Windows 的系统目录（System32\config\SAM 是本机账户数据库）
+//
+// 只列到这一层为止：/var、/usr、/home、/srv、/opt 下面全是正经的站点根
+// （/var/www、/usr/share/nginx/html、用户家目录里的站点），拦它们等于拦掉正常用法。
+//
+// 这道闸管的是"把敏感目录填进配置里"，**不管**文件系统层面的逃逸——站点根里放一条
+// 指向 /etc 的符号链接是另一回事，由静态处理器那边的 os.Root 兜着（见
+// webservice/handler.go 的 staticFiles.open），这里看不到也不该重复一遍。
+var sensitiveSystemRoots = []string{"/etc", "/root", "/proc", "/sys", "/dev", "/boot", "/windows"}
+
+// sensitiveSystemRoot 返回 clean（已 filepath.Clean 过的路径）落在哪个系统敏感目录下，
+// 不在任何一个下面时返回空串。
+//
+// 只判绝对路径：相对路径的 "etc" 指的是当前工作目录下的 etc，与 /etc 无关，
+// 而工作目录在哪由启动方式决定，这里没有可靠依据。写成 "/srv/../etc" 也绕不过去，
+// filepath.Clean 已经把它折成了 "/etc"。
+//
+// 大小写与 pathContains 同一口径：只有 Windows 折叠。这样 C:\Windows 与 /windows
+// 归到同一条规则上，而 Linux 上的 /ETC 确实是另一个目录、不该被这条挡住。
+func sensitiveSystemRoot(clean string) string {
+	p := clean
+	// 只剥盘符（"C:"）。UNC 路径的 VolumeName 是 \\主机\共享名，剥掉它会把
+	// \\server\www\etc 误判成 /etc——那是远端共享下一个普通子目录。不剥则归一化成
+	// //server/www/etc，开头是 "//"，下面的规则一条也匹配不上，正是想要的结果。
+	if vol := filepath.VolumeName(p); len(vol) == 2 && vol[1] == ':' {
+		p = p[len(vol):]
+	}
+	p = filepath.ToSlash(p)
+	if !strings.HasPrefix(p, "/") {
+		return ""
+	}
+	if runtime.GOOS == "windows" {
+		p = strings.ToLower(p)
+	}
+	for _, root := range sensitiveSystemRoots {
+		if p == root || strings.HasPrefix(p, root+"/") {
+			return root
+		}
+	}
+	return ""
 }
 
 // pathContains 判断 target 是不是 base 本身或它下面的东西。两边都取绝对路径再比，
@@ -513,7 +719,10 @@ func childLabel(ch config.WebChild) string {
 
 // validateForward 校验单条端口转发规则。重点检查 Bind：若指定监听绑定地址，
 // 必须是合法 IP（如 127.0.0.1），避免误填主机名导致监听失败；留空仍表示监听所有网卡。
-func validateForward(_ *config.Config, r config.ForwardRule) error {
+//
+// 另有一条与端口无关的硬性拒绝：**目标不得是本机的面板端口**（审计 NEW-1）。
+// 详见 forwardTargetsPanel。
+func validateForward(cfg *config.Config, r config.ForwardRule) error {
 	if r.ListenPort < 1 || r.ListenPort > 65535 {
 		return fmt.Errorf("监听端口需在 1-65535 之间")
 	}
@@ -555,7 +764,127 @@ func validateForward(_ *config.Config, r config.ForwardRule) error {
 			return fmt.Errorf("绑定地址（bind）需为合法 IP，如 127.0.0.1；留空表示监听所有网卡")
 		}
 	}
+	// 监听端口不得撞上本机的面板端口。放在目标检查之前：两条都要用到上面的端口范围结论，
+	// 而监听侧的后果更重（面板起不来），先报它。
+	if port, ok := forwardListensOnPanel(cfg, r); ok {
+		return fmt.Errorf("监听端口 %d 与面板管理端口冲突：模块在面板之前绑定端口，这条规则一旦生效，"+
+			"下次重启时面板会因端口被占用而无法启动；请改用其他监听端口，"+
+			"或直接在「设置 → 面板」里改面板端口", port)
+	}
+	// 目标不得指向本机的面板端口。放在最后：前面几条已经把端口范围与目标地址的
+	// 合法性定下来了，这一条要用到那些结论。
+	if port, ok := forwardTargetsPanel(cfg, r); ok {
+		return fmt.Errorf("目标 %s:%d 指向本机的面板管理端口，会让面板收到的所有请求都变成本机来源，"+
+			"入站防护的来源判定与审计日志将全部失效；请改用其他目标，或直接在「设置 → 面板」里改面板端口",
+			strings.TrimSpace(r.TargetHost), port)
+	}
 	return nil
+}
+
+// forwardListensOnPanel 判断一条转发规则的**监听端口**会不会和面板管理端口撞上；
+// 命中时返回撞上的那个监听端口。
+//
+// # 为什么这条必须拦（审计 L-01）
+//
+// 面板的监听地址固定 0.0.0.0（config.Panel.Listen，不在设置 UI 暴露），所以只要端口相同
+// 就一定冲突，与规则的 Bind 填什么无关。而模块的 ReloadAll 跑在面板 Start 之前
+// （cmd/mantou/main.go），先绑的是转发：
+//
+//   - Linux：面板随后 bind 失败，进程直接以「启动失败: listen tcp …: address already in use」退出，
+//     面板自锁——只能手工改 config.json 才能恢复；
+//   - Windows：两者可以共存（SO_REUSEADDR 语义不同），回环仍回面板，而所有非回环网卡
+//     落到转发规则上，等于静默丢掉远程管理入口。
+//
+// 判定只看 Enabled 的规则：禁用规则不绑端口，撞不上；而启用这条路径由 registerCRUD 的
+// toggle 兜住（它在启用侧调 validate），所以"存着禁用 → 回头再打开"也过不去。
+// 这与 validateWebService 对服务端口的处理（同为监听侧）是同一形状。
+//
+// # 覆盖范围
+//
+// 端口范围规则按 ListenPort..ListenPortEnd 全段逐个比，`26098-26102` 这种"范围里恰好
+// 盖住面板端口"的写法也拦得住——那正是最不容易被用户自己发现的一种。
+func forwardListensOnPanel(cfg *config.Config, r config.ForwardRule) (int, bool) {
+	if cfg == nil || cfg.Panel.Port <= 0 || !r.Enabled {
+		return 0, false
+	}
+	start, end := r.ListenPort, r.ListenPortEnd
+	if end <= start {
+		end = start
+	}
+	if cfg.Panel.Port >= start && cfg.Panel.Port <= end {
+		return cfg.Panel.Port, true
+	}
+	return 0, false
+}
+
+// forwardTargetsPanel 判断一条转发规则会不会把流量送到**本机的面板端口**；
+// 命中时返回撞上的那个目标端口。
+//
+// # 为什么这条必须拦（审计 NEW-1）
+//
+// 面板的入站防护、登录限流与审计日志全都以「连接对端 IP」为唯一依据
+// （SetTrustedProxies(nil) + ipx.ClientIP 刻意不看任何代理头，见 internal/server/server.go）。
+// 一条 `8443 → 127.0.0.1:面板端口` 的规则把这个依据整个抽掉：
+//
+//   - 「仅局域网」、拒绝名单、自动封禁全部失效——decide 无条件放行回环、strike 对回环
+//     不计数，那是刻意留的自救通道（见 firewall.go），不是可以顺手收紧的东西；
+//   - 登录限流的两个键都含 IP（api_auth.go），于是全网攻击者共享同一个 127.0.0.1 桶：
+//     爆破仍被限，但合法的本机/隧道访问被连带锁死；
+//   - 日志里来源一律 127.0.0.1，取证能力归零。
+//
+// 目标写本机**局域网地址**是同一形状的弱化版（回环豁免不生效，但「仅局域网」照样被绕过、
+// 所有来源仍塌成一个 IP），所以判的是 ipx.IsLocalHost 而不只是回环。
+//
+// # 为什么补在这里而不是收紧回环豁免
+//
+// 其余每一条入站路径本来都有面板端口检查（webhook、webservice 的保存与启停、配置导入），
+// **只有端口转发没有**——这是那张表上缺的一格，而不是防火墙的设计问题。
+// 补齐这一格是代价最小、语义最清楚的做法：回环豁免那条自救通道要留着。
+//
+// # 覆盖范围
+//
+// 端口范围规则按 expandRule 的同一口径逐个算目标端口（多对一恒等于 TargetPort，
+// 递增映射按偏移递增），因此 `20000-21000 → 127.0.0.1:1000` 这种"范围里恰好有一个
+// 落在面板端口上"的写法也拦得住——那正是最不容易被用户自己发现的一种。
+func forwardTargetsPanel(cfg *config.Config, r config.ForwardRule) (int, bool) {
+	if cfg == nil || cfg.Panel.Port <= 0 {
+		return 0, false
+	}
+	if !ipx.IsLocalHost(r.TargetHost) {
+		return 0, false
+	}
+	for _, tp := range forwardTargetPorts(r) {
+		if tp == cfg.Panel.Port {
+			return tp, true
+		}
+	}
+	return 0, false
+}
+
+// forwardTargetPorts 列出一条规则实际会拨向的目标端口，口径与 forward.expandRule 一致。
+//
+// 不复用那个函数：它在 forward 包里且返回整套运行项（含 runner 键），而这里只要端口。
+// 两处口径若走偏，症状是"保存时拦住了、运行期没拦"或反之，所以上下两处注释互相点名。
+func forwardTargetPorts(r config.ForwardRule) []int {
+	start, end := r.ListenPort, r.ListenPortEnd
+	if end <= start {
+		end = start
+	}
+	if end-start+1 > config.MaxForwardRangePorts {
+		end = start + config.MaxForwardRangePorts - 1
+	}
+	if r.SameTargetPort {
+		return []int{r.TargetPort} // 多对一：所有监听端口共用同一个目标端口
+	}
+	out := make([]int, 0, end-start+1)
+	for p := start; p <= end; p++ {
+		tp := r.TargetPort + (p - start)
+		if tp < 1 || tp > 65535 {
+			continue // 与 expandRule 一致：越界的尾部端口不会被启动，也就不必拦
+		}
+		out = append(out, tp)
+	}
+	return out
 }
 
 // normalizeWOL 规范化网络唤醒设备的保存请求。
@@ -685,6 +1014,32 @@ func wolResource(stats *runstats.Store) resource[config.WOLDevice] {
 		// （registerCRUD 的 POST / PUT 均先 normalize 再 validate）。
 		normalize: normalizeWOL,
 	}
+}
+
+// validateCronTask 校验计划任务保存请求：启用中的任务，其 cron 表达式必须真的排得进调度器
+// （审计 L-05）。
+//
+// 从前这里没有任何校验：`not a cron`、`*/5 * * *`（少一段）、`99 99 * * *`、空串都会 200 存下来。
+// 界面上那条任务显示「启用」，模块状态显示健康，而它永远不会执行——失败的全部痕迹是重载时
+// 一行 ERROR 日志。表达式是用户手写的（调度类型选「自定义」那一档，见 CronTasks.vue 的
+// buildCron），写错是常态，所以这条必须在保存时当场拒绝。
+//
+// 判定借 cron 模块的 ValidateSpec，用的就是调度器自己那个解析器（理由写在那边）。
+//
+// **只在启用时校验**，与 toggle 端点的既有口径一致（见 registerCRUD 里那句
+// `if req.Enabled && r.validate != nil`）。禁用中的坏表达式没有危害——它排不进调度器，
+// 也不该排。反过来无条件校验会造出一个走不出去的死角：一份从备份导入、或手改进来的
+// 坏表达式任务，连"把它关掉"这个 PUT 都会被 400 挡住（计划任务没注册轻量 toggle 端点，
+// 列表里那个开关走的是整行 PUT，见 CronTasks.vue 的 toggle）。
+func validateCronTask(_ *config.Config, task config.CronTask) error {
+	if !task.Enabled {
+		return nil
+	}
+	if err := cron.ValidateSpec(task.Cron); err != nil {
+		return fmt.Errorf("cron 表达式无法解析（%s）：标准格式为 5 段「分 时 日 月 周」，"+
+			"例如 0 3 * * * 表示每天 03:00", err.Error())
+	}
+	return nil
 }
 
 // normalizeCert 规范化证书保存请求。
@@ -893,14 +1248,18 @@ func (s *Server) registerResourceRoutes(g *gin.RouterGroup) {
 		},
 	})
 	registerCRUD(s, g, "webservices", resource[config.WebService]{
-		get:       func(c *config.Config) []config.WebService { return c.WebServices },
-		set:       func(c *config.Config, v []config.WebService) { c.WebServices = v },
-		id:        func(t *config.WebService) string { return t.ID },
-		setID:     func(t *config.WebService, id string) { t.ID = id },
-		modLabel:  "Web 服务",
-		enabled:   func(t *config.WebService) bool { return t.Enabled },
-		itemName:  func(t *config.WebService) string { return t.Name },
-		normalize: normalizeWebService,
+		get:      func(c *config.Config) []config.WebService { return c.WebServices },
+		set:      func(c *config.Config, v []config.WebService) { c.WebServices = v },
+		id:       func(t *config.WebService) string { return t.ID },
+		setID:    func(t *config.WebService, id string) { t.ID = id },
+		modLabel: "Web 服务",
+		enabled:  func(t *config.WebService) bool { return t.Enabled },
+		itemName: func(t *config.WebService) string { return t.Name },
+		// 子项 ID 由客户端提供，补齐并去重之后再走后面的补默认值（见 normalizeWebChildIDs）。
+		normalize: func(ws *config.WebService) {
+			normalizeWebChildIDs(s.deps.Config.Snapshot(), ws)
+			normalizeWebService(ws)
+		},
 		// 静态站点根目录要和本进程实际的数据目录比，所以这里得把它带进去。
 		validate: func(cfg *config.Config, ws config.WebService) error {
 			return validateWebService(cfg, ws, s.deps.DataDir)
@@ -950,6 +1309,8 @@ func (s *Server) registerResourceRoutes(g *gin.RouterGroup) {
 		modLabel: "计划任务",
 		enabled:  func(t *config.CronTask) bool { return t.Enabled },
 		itemName: func(t *config.CronTask) string { return t.Name },
+		// 启用中的任务，表达式必须真能排进调度器（见 validateCronTask）。
+		validate: validateCronTask,
 		// 条数上限：成本在触发那一刻——每次执行结束都要串行回写一次运行态（原因见 config.MaxCronTasks）。
 		maxCount: config.MaxCronTasks,
 	})
@@ -1010,6 +1371,62 @@ func (s *Server) registerResourceRoutes(g *gin.RouterGroup) {
 		setID:    func(t *config.ACMEAccount, id string) { t.ID = id },
 		modLabel: "ACME 账户",
 		itemName: func(t *config.ACMEAccount) string { return t.Name },
+		// 这条资源身上挂着两样凭证，此前列表接口把它们原样发给了前端：
+		//
+		//   privateKeyPem  账户私钥。拿到它就能代表这个账户向 CA 申请任意域名的证书
+		//                  （只要还能通过验证），也能吊销这个账户已签发的证书。
+		//   eabHmac        外部账户绑定密钥。ZeroSSL / Google 这类 CA 用它认"这个 ACME
+		//                  账户属于我后台的哪个账号"，泄露即等于对方能在你账下注册、耗配额。
+		//
+		// 界面上一个都不显示（web/src/views/Certs.vue 的 AcmeAccount 里没有 privateKeyPem，
+		// eabHmac 那个输入框是 type="password"），所以它们只是白白多走了一趟网络、
+		// 多落进一处浏览器内存与响应缓存。与凭证、接收器令牌同一套做法：列表脱敏，
+		// 保存时按占位符还原。
+		list: func(source []config.ACMEAccount) []config.ACMEAccount {
+			out := append([]config.ACMEAccount(nil), source...)
+			for i := range out {
+				// 私钥直接清空而不是给占位符：界面上没有这个字段，占位符只会让
+				// 前端多存一段没用的字符串，还得指望它原样送回来。
+				out[i].PrivateKeyPEM = ""
+				if out[i].EABHMAC != "" {
+					out[i].EABHMAC = maskedSecret
+				}
+			}
+			return out
+		},
+		// 还原两个方向都必须做，否则改一次账户名就把凭证清掉了：
+		// 前端编辑走的是「拿列表里那一行、改几个字段、整行 PUT 回来」（useResource.openEdit），
+		// 而 PUT 是整条替换（registerCRUD 里 list[i] = item）。私钥在列表里被清空之后，
+		// 回传的那条自然也是空的——不还原就等于每次保存都要求用户重新注册账户，
+		// 而账户是在首次签发时注册的，用户根本不知道自己刚弄丢了什么。
+		normalize: func(t *config.ACMEAccount) {
+			if t.ID == "" {
+				// 新建：没有"已存储的值"可还原。占位符照旧要清掉——界面上不会走到这条
+				// （复制按钮只给不含脱敏字段的资源用，见 useResource.openCopy），
+				// 但直接调接口的脚本可以把列表返回的那一行原样 POST 回来。
+				if t.EABHMAC == maskedSecret {
+					t.EABHMAC = ""
+				}
+				return
+			}
+			cfg := s.deps.Config.Snapshot()
+			for i := range cfg.ACMEAccounts {
+				if cfg.ACMEAccounts[i].ID != t.ID {
+					continue
+				}
+				if t.PrivateKeyPEM == "" {
+					t.PrivateKeyPEM = cfg.ACMEAccounts[i].PrivateKeyPEM
+				}
+				if t.EABHMAC == maskedSecret {
+					t.EABHMAC = cfg.ACMEAccounts[i].EABHMAC
+				}
+				return
+			}
+			// 找不到这条 ID：占位符不能落盘，否则 EAB 认证会拿 "******" 去请求 CA。
+			if t.EABHMAC == maskedSecret {
+				t.EABHMAC = ""
+			}
+		},
 	})
 
 	s.registerWebhookRoutes(g)

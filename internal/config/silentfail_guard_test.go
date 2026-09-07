@@ -121,8 +121,9 @@ type goFile struct{ abs, rel string }
 func productionGoFiles(t *testing.T) []goFile {
 	t.Helper()
 	root := moduleRoot(t)
+	// 不含 .git 之类以点开头的目录：那一类由下面的通用规则统一跳过。
 	skipDir := map[string]bool{
-		".git": true, "node_modules": true, "web": true,
+		"node_modules": true, "web": true,
 		"data": true, "bin": true, "dist": true, "docs": true,
 	}
 	var out []goFile
@@ -131,7 +132,13 @@ func productionGoFiles(t *testing.T) []goFile {
 			return err
 		}
 		if d.IsDir() {
-			if path != root && skipDir[d.Name()] {
+			if path == root {
+				return nil
+			}
+			// 以 . 或 _ 开头的目录一律跳过，与 go 命令自己的规则一致：`go build ./...`
+			// 从不把它们算作包。那底下的 .go 文件无论怎么写都进不了用户手里的二进制
+			// （本地的验证脚手架就放在 .devrun/），扫它们只会扫出与生产无关的违规。
+			if name := d.Name(); name[0] == '.' || name[0] == '_' || skipDir[name] {
 				return fs.SkipDir
 			}
 			return nil

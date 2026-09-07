@@ -235,7 +235,19 @@ func (ls *listenServer) start() error {
 		// 由此留下的两个缺口分别由两道停滞超时补上：请求正文那侧见 guardBodyRead，
 		// 响应体那侧（客户端不读、把写堵死）见 conntrack.go 的 writeGuard。
 		IdleTimeout: 120 * time.Second,
-		ErrorLog:    ls.firewall.WrapErrorLog(ls.log.Standard(slog.LevelWarn, "Web TLS 或连接异常")),
+		// 请求头总量上限。不设置时标准库用 1 MiB（http.DefaultMaxHeaderBytes），
+		// 那个默认值会直接推翻下面那段并发连接的内存预算：预算按"每条连接约 20 KB"
+		// 算出 2000 条 ≈ 40–64 MB，而单条连接光是请求头就能合法地占到 1 MiB，
+		// 2000 × 1 MiB ≈ 2 GB——还只是一个监听，本模块最多能开 MaxWebServices(50) 个。
+		// 而且这条路径上没有任何东西能补救：头是在 Handler 被调用**之前**读完的，
+		// 中间件、体积上限、停滞超时全都还没上场。
+		//
+		// 64 KiB 与面板那侧同量级（server.go 用 256 KiB，面板要收 Cookie 与较长的
+		// Authorization）。Web 服务这侧收的是普通访客请求，正常的头部在几 KB 量级；
+		// 反向代理会往上游多加几个 X-Forwarded-* 也远到不了 64 KiB。
+		// 超限时标准库回 431 Request Header Fields Too Large，是能看懂的结果。
+		MaxHeaderBytes: 64 << 10,
+		ErrorLog:       ls.firewall.WrapErrorLog(ls.log.Standard(slog.LevelWarn, "Web TLS 或连接异常")),
 	}
 
 	ln, err := net.Listen(network, bindAddr)
@@ -247,6 +259,8 @@ func (ls *listenServer) start() error {
 	// 每条 HTTP 连接约 20 KB（读写缓冲 + goroutine 栈），HTTPS 约 32 KB，
 	// 因此 2000 的上界对应约 40–64 MB，落在 README 给出的内存预算内；
 	// 不加限制时一次压测或扫描就能把 RSS 推到 OOM。
+	// 这笔预算成立的另一半前提是上面的 MaxHeaderBytes：请求头是对端唯一能单方面
+	// 撑大那 20 KB 的东西，不设上限的话它自己就能到 1 MiB（标准库默认值）。
 	// LimitListener 在达到上限时让 Accept 阻塞（连接留在内核 backlog 里等待，
 	// 而不是被立刻拒绝），对 HTTP 语义合适：客户端按自己的超时决定是否放弃。
 	// 也正因为超限是"阻塞"而不是"拒绝"，一批赖着不走的连接就能让正常访客连不进来——

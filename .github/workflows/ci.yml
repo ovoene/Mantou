@@ -12,13 +12,27 @@
 #                  也返回 0，在 CI 里等于不设防。
 #   2. go vet  —— 标准库自带的静态检查（Printf 参数、结构体 tag、锁复制等）。
 #   3. go build / go test —— 全量编译 + 全量单测。
-#                  注：本项目 CGO_ENABLED=0，`-race` 依赖 cgo，因此无法在此启用竞态检测；
-#                  并发相关的正确性由各包自己的确定性测试覆盖（见 module / cert / webservice）。
+#                  注：发布产物是 CGO_ENABLED=0（见下面 go build 那一步），但**测试**不受这个限制——
+#                  `-race` 依赖 cgo，而 ubuntu runner 自带 gcc，所以在 CI 里跑竞态检测是可行的，
+#                  只是目前没开：本仓库有若干测试用 runtime.ReadMemStats 的堆增量断言内存预算
+#                  （logx、webhook 三处、runstats），race 模式下这些数字会不会漂没有验证过，
+#                  贸然设成阻断门禁的风险是「红的不是代码而是门禁自己」。
+#                  在此之前，并发正确性靠各包自己的确定性测试覆盖（见 module / cert / webservice）。
 #   4. vue-tsc —— 前端类型检查。release.yml 走 `build:only`（跳过类型检查）以缩短发布耗时，
 #                  类型错误必须在这里被拦下，否则会一路带到发布产物里。
 #
-# 依赖漏洞扫描（govulncheck）单列一个非阻断作业：它的结论会随上游漏洞库更新而变化，
-# 让它阻断合并等于把「今天能过的代码明天突然过不了」变成常态。结果需人工看一眼。
+# 依赖漏洞扫描（govulncheck / npm audit）在这里单列一个**非阻断**作业：它的结论会随上游
+# 漏洞库更新而变化，让它阻断合并等于把「今天能过的代码明天突然过不了」变成常态。
+# 真正的门禁在 release.yml（发布才是那个不可撤回的动作）：那边的 checks / web 两个作业会
+# **阻断**，这里只负责让人早一点看见。
+#
+# 扫描器自身钉死版本（GOVULNCHECK_VERSION）而不用 @latest：@latest 意味着同一份代码隔两天
+# 可能被两个不同版本的扫描器扫出两种结论，出了事无从复现。漏洞库仍然是活的——那正是它的
+# 价值所在——但工具链不再是变量。
+#
+# 所有 uses: 一律钉到提交 SHA，版本号写在同行注释里。主版本标签（@v4）是**可移动**的：
+# 上游仓库一旦被入侵，改一下标签就能把任意代码送进这条流水线，而这里有 GITHUB_TOKEN。
+# SHA 是内容地址，改不动。升级办法是改这里的 SHA 与注释，而不是让它自己漂。
 # ============================================================================
 
 name: ci
@@ -35,6 +49,10 @@ on:
 permissions:
   contents: read
 
+# 扫描器版本集中在这里，与 release.yml 里那份保持一致（两条流水线各自独立，YAML 没法共享）。
+env:
+  GOVULNCHECK_VERSION: v1.7.0
+
 # 同一分支上新的推送会取消上一次仍在跑的检查，避免排队浪费额度。
 concurrency:
   group: ci-${{ github.ref }}
@@ -46,13 +64,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: 配置 Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          # 与 release.yml、Dockerfile 保持一致。
-          go-version: '1.26'
+          # 与 release.yml、Dockerfile 保持一致。取当前稳定线而非 go.mod 里那个下限：
+          # go 指令（1.26.0）是编译器版本**下限**，用更新的工具链构建合法且能拿到最新标准库补丁。
+          go-version: '1.27'
           cache-dependency-path: go.sum
 
       - name: 校验依赖清单
@@ -103,12 +122,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: 配置 Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: '22'
+          # 与 release.yml、Dockerfile 保持一致。24 是当前 Active LTS，22 已进入只收安全补丁的
+          # 维护期。真正的下限写在 web/package.json 的 engines 里（Node 22.12，由 vite 8 与
+          # vue-i18n 11 决定）——CI 用更新的 LTS 构建，不等于要求使用者升到 24。
+          node-version: '24'
           cache: npm
           cache-dependency-path: web/package-lock.json
 
@@ -122,16 +144,16 @@ jobs:
   vuln:
     name: 依赖漏洞扫描（不阻断）
     runs-on: ubuntu-latest
-    # 结论随上游漏洞库变化，仅作提示；真正需要处置时再手动升级依赖。
+    # 结论随上游漏洞库变化，这里仅作提示；发布前的那道阻断门禁在 release.yml。
     continue-on-error: true
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: 配置 Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: '1.26'
+          go-version: '1.27'
           cache-dependency-path: go.sum
 
       - name: 确保 embed 占位文件存在
@@ -141,4 +163,21 @@ jobs:
 
       - name: govulncheck
         run: |
-          go run golang.org/x/vuln/cmd/govulncheck@latest ./... || true
+          # 版本钉死（见文件头）。`|| true` 在这里是有意的：整个作业本来就是 continue-on-error，
+          # 但保留退出码会让作业标成红叉，看板上分不清"有漏洞待看"和"扫描器自己挂了"。
+          go run "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}" ./... || true
+
+      - name: 配置 Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: npm audit
+        run: |
+          # 前端依赖同样要看。这里连 devDependencies 一起扫（vite/vue-tsc 那些只在构建期出现，
+          # 但构建期被投毒一样能把恶意代码写进 dist），而 release.yml 那道阻断门禁只看
+          # 真正会打进产物的 dependencies——否则一条 esbuild 的中危公告就能卡住发布。
+          npm audit --prefix web || true
+

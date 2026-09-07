@@ -253,6 +253,50 @@ func TestFirewallAutoBanSkipsAllowAndLoopback(t *testing.T) {
 	}
 }
 
+// TestFirewallAllowListBeatsExistingBan 钉住 decide 第 3 条的另一半：
+// 加白**之前**就已经存在的封禁，加白之后必须失效。
+//
+// 上一个用例管的是"加白的来源不会被封"（strike 侧），这里管的是"已经被封的来源加白后能进来"
+// （decide 侧）。两者顺序相反就是同一个 bug 的两种表现，而只有后者会让用户看到
+// "我明明加白了却还是进不来"——加白是人做的明示决定，此时机器早先的推测必须让位。
+//
+// 造这个场景只用真实路径：先在没有允许名单的快照上把它封掉（strike 对加白来源不计数，
+// 见上一个用例，所以顺序不能反），再把地址写进配置、重取一份快照。
+// 封禁表挂在 f 上、名单来自 decide 的入参，于是这一步换的只有名单。
+func TestFirewallAllowListBeatsExistingBan(t *testing.T) {
+	const raw = "203.0.113.5"
+	f := newTestFirewall(t, config.PanelFirewall{
+		Enabled: true, Mode: config.FirewallModeAll,
+		AutoBan: true, AutoBanThreshold: 1, AutoBanMinutes: 10,
+	})
+	ip := net.ParseIP(raw)
+	if !f.strike(f.current(), ip, raw) {
+		t.Fatal("阈值为 1，一次超限即应封禁")
+	}
+	if got := f.decide(f.current(), ip); got != fwDenyBanned {
+		t.Fatalf("前提不成立：加白前就该是封禁状态，实际 %v", got.reason())
+	}
+
+	if err := f.cfg.Update(func(cfg *config.Config) {
+		cfg.Settings.Security.Firewall.AllowIPs = []string{raw}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	lists := f.current()
+	if got := f.decide(lists, ip); got != fwPass {
+		t.Fatalf("加白应压过既有封禁，实际 %v", got.reason())
+	}
+	// 反面：同一张封禁表、同一份名单下，没加白的地址仍要被拦住。
+	// 少了这一句，"封禁整体失效"也能让上面那条断言通过。
+	other := net.ParseIP("203.0.113.6")
+	if !f.strike(lists, other, other.String()) {
+		t.Fatal("未加白的地址应能被封禁")
+	}
+	if got := f.decide(lists, other); got != fwDenyBanned {
+		t.Fatalf("未加白的地址应仍被封禁拦下，实际 %v", got.reason())
+	}
+}
+
 // TestFirewallAutoBanExpires 封禁到期后自动失效——机器的误判必须能自愈。
 func TestFirewallAutoBanExpires(t *testing.T) {
 	f := newTestFirewall(t, config.PanelFirewall{

@@ -292,10 +292,17 @@ function viewOf(ch: Child) {
 
 // 后端地址渲染成可点击链接：缺协议前缀时浏览器会当作相对路径（点开跳到当前页），
 // 这里兜底补全 http://，确保新标签打开的是真实后端地址（与保存期自动补全双保险）。
+//
+// 只放行 http / https。原来那句正则只校验"长得像 scheme://"，于是
+// javascript://%0aalert(1) 原样进了 :href——点一下就是在面板自己的源上执行脚本，
+// 能读到本页的一切。保存接口那侧现在也拦（见 checkBackendURL），但配置还能被手改，
+// 而渲染这一处才是真正决定"点下去会发生什么"的地方。
 function backendHref(u: string): string {
   const s = (u || '').trim()
   if (s === '') return '#'
-  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(s)) return s
+  if (/^https?:\/\//i.test(s)) return s
+  // 带了协议但不是 http/https：不给可用链接，避免把 javascript: 这类值交给浏览器执行。
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(s)) return '#'
   return 'http://' + s
 }
 
@@ -638,7 +645,7 @@ useCloseOnLeave(logsVisible)
                   class="addr-link"
                   :href="frontendUrl(row, p, d)"
                   target="_blank"
-                  rel="noopener"
+                  rel="noopener noreferrer"
                 >{{ d }}</a>
               </span>
             </template>
@@ -654,7 +661,7 @@ useCloseOnLeave(logsVisible)
                   class="addr-link"
                   :href="backendHref(u)"
                   target="_blank"
-                  rel="noopener"
+                  rel="noopener noreferrer"
                 >{{ u }}</a>
               </span>
             </template>
@@ -878,8 +885,6 @@ useCloseOnLeave(logsVisible)
                 <el-form-item v-if="ch.tls" :label="t('webservice.tlsMinVersion')">
                   <el-select v-model="ch.tlsMinVersion" style="width: 100%">
                     <el-option :label="t('webservice.tlsVersionAuto')" value="" />
-                    <el-option label="TLS 1.0" value="1.0" />
-                    <el-option label="TLS 1.1" value="1.1" />
                     <el-option label="TLS 1.2" value="1.2" />
                     <el-option label="TLS 1.3" value="1.3" />
                   </el-select>

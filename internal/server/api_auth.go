@@ -1,6 +1,8 @@
 package server
 
 import (
+	"crypto/subtle"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -10,6 +12,7 @@ import (
 
 	"mantou/internal/auth"
 	"mantou/internal/config"
+	"mantou/internal/strutil"
 )
 
 // initStatusResp 描述面板初始化状态。
@@ -69,9 +72,24 @@ func (s *Server) handleInitSetup(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, "用户名至少 3 个字符")
 		return
 	}
+	// 上限与登录那侧的键长同源（maxLoginUserKeyLen）：这里存进去的值，
+	// 之后每次登录都要拿去拼限流键。两处用同一个数，就不会出现"存得进、登录时被截断"。
+	if len(req.Username) > maxLoginUserKeyLen {
+		s.setupLimiter.Fail(c.ClientIP())
+		respondError(c, http.StatusBadRequest, fmt.Sprintf("用户名最多 %d 个字节", maxLoginUserKeyLen))
+		return
+	}
 	if len(req.Password) < 6 {
 		s.setupLimiter.Fail(c.ClientIP())
 		respondError(c, http.StatusBadRequest, "密码至少 6 个字符")
+		return
+	}
+	// bcrypt 只取前 72 字节，超过就直接报错（golang.org/x/crypto/bcrypt 从 v0.?? 起
+	// 返回 ErrPasswordTooLong 而不是静默截断）。不拦的话，用户填一个长口令得到的是
+	// 一句"密码处理失败"的 500——看不出问题在长度上，而这是初始化流程，卡在这里就没有下一步。
+	if len(req.Password) > auth.MaxPasswordBytes {
+		s.setupLimiter.Fail(c.ClientIP())
+		respondError(c, http.StatusBadRequest, fmt.Sprintf("密码最多 %d 个字节（超过的部分不会参与校验）", auth.MaxPasswordBytes))
 		return
 	}
 
@@ -125,6 +143,10 @@ type loginReq struct {
 	Password string `json:"password"`
 }
 
+// maxLoginUserKeyLen 登录失败时「用户名」这一项能带多长（字节）。
+// 只约束限流键与日志两处，**不约束账号比对**，理由见 handleLogin。
+const maxLoginUserKeyLen = 64
+
 // handleLogin 校验账号密码，成功后下发会话 Cookie。
 func (s *Server) handleLogin(c *gin.Context) {
 	var req loginReq
@@ -135,9 +157,40 @@ func (s *Server) handleLogin(c *gin.Context) {
 
 	ip := c.ClientIP()
 	ipKey := "ip:" + ip
-	// 复合键：账户锁定与来源 IP 绑定，避免「针对已知管理员账户跨 IP 连续失败」触发全局账户锁定 DoS。
-	userKey := "ip:" + ip + ":user:" + strings.TrimSpace(req.Username)
-	// 复合限流：既按来源 IP 限制爆破频率，也按被尝试的账户名限制（防止单账户跨 IP 爆破、多账户同 IP 爆破）。
+	// 用户名先夹长度，再拿去拼限流键与写日志——**只夹这两处，比对那一侧仍用原值**。
+	//
+	// 为什么必须夹：这个接口免鉴权，用户名整串由请求方决定（受全局 1 MiB 体积上限约束），
+	// 而它会流进两个有放大效应的地方。
+	//
+	//  1. 限流表。键里含完整用户名，表上限 loginLimiterMaxEntries（4096）条，
+	//     且条目要等锁定窗口过去才被清掉。一个接近 1 MiB 的用户名配上 4096 个互不相同的
+	//     取值，光键就能占到 GB 级——这台设备的内存预算总共只有几百 MB。
+	//
+	//  2. 失败日志。下面那行 Warn 会把用户名原样写进控制台与日志文件；2 KiB/值的截断
+	//     只发生在内存环形缓冲那一层（见 logx 的 ring handler），落盘这一路没有。
+	//     而日志文件是 LogMaxSizeMB=5、LogMaxBackups=0（轮转即丢弃全部历史），
+	//     于是几个超长的失败请求就能把既有日志整份轮掉——对一个未鉴权的来源来说，
+	//     那等于一条抹掉自身痕迹的路，比多占点内存严重得多。
+	//
+	// 为什么不夹比对那一侧：夹了就等于给"配置里存着一个超长用户名"的实例判死刑
+	//（手改 config.json 存得进去，加载期不校验长度），那种实例会突然再也登不进来。
+	// 字符串比对是定长开销、不留存、不放大，让它看原值是安全的。
+	userForKey := strutil.Truncate(strings.TrimSpace(req.Username), maxLoginUserKeyLen, "…")
+	// 第二个限流键：来源 IP + 被尝试的账户名。
+	//
+	// 键里刻意含 IP，所以它**不是**"跨 IP 的账户锁定"。那个做法会把「针对已知管理员账户
+	// 连续失败」变成一条谁都能打的锁门 DoS：从任意几个地址故意失败几次，真正的管理员就
+	// 再也登不进来，而这台面板往往是他恢复访问的唯一入口。取舍是宁可少拦一点。
+	//
+	// 那它比 ipKey 多挡什么？就一件事：**一次成功登录不会清掉其它账户名的失败史**。
+	// 成功时清的是 ipKey 和「这一个账户名」的键，于是同一 IP 上冲着别的账户名的失败计数
+	// 会一直累加。在与管理员共用出口 IP 的场景里（NAT、同一局域网），这条让攻击者没法
+	// 靠管理员的正常登录把自己的计数反复清零。表满淘汰时两个键各自独立，也算一层冗余。
+	//
+	// 除此之外它的判定严格弱于 ipKey：同一 IP 的失败 ipKey 全都算，它只算其中一个
+	// 账户名那一份，因此永远不会先于 ipKey 触发。别把它当成"按账户限流"来读。
+	userKey := "ip:" + ip + ":user:" + userForKey
+	// 两个键都要过：ipKey 挡同一来源的爆破（不分账户名），userKey 挡上面那一件事。
 	if ok, retry := s.limiter.Allowed(ipKey); !ok {
 		c.Header("Retry-After", strconv.Itoa(retry))
 		respondError(c, http.StatusTooManyRequests, "登录尝试过于频繁，请稍后再试")
@@ -155,11 +208,26 @@ func (s *Server) handleLogin(c *gin.Context) {
 		return
 	}
 
-	ok := strings.TrimSpace(req.Username) == cfg.Auth.Username && auth.VerifyPassword(cfg.Auth.PasswordHash, req.Password)
-	if !ok {
+	// 用户名与密码分别求值、再一起判定：**不能**让用户名不匹配短路掉 bcrypt（审计 S-02）。
+	//
+	// 短路版本（`名字对得上 && VerifyPassword(...)`）会把"这个用户名存不存在"直接写进
+	// 响应耗时里：实测错误用户名 1.24 ms 中位、错误密码 95.4 ms 中位，77 倍、区间零重叠，
+	// 单个请求就能 100% 判定，登录限流也拦不住这件事（它限的是次数，不是信息量）。
+	//
+	// 对策是用名不对的时候也照样跑一遍 bcrypt。故意拿**真实的那个哈希**去比，而不是另造
+	// 一个诱饵哈希：这样 cost 一定一致，日后有人改了 bcrypt 代价参数也不会把两条路的耗时
+	// 重新拉开。名字不对时 passOK 的结果只是被丢掉，不参与任何判定。
+	//
+	// 用户名用 subtle.ConstantTimeCompare 而不是 ==：这一处本来就不是耗时差的来源
+	//（纳秒级，被 bcrypt 的毫秒级抖动整个吃掉），写成常量时间是为了让"这里不许短路"
+	// 这件事在代码上看得出来，避免日后被顺手改回 && 的形状。
+	userOK := subtle.ConstantTimeCompare(
+		[]byte(strings.TrimSpace(req.Username)), []byte(cfg.Auth.Username)) == 1
+	passOK := auth.VerifyPassword(cfg.Auth.PasswordHash, req.Password)
+	if !userOK || !passOK {
 		s.limiter.Fail(ipKey)
 		s.limiter.Fail(userKey)
-		s.deps.Log.Warn("登录失败", "username", req.Username, "ip", ip)
+		s.deps.Log.Warn("登录失败", "username", userForKey, "ip", ip)
 		respondError(c, http.StatusUnauthorized, "用户名或密码错误")
 		return
 	}

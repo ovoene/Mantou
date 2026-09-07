@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -13,12 +14,28 @@ import (
 
 	"mantou/internal/app"
 	"mantou/internal/config"
+	"mantou/internal/fsx"
+	"mantou/internal/lockfile"
 	"mantou/internal/logx"
 	"mantou/internal/metrics"
 	"mantou/internal/restart"
 	"mantou/internal/server"
 	"mantou/internal/version"
 	"mantou/web"
+)
+
+const (
+	// dataLockName 数据目录里的锁文件名。带前导点，与用户自己放进去的东西区分开；
+	// 内容只有一个进程号，纯粹给排查的人看（见 internal/lockfile）。
+	dataLockName = ".lock"
+
+	// dataLockWait 抢数据目录锁的最长等待。
+	//
+	// 唯一需要等的场合是"新旧两个进程有一瞬间同时活着"：Windows 没有 exec 语义，
+	// 重启只能先拉起新进程、再退掉自己（见 exec_self_windows.go）。正常路径上换进程之前
+	// 会显式放锁，这几秒是那一步万一没走到时的兜底，也覆盖"外部守护把新实例拉起得
+	// 比旧实例退出更早"。等不到就按"另一个实例正在运行"拒绝启动。
+	dataLockWait = 3 * time.Second
 )
 
 // 版本号 / 官网地址 / 编译时间由 version 包提供：version.go 维护默认值，构建脚本
@@ -46,9 +63,35 @@ func main() {
 }
 
 func run(dataDir string) error {
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+	// 数据目录 0700：里面有 config.json、master.key、证书私钥、日志与上传的图片，
+	// 没有任何一项需要让同机的其他用户看见（连文件名都不必，见 fsx.DirMode）。
+	//
+	// 用 TightenTree 而不是 Tighten：certs/ 与 uploads/ 是「第一次写入时才建」的，
+	// 光收紧 data 根管不到它们，升级上来的安装会一直等到下次续证书 / 换背景图才收紧。
+	//
+	// 这里不直接用 fsx.EnsureDir，是为了把「权限收紧失败」记进日志：那一步是尽力而为的，
+	// 而此刻日志还没建起来（要先读配置，见下面第 2 步），所以先把结果留在手里。
+	if err := os.MkdirAll(dataDir, fsx.DirMode); err != nil {
 		return fmt.Errorf("创建数据目录失败: %w", err)
 	}
+	tightenErr := fsx.TightenTree(dataDir)
+
+	// 数据目录单实例锁：同一个 data 目录只允许一个进程。两个进程各持一份内存配置时，
+	// 谁后保存谁的算数，另一份的改动无声消失；各模块还会同时去抢同一批端口。
+	// 锁由内核持有、随进程终止自动释放，没有"陈旧锁"这回事（见 internal/lockfile）。
+	//
+	// 拿不到锁分两种，处置完全不同：
+	//   - 确实有人占着（ErrHeld）→ 拒绝启动。这是唯一安全的方向，继续跑下去就是两份配置互相覆盖。
+	//   - 这个挂载点没有文件锁（NFS / CIFS / 某些 FUSE，返回 ENOLCK 之类）→ 照常启动，
+	//     只在日志里记一条。那种环境里谁也拿不到锁，为一个假想风险让面板彻底起不来不划算。
+	//
+	// 自更新与定时重启不会被这把锁挡住：换进程之前会显式放锁（见 servePanels），
+	// 而新二进制的 `-version` 冒烟测试在 main 里就返回了，根本走不到 run。
+	lock, lockErr := lockfile.Acquire(filepath.Join(dataDir, dataLockName), dataLockWait)
+	if errors.Is(lockErr, lockfile.ErrHeld) {
+		return fmt.Errorf("%w；请先停掉那个进程，或用 -data 指定另一个数据目录", lockErr)
+	}
+	defer lock.Release()
 
 	// 1. 配置。
 	cfgMgr := config.NewManager(filepath.Join(dataDir, "config.json"))
@@ -77,6 +120,24 @@ func run(dataDir string) error {
 	})
 	logx.SetGlobal(log)
 	log.Info("Mantou 启动中", "version", version.Load().Version, "dataDir", dataDir)
+
+	// 上面那次收紧的结果，等到现在才有地方说。不当成启动失败：目录仍然可用，
+	// 只是比预期宽松（多见于把 data 挂在 FAT/NTFS/CIFS 上，或目录属主是别的用户）。
+	// 出错的具体是哪一层看 error 里的路径——TightenTree 走的是整棵树。
+	if tightenErr != nil {
+		log.Warn("数据目录权限未能收紧到 0700，同机其他用户可能可以列出其中的文件",
+			"dir", dataDir, "error", tightenErr.Error())
+	}
+	// 同理，锁没拿到也等到现在才有地方说。ErrHeld 那一支已经在上面 return 了，
+	// 走到这里的只剩"这个挂载点给不了锁"，此时第二个实例拦不住，只能把话说清楚。
+	if lockErr != nil {
+		log.Warn("数据目录锁不可用，无法阻止第二个进程写同一个数据目录",
+			"dir", dataDir, "error", lockErr.Error())
+	}
+
+	// 上一次「导入配置」回滚到一半就被杀掉/断电的话，uploads/ 或 certs/ 只剩在
+	// <目录名>.restore-old-<纳秒> 里。必须早于第 4 步：证书模块一起来就要读 certs/。
+	app.ReclaimRestoreLeftovers(dataDir, log)
 
 	// 一次性存储升级：Web 服务子项的 Basic 认证口令从明文改为 bcrypt 哈希。
 	// 必须早于第 4 步的模块启动——Web 服务起来就要用这个字段校验访问了。
@@ -121,10 +182,10 @@ func run(dataDir string) error {
 		LogFile: logFile,
 	})
 
-	return servePanels(baseDeps, log)
+	return servePanels(baseDeps, log, lock)
 }
 
-func servePanels(baseDeps server.Deps, log *logx.Logger) error {
+func servePanels(baseDeps server.Deps, log *logx.Logger, lock *lockfile.Lock) error {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
@@ -224,6 +285,15 @@ func servePanels(baseDeps server.Deps, log *logx.Logger) error {
 			}
 			if baseDeps.Modules != nil {
 				baseDeps.Modules.CloseAll()
+			}
+			// 数据目录锁：在拉起新进程之前显式放掉。
+			//
+			// unix 上 syscall.Exec 会关掉这个 fd（Go 开文件一律带 O_CLOEXEC），锁本来就会随之释放；
+			// Windows 上 execSelf 是"先起子进程、再退自己"，两个进程有一瞬间同时活着——
+			// 不先放锁，新进程要么等满 dataLockWait，要么直接判定"数据目录已被占用"而退出，
+			// 那就等于一次重启把面板永久关掉了。
+			if e := lock.Release(); e != nil {
+				log.Warn("释放数据目录锁失败", "error", e.Error())
 			}
 			if e := execSelf(path); e != nil {
 				// 走到这里已经没有回退：监听关了、模块关了、配置管理器也 Close 了，

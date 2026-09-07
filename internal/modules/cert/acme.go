@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"slices"
 	"strings"
 	"time"
@@ -59,12 +60,19 @@ const (
 // letsEncryptDirectoryURL 默认 CA（Let's Encrypt 生产环境）目录地址。
 const letsEncryptDirectoryURL = "https://acme-v02.api.letsencrypt.org/directory"
 
-// caDirectoryURL 将账户 CA 标识映射为 ACME 目录地址；自定义目录必须是 https。
+// caDirectoryURL 将账户 CA 标识映射为 ACME 目录地址；认不出来的一律返回空串，
+// 由调用方给出明确错误（见 precheckIssue 与 setupACME）。
 //
 // 只接受 https:// 前缀是安全要求，不是洁癖：ACME 目录决定了「向谁申请证书、
 // 把 DNS 验证凭据交给谁」，若允许 http://，任何能改写明文流量的中间人都可以把签发
-// 引导到自己的 CA 并取得可用于该域名的证书。因此 http:// 一律拒绝（返回空串，
-// 由调用方给出明确错误），而不是静默回落到默认 CA——静默回落会让用户以为在用私有 CA。
+// 引导到自己的 CA 并取得可用于该域名的证书。
+//
+// **认不出来时不回落到默认 CA**，包括漏写协议（acme.corp.internal/directory）和
+// 内置名字打错（letsencryp）这两种。回落的后果不是"少了个提示"：用户以为在用自己的
+// 私有 CA，实际上域名清单和账户密钥都发给了 Let's Encrypt，而且它还真能签出证书来
+// ——整件事从头到尾没有一处看起来不对，直到有人去查签发记录。
+// 面板的 CA 下拉框只给三个内置值，所以走到这里的自定义地址来自手改 config.json
+// 或直接调接口，也就是最可能带着笔误的两条路。
 func caDirectoryURL(ca string) string {
 	ca = strings.TrimSpace(ca)
 	switch ca {
@@ -77,14 +85,136 @@ func caDirectoryURL(ca string) string {
 	case "buypass":
 		return "https://api.buypass.com/acme/directory"
 	default:
-		if strings.HasPrefix(ca, "https://") {
+		// 协议名按 RFC 3986 不区分大小写，url.Parse 也会把它归一化成小写，
+		// 所以 HTTPS:// 照收——否则一个大写就把地址推进下面的拒绝分支。
+		if len(ca) >= 8 && strings.EqualFold(ca[:8], "https://") {
 			return ca
 		}
-		if strings.HasPrefix(ca, "http://") {
-			return "" // 明文目录：拒绝
-		}
-		return letsEncryptDirectoryURL
+		return "" // 明文目录、漏写协议、名字打错：全部拒绝
 	}
+}
+
+// unsupportedCAMsg caDirectoryURL 返回空串时给用户看的那句话。
+//
+// 两个调用点共用一份文本：这句话要同时覆盖三种成因（漏写协议、写了 http://、
+// 内置名字打错），各自编一句的话，用户在预检和签发两条路上会看到不一样的解释。
+// 刻意把可选值列出来——报错时最有用的信息是"那我该填什么"。
+func unsupportedCAMsg(ca string) string {
+	return fmt.Sprintf("账户 CA %q 无法识别：内置可选 letsencrypt / letsencrypt-staging / zerossl / buypass，"+
+		"自定义 ACME 目录必须以 https:// 开头（明文目录会让中间人把签发引导到自己的 CA）", ca)
+}
+
+// ACME 目录的出站也归「内网防护」管（审计 F-01）。
+//
+// # 为什么这条出站需要管
+//
+// 自定义 CA 目录是用户可填的任意 https 地址（见 caDirectoryURL），而它此前用的是裸
+// net.Dialer——同一份配置里 DDNS 取址、计划任务 HTTP 动作、通知推送、更新清单拉取
+// 全都经 netguard 约束，只有它不受约束。填一个内网地址进去，面板就会代为发起请求，
+// 由响应差异（连得上 / 证书报错 / 超时）反推内网存活与端口开放，并把域名清单送出去。
+//
+// 影响面比通用 SSRF 小：只能 https（元数据端点那类明文地址够不着）、要有能通过校验的
+// TLS 证书、只会讲 ACME 协议、且只有管理员能配。所以这里做的是**把这条出站并回既有开关**，
+// 不是新加一道默认拦截——默认关闭时行为与从前完全一致（私有 CA 的自建场景照旧可用）。
+//
+// # 为什么不直接换成 netguard.HTTPClient
+//
+// 那条路在防护开启时刻意禁用代理（理由见 netguard.newTransport），换过去会让
+// 「只有代理能出网」的部署里签发直接失败；而它共享的 Transport 也丢掉了这里为
+// 「CA 不可达要快速失败」「不复用被 CA 单方关闭的 HTTP/2 连接」调出来的那组参数。
+// 所以只借它的 Control 钩子（netguard.DialControl），Transport 仍是本地这一份。
+
+// acmeDirectoryBlocked 在建连之前先看目录地址本身：主机是 IP 字面量且落在内网 / 保留段
+// 时直接拒绝，并给出一句能照着改的错误。
+//
+// 与 Control 钩子不重复，它补的正是钩子够不到的那一格——经代理转发时钩子只看得到代理
+// 地址（见 newACMETransport），而 IP 字面量恰好是唯一在拨号那一刻不会变样的写法
+// （域名会：DNS 重绑定），因此在这里判是有效的。blockPrivate 为假时不判，保持开关语义。
+func acmeDirectoryBlocked(directoryURL string, blockPrivate bool) error {
+	if !blockPrivate {
+		return nil
+	}
+	u, err := url.Parse(directoryURL)
+	if err != nil {
+		return fmt.Errorf("ACME 目录地址无法解析: %w", err)
+	}
+	ip := net.ParseIP(u.Hostname())
+	if ip == nil {
+		return nil // 域名交给拨号期的 Control 钩子
+	}
+	if netguard.IsPrivateOrReserved(ip) {
+		return fmt.Errorf("%w：ACME 目录 %s 指向内网 / 保留地址 %s。"+
+			"如确需向内网私有 CA 申请证书，请在「设置 → 安全」关闭内网防护",
+			netguard.ErrBlocked, u.Host, ip.String())
+	}
+	return nil
+}
+
+// newACMETransport 构造本次签发专用的 Transport。
+//
+// 超时与 HTTP/2 那几项的由来：默认情况下 acme.Client 复用 http.DefaultClient，而它没有
+// 连接/头部超时，一旦 ACME 目录或订单接口不可达（网络不通、被防火墙拦截、Docker 桌面
+// 环境无出网等），请求会一直挂到整体 ctx（最长 30 分钟）才失败，表现为证书永久卡在
+// 「正在签发」。这里把连接/TLS/响应头超时收敛到数十秒，让「CA 不可达」类故障快速以明确
+// 错误返回。不强制 HTTP/2 则是为了规避实测中「Register 成功但 AuthorizeOrder 挂死」的
+// 差分现象：极可能是复用了被 CA 单方关闭的空闲 HTTP/2 连接（服务端关闭后客户端仍在其上
+// 发流，直到超时），改走 HTTP/1.1 后每请求的连接探测更可靠。
+//
+// 内网防护开启时二者只能取一个（原因见 netguard.DialControl）：
+//
+//   - 该地址没有代理 → 直连 + 挂 Control 钩子，拨号期逐个 IP 校验，重定向与
+//     「域名解析到内网」同样拦得住；
+//   - 该地址有代理 → 保留代理、不挂钩子。挂了反而两头空：钩子只能校验代理地址，
+//     而代理常部署在 127.0.0.1:8080 这类地址上，于是这一拨号会被自己拦下、签发直接失败。
+//     此时出网策略点是代理本身，面板记一条告警说明这次防护没生效在哪。
+func (i *acmeIssuer) newACMETransport(directoryURL string, blockPrivate bool) *http.Transport {
+	dialer := &net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}
+	tr := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		ForceAttemptHTTP2:     false,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       30 * time.Second,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+	guard, viaProxy := acmeGuardDial(directoryURL, blockPrivate, http.ProxyFromEnvironment)
+	if guard {
+		dialer.Control = netguard.DialControl
+	} else if viaProxy != nil && i.log != nil {
+		i.log.Warn("内网防护对本次 ACME 签发不生效：该目录地址经代理出网，拨号目标是代理而非 CA",
+			"directory", directoryURL, "proxy", viaProxy.Host)
+	}
+	tr.DialContext = dialer.DialContext
+	return tr
+}
+
+// acmeGuardDial 决定本次 ACME 出站是否挂内网防护钩子。
+//
+// 返回 guard=false 时，第二个返回值给出"是因为要经这个代理出网"——调用方据此记告警；
+// 为 nil 则表示防护本就没开，那是正常状态，不必吵。
+//
+// 单独拆出来是为了能把四种组合都测到：proxy 探测走的是 http.ProxyFromEnvironment，
+// 它在进程内只读一次环境变量（sync.Once），测试里 t.Setenv 改不动它，所以把这个函数
+// 依赖的探测器做成参数。
+func acmeGuardDial(directoryURL string, blockPrivate bool, proxy func(*http.Request) (*url.URL, error)) (bool, *url.URL) {
+	if !blockPrivate {
+		return false, nil
+	}
+	if proxy == nil {
+		return true, nil
+	}
+	u, err := url.Parse(directoryURL)
+	if err != nil {
+		return true, nil // 地址本身有问题，往严的那侧倒
+	}
+	proxyURL, err := proxy(&http.Request{URL: u, Host: u.Host})
+	if err != nil || proxyURL == nil {
+		// 解析失败一律当作"没有代理"：那种情况下 Transport 自己发请求时也会失败，
+		// 而这里返回"直连"只会让防护往严的那侧倒。
+		return true, nil
+	}
+	return false, proxyURL
 }
 
 // friendlyACMEError 把常见的 ACME 错误类型翻译为更友好的中文提示，便于面板直接展示原因
@@ -148,27 +278,22 @@ func (i *acmeIssuer) Issue(ctx context.Context, c config.Certificate, account *c
 
 	directoryURL := caDirectoryURL(account.CA)
 	if directoryURL == "" {
-		return nil, nil, fmt.Errorf("ACME 目录地址必须使用 https（当前账户 CA 为 %q）", account.CA)
+		return nil, nil, fmt.Errorf("%s", unsupportedCAMsg(account.CA))
 	}
 
-	// 显式配置带超时的 HTTP 客户端：默认情况下 acme.Client 复用 http.DefaultClient，
-	// 而它没有连接/头部超时，一旦 ACME 目录或订单接口不可达（网络不通、被防火墙拦截、
-	// Docker 桌面环境无出网等），请求会一直挂起直到整体 ctx（最长 30 分钟）才失败，
-	// 表现为证书永久卡在「正在签发」。这里把连接/TLS/响应头超时收敛到数十秒，
-	// 让「CA 不可达」类故障快速以明确错误返回。
-	acmeTransport := &http.Transport{
-		Proxy:       http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-		// 不强制 HTTP/2：实测中「Register 成功但 AuthorizeOrder 挂死」的差分现象，
-		// 极可能是复用了被 CA 关闭的空闲 HTTP/2 连接（连接被服务端关闭后客户端仍在其上发流，
-		// 直到超时）。改为 HTTP/1.1 后每请求的连接探测更可靠，可规避该死连接复用卡死。
-		ForceAttemptHTTP2:     false,
-		MaxIdleConns:          100,
-		IdleConnTimeout:       30 * time.Second,
-		TLSHandshakeTimeout:   15 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
+	// 内网防护（Settings.Security.BlockPrivateNetwork）——自定义 ACME 目录也是一条
+	// 「用户可配置的出站请求」，此前它是唯一绕过这道开关的那条（审计 F-01）。
+	blockPrivate := false
+	if i.cfgMgr != nil {
+		if snap := i.cfgMgr.Snapshot(); snap != nil {
+			blockPrivate = snap.Settings.Security.BlockPrivateNetwork
+		}
 	}
+	if err := acmeDirectoryBlocked(directoryURL, blockPrivate); err != nil {
+		return nil, nil, err
+	}
+
+	acmeTransport := i.newACMETransport(directoryURL, blockPrivate)
 	// 这个连接池只服务本次签发。签发完就丢，而丢掉不等于关掉——不主动关，
 	// 到 CA 的空闲连接还要挂 30 秒（IdleConnTimeout）。
 	defer acmeTransport.CloseIdleConnections()
@@ -561,12 +686,40 @@ func absoluteName(fqdn string) string {
 	return name + "."
 }
 
+// errOrderReadyTimeout 「等到超时订单还没就绪」。三处返回它：整体预算用光、
+// 睡醒发现预算已经用光、以及单次查询自己超时（见 waitOrderReady 里的说明）。
+var errOrderReadyTimeout = errors.New("等待订单就绪超时")
+
 // waitOrderReady 轮询订单直到 ready/valid。
+//
+// 每次查询都单独设截止，与注册 / 建订单 / 提交验证 / 签发那几步同一口径（见 acmeStepTimeout）。
+// 原先这里直接用外层 ctx：整体预算（acmeOrderReadyTimeout）只在**查询返回之后**才检查一次，
+// 于是一次挂住的查询能把这个函数拖到远超预算——x/crypto/acme 的客户端在 5xx / badNonce 上
+// 会带退避自己重试，那些重试全都算在同一次 GetOrder 里，只受 ctx 约束。
+// 表现是证书长时间卡在「正在签发」，最后抛出来的还是外层 ctx 的错（整轮签发最长 30 分钟），
+// 而不是「等待订单就绪超时」这句能看懂的话。
 func (i *acmeIssuer) waitOrderReady(ctx context.Context, client *acme.Client, orderURL string) error {
 	deadline := time.Now().Add(acmeOrderReadyTimeout)
 	for {
-		order, err := client.GetOrder(ctx, orderURL)
+		// 单次上限再夹一道「到整体截止还剩多久」：这样最后一次查询也不会跑过预算，
+		// 超时那一刻报的就是本函数自己的话。
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return errOrderReadyTimeout
+		}
+		getCtx, getCancel := context.WithTimeout(ctx, min(remaining, acmeStepTimeout))
+		order, err := client.GetOrder(getCtx, orderURL)
+		getCancel()
 		if err != nil {
+			// 外层 ctx 结束（用户取消 / 整轮签发超时）按它本来的错返回，别改写成别的意思。
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			// 只是这一次查询自己超时：说成「等待订单就绪超时」，而不是抛一个裸的
+			// context deadline exceeded——后者对着面板上的人什么也没说明。
+			if errors.Is(err, context.DeadlineExceeded) {
+				return errOrderReadyTimeout
+			}
 			return fmt.Errorf("查询订单状态失败: %w", err)
 		}
 		switch order.Status {
@@ -575,8 +728,9 @@ func (i *acmeIssuer) waitOrderReady(ctx context.Context, client *acme.Client, or
 		case acme.StatusInvalid:
 			return fmt.Errorf("ACME 订单无效")
 		}
+		// 这一次已经查到「还没就绪」且预算用光：立刻收摊，不必再睡 3 秒。
 		if time.Now().After(deadline) {
-			return fmt.Errorf("等待订单就绪超时")
+			return errOrderReadyTimeout
 		}
 		select {
 		case <-ctx.Done():

@@ -21,6 +21,8 @@
 # 启动：  docker compose up -d
 # 查看：  docker compose logs -f
 # 升级：  docker compose pull && docker compose up -d   （使用远程镜像时）
+#         镜像变了之后这条命令会**重建**容器，也就是换一个新的可写层。所以数据必须落在
+#         容器之外——默认已挂命名卷 mantou-data（见下方「数据持久化」），无需额外操作。
 
 services:
   mantou:
@@ -71,17 +73,48 @@ services:
       # 与下方 deploy.resources.limits.memory=256M 配套：软上限先起作用，硬上限只是兜底。
       - GOMEMLIMIT=200MiB
 
-    # ---- 数据持久化：全部在容器内（无外部挂载） ----
-    # 设计意图：所有配置 / 日志 / 上传背景图 / 证书 直接写入容器可写层（由 MANTOU_DATA_DIR=/data 指定）。
-    # 不挂命名卷、也不挂绑定挂载 —— 因此「删除容器即删除全部数据」：
-    #   - `docker rm mantou` 或 `docker compose down`（移除容器）后，数据随可写层一并消失；
-    #   - `docker restart` / `restart: unless-stopped` 自动重启、宿主机重启都不丢（可写层保留）。
-    # 跨设备 / 长期保留请依赖面板内的「配置备份」导出（AES 加密），不要指望容器留存。
-    # 如需改为外部持久化（数据独立于容器），再启用下方任一行即可：
-    #   - mantou-data:/data      # 命名卷（Docker 管理，删容器不丢，仅 down -v 才丢）
-    #   - ./data:/data           # 绑定挂载（落到宿主机目录，便于查看/同步）
-    # volumes:
-    #   - mantou-data:/data
+    # ---- 数据持久化：命名卷（默认） ----
+    # /data 里是 config.json、日志、上传的背景图、证书私钥，以及 master.key——那把钥匙是
+    # 解开配置里凭证字段（DDNS / 通知 / 反代 的那些密码）的唯一途径，丢了只能一项项重填。
+    #
+    # 为什么默认就挂卷：上面「升级」那条命令在镜像变了之后会重建容器，而重建等于换一个新的
+    # 可写层。数据要是留在可写层里，一次例行升级就把它们全部清空，且没有任何提示——一条写在
+    # 同一个文件里的常规操作不该有这种后果。命名卷由 Docker 管理、独立于容器生命周期：
+    # `up -d` 重建、`down` 之后再 `up` 都还在，只有显式 `down -v` 才会删。
+    volumes:
+      - mantou-data:/data
+    # 想让数据落在宿主机目录里（便于直接查看、同步、纳入现有备份方案），把上面一行换成绑定挂载：
+    #   - ./data:/data
+    # 绑定挂载下 /data 的属主是宿主机那个目录的属主；配合下方「收紧容器权限」时要自己把它
+    # chown 给对应 uid。
+    #
+    # 想回到「全部在容器内、删容器即删数据」的一次性用法（临时试用、CI 里跑一遍就丢），把
+    # volumes 这两行注释掉即可：那样数据写进可写层，`docker restart`、`restart: unless-stopped`
+    # 自动重启、宿主机重启都不丢，但 `docker compose down`、`docker rm`、以及任何一次镜像
+    # 升级都会清空。那种用法下务必用面板内的「配置备份」导出（AES 加密）另存一份。
+
+    # ---- 可选：收紧容器权限（默认不启用） ----
+    # 默认以 root 运行，理由见 Dockerfile 末尾：Web 服务 / 端口转发要能绑任意端口（含 80、443
+    # 这类特权端口），WOL 还需要二层广播。如果这台面板只用到 1024 以上的端口，可以把下面几项
+    # 取消注释，让它以非 root 跑：
+    #
+    # user: "65532:65532"                  # 镜像里没有建这个用户，只能用数字 uid:gid
+    # cap_drop: [ALL]
+    # cap_add: [NET_BIND_SERVICE]          # 只留「可绑特权端口」这一项；不用 80/443 可连它一起去掉
+    # security_opt: [ "no-new-privileges:true" ]
+    # read_only: true                      # 根文件系统只读；程序的写入全部落在 /data 里
+    # tmpfs: [ /tmp ]                      # 只读根下给 /tmp 留一块内存盘（兜底，程序自身不用它）
+    #
+    # 三条代价，启用之前要先知道：
+    #  1. 命名卷首次创建时 /data 归 root（镜像里的 VOLUME ["/data"]），换 uid 之前得先改属主，
+    #     否则容器起不来（stderr 上一句 permission denied）。一次性命令：
+    #       docker compose down
+    #       docker run --rm -v mantou-data:/data alpine chown -R 65532:65532 /data
+    #  2. read_only: true 之后，「关于」页里的在线覆盖更新用不了——它要把新二进制写到 /app。
+    #     容器本来就该靠拉新镜像升级；那种自我覆盖即使成功，也会在下一次重建容器时随可写层
+    #     一起消失。
+    #  3. WOL 的二层广播、组播发现照旧只在 host 网络下才通。那是网络模式的限制，与这里的
+    #     权限无关（见上方「模式 B」）。
 
     # ---- 关于健康状态标签：不提供 ----
     # 容器只有 running / stop 两个默认状态，不会出现 healthy / unhealthy。
@@ -104,8 +137,21 @@ services:
         limits:
           memory: 256M
 
-# 数据备份（当前为纯容器内，无命名卷）：用 docker cp 进出容器
-#   导出：docker cp mantou:/data ./mantou-data-backup
-#   导入（先 docker compose up 建好容器）：docker cp ./mantou-data-backup/. mantou:/data
-# 命名卷方案（如需启用）的备份命令：
-#   docker run --rm -v mantou-data:/data -v "$PWD":/backup alpine tar czf /backup/mantou-data.tgz -C /data .
+# 上面 services.mantou.volumes 引用的那个卷。只声明、不配选项，由 Docker 用默认的 local
+# 驱动创建（宿主机上实际落在 /var/lib/docker/volumes/mantou-data/_data）。
+volumes:
+  mantou-data:
+    # 显式定名，禁掉 compose 默认的「项目名_卷名」前缀。不写这一行的话真实卷名会随项目
+    # 目录名变（如 mantou_mantou-data），下面那几条 `docker run -v mantou-data:/data` 就会
+    # 各自新建一个空卷、备份出一个空包，而且不报错。
+    name: mantou-data
+
+# 数据备份（默认的命名卷方案）：把卷里的内容打成一个 tar.gz
+#   导出：docker run --rm -v mantou-data:/data -v "$PWD":/backup alpine tar czf /backup/mantou-data.tgz -C /data .
+#   导入：docker compose down
+#         docker run --rm -v mantou-data:/data -v "$PWD":/backup alpine tar xzf /backup/mantou-data.tgz -C /data
+#         docker compose up -d
+# ⚠️ 这个包里有 master.key 与证书私钥，拿到它等于拿到这台面板的全部凭证，请按密钥的规格保管。
+# 换成绑定挂载（./data:/data）的话，直接备份宿主机上那个目录即可。
+# 若把 volumes 注释掉退回纯容器内模式，则只能 docker cp 进出容器，且容器一旦被删就没得可拷：
+#   docker cp mantou:/data ./mantou-data-backup

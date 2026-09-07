@@ -63,7 +63,11 @@ const (
 	aadJWTSecret  = "auth.jwtSecret"
 	aadTOTPSecret = "auth.twoFA.secret"
 	aadACMEKey    = "acme.privateKeyPem"
-	aadCredential = "credential.secret"
+	// aadACMEEABHMAC 外部账户绑定（EAB）的 HMAC 密钥。ZeroSSL、Google 这类 CA 要求
+	// 用它来证明"这个 ACME 账户属于我的 CA 后台账号"，拿到它就能在对方账下注册账户、
+	// 消耗配额、签发证书——与账户私钥同一量级的东西，没有理由只加密其中一个。
+	aadACMEEABHMAC = "acme.eabHmac"
+	aadCredential  = "credential.secret"
 	// 消息路由模块的三类凭证。
 	//
 	// aadWebhookToken 入站接收器的令牌：拿到它就能冒充第三方系统往面板推消息。
@@ -230,6 +234,9 @@ func walkSecrets(cfg *Config, fn func(value, aad string) (string, error)) error 
 	for i := range cfg.ACMEAccounts {
 		acc := &cfg.ACMEAccounts[i]
 		if err := apply(&acc.PrivateKeyPEM, aadACMEKey, "ACME 账户 "+acc.Email+" 的私钥"); err != nil {
+			return err
+		}
+		if err := apply(&acc.EABHMAC, aadACMEEABHMAC, "ACME 账户 "+acc.Email+" 的 EAB 密钥"); err != nil {
 			return err
 		}
 	}

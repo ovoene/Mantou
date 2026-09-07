@@ -5,6 +5,8 @@ import (
 	"encoding/hex"
 	"sync"
 	"time"
+
+	"mantou/internal/mapx"
 )
 
 // sessionGrace 是"关闭/信标"软注销的宽限期：在宽限内若同一会话有新的鉴权请求到达
@@ -15,6 +17,28 @@ const sessionGrace = 5 * time.Second
 // sessionSweepInterval 是后台清扫周期：定期移除已过绝对过期时间的会话记录，
 // 避免长期运行后「登录过、到期后再没访问过」的记录在内存映射中持续堆积。
 const sessionSweepInterval = 10 * time.Minute
+
+const (
+	// sessionMaxEntries 会话表条目上限（审计 R-02）。
+	//
+	// 这张表的键是令牌哈希，每次登录成功都新增一条，而条目要活到**绝对过期时间**
+	// （Auth.SessionHours，默认按小时计）才会被清掉——sweepLoop 每 10 分钟一轮，
+	// 且只清绝对过期的那些。于是"反复登录"这一个动作就能把表一路堆上去，中间没有
+	// 任何一处拦它：登录限流只在**失败**时记账，成功登录不留痕迹。
+	//
+	// 这不是未授权访问漏洞（每一条都要先过一次口令校验），而是一条无界内存增长。
+	// 面板的部署常态是内存很小的机器（README 给的参考是 128MB 级），
+	// 每条会话连键带结构体约 200 字节，堆到几十万条就足以把进程顶死。
+	//
+	// 上限取得比 loginLimiterMaxEntries（4096）小得多：那张表按 IP 记账、来源可以
+	// 任意多，而这张表的每一条都对应一次成功登录，且面板只有一个账号——真实并发
+	// 会话是"几个浏览器 / 几台设备"的量级。512 条已远超任何正常用法。
+	sessionMaxEntries = 512
+	// sessionShrinkFloor 触发 map 重建的最小峰值，理由同 loginLimiterShrinkFloor：
+	// 删条目不会让 map 归还桶内存（见 mapx.ShrinkSparse），表被堆满再清空之后，
+	// 那块桶数组会一直挂在进程上直到重启。峰值低于该阈值时不值得为此付一次全表拷贝。
+	sessionShrinkFloor = 64
+)
 
 // sessionEntry 是单条服务端会话状态。
 type sessionEntry struct {
@@ -33,6 +57,8 @@ type sessionRegistry struct {
 	entries  map[string]*sessionEntry
 	stop     chan struct{}
 	stopOnce sync.Once
+	// peak 记录 entries 见过的最大条目数，供 sweep 判断是否该重建 map 以真正释放内存。
+	peak int
 }
 
 func newSessionRegistry() *sessionRegistry {
@@ -58,15 +84,24 @@ func (r *sessionRegistry) sweepLoop() {
 		case <-r.stop:
 			return
 		case now := <-ticker.C:
-			r.mu.Lock()
-			for k, e := range r.entries {
-				if now.After(e.expiresAt) {
-					delete(r.entries, k)
-				}
-			}
-			r.mu.Unlock()
+			r.sweep(now)
 		}
 	}
+}
+
+// sweep 移除已过绝对过期时间的会话。删除只清条目、不缩容，因此清扫后顺带判断一次
+// 是否该整表重建——把表堆到上限再放空之后，那块桶内存本来会一直挂着（见
+// mapx.ShrinkSparse）。单独成一个方法（而不是留在 sweepLoop 里）是为了让上限与
+// 缩容能被直接测到，不必等那 10 分钟的 ticker；与 loginLimiter.sweep 同一形状。
+func (r *sessionRegistry) sweep(now time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for k, e := range r.entries {
+		if now.After(e.expiresAt) {
+			delete(r.entries, k)
+		}
+	}
+	r.entries = mapx.ShrinkSparse(r.entries, &r.peak, sessionShrinkFloor)
 }
 
 // close 停止后台清扫协程；可安全多次调用。
@@ -85,10 +120,56 @@ func (r *sessionRegistry) add(token, username string, ttl time.Duration) {
 	now := time.Now()
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// 先把表压回上限以内再插入——顺序反过来的话，被淘汰的可能正是刚插进去的这一条，
+	// 于是登录返回了一个从一开始就无效的令牌。
+	r.trimToCap(now)
 	r.entries[sessionKey(token)] = &sessionEntry{
 		username:   username,
 		expiresAt:  now.Add(ttl),
 		lastSeenAt: now,
+	}
+	if n := len(r.entries); n > r.peak {
+		r.peak = n
+	}
+}
+
+// trimToCap 在插入新会话前把表压回 sessionMaxEntries - 1 条以内；调用方须持有 r.mu。
+//
+// 淘汰而不是拒绝。拒绝的写法看着更"安全"，实际是把一条内存护栏改造成了拒绝服务的开关：
+// 把表填满这件事只需要一份有效凭据就能做到，而一旦满了，管理员自己就再也登不进来。
+// 淘汰的取舍与 loginLimiter.evictOne 一致——内存有界优先，代价落在"淘汰哪一条"上。
+//
+// 不写日志：这张表和 loginLimiter 一样没有 logger，为一条几乎不会触发的分支把它
+// 穿进来要改动全部构造点；而真到了 512 条会话，管理员从「别处的会话」计数（见
+// revokeAll）也看得见。
+func (r *sessionRegistry) trimToCap(now time.Time) {
+	if len(r.entries) < sessionMaxEntries {
+		return
+	}
+	// 一、先清已经没救的：绝对过期的，以及宽限已过（关掉最后一个标签页后再没回来）的。
+	// 这两类在下一次 valid() 里本来就会被判死，只是没人再来访问，所以一直挂着。
+	for k, e := range r.entries {
+		if now.After(e.expiresAt) || (!e.pendingDeleteAt.IsZero() && now.After(e.pendingDeleteAt)) {
+			delete(r.entries, k)
+		}
+	}
+	// 二、还活着的，从最久没露面的那条开始淘汰。lastSeenAt 每次鉴权请求都会刷新
+	// （后台静默轮询也算，见 valid），所以"最久没露面"就是"这个浏览器最可能已经不在了"。
+	for len(r.entries) >= sessionMaxEntries {
+		var (
+			victim string
+			found  bool
+			oldest time.Time
+		)
+		for k, e := range r.entries {
+			if !found || e.lastSeenAt.Before(oldest) {
+				victim, found, oldest = k, true, e.lastSeenAt
+			}
+		}
+		if !found {
+			return
+		}
+		delete(r.entries, victim)
 	}
 }
 

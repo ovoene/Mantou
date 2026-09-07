@@ -17,6 +17,18 @@
 #   - MIRROR        : 基础镜像前缀（加速站），结尾需带 / ；为空则走 docker.io
 #   - GOPROXY       : Go 模块代理，为空回退到官方代理 + direct
 #   - NPM_REGISTRY  : npm 镜像源，为空则走官方源
+#
+# 供应链：三个基础镜像都按 digest 钉死（见各 FROM 行）。这三个参数因此只决定**从哪里取**，
+# 不决定**取到什么**——digest 是内容地址，加速站给错了东西构建会直接失败；同理 Go 依赖由
+# go.sum 校验、npm 依赖由 package-lock.json 的 integrity 校验。换言之，一个有恶意的镜像源
+# 只能让构建失败，不能悄悄换掉内容。
+#
+# 但用镜像源构建出来的镜像仍然**不是官方产物**：官方镜像只由 .github/workflows/release.yml
+# 在 GitHub Actions 上构建并推到 ghcr.io，带构建来源证明（provenance）。本地/自建构建会把
+# 实际用过的镜像源记进 OCI 标签（见阶段 3 的 LABEL），方便事后分辨手里这个镜像是怎么来的。
+#
+# 升级 digest 的办法（不要手写）：
+#   docker buildx imagetools inspect node:24-alpine --format '{{.Manifest.Digest}}'
 # ============================================================================
 
 ARG MIRROR=
@@ -25,14 +37,21 @@ ARG GOPROXY=
 ARG NPM_REGISTRY=
 
 # ---------- 阶段 1：构建前端 ----------
-# node:22-alpine：Node 20 已于 2026-04 结束维护（不再收安全补丁），故抬到 22（LTS，维护至 2027-04）。
+# node:24-alpine：24 是当前的 Active LTS；22 已进入维护期（只收安全补丁，2027-04 结束）。
+# 前端工具链此刻要求的下限是 Node 22.12（vite 8 的 engines 是 ^20.19.0 || >=22.12.0，
+# vue-i18n 11 是 >= 22），这里取 LTS 线的上一档而不是刚好压线的那一版——理由同后端那段：
+# 构建镜像的版本是**编译环境**，抬它不会抬高对使用者的要求，而压线的那一版会在下一次
+# 依赖升级时又变成不够用。web/package.json 的 engines 里写的才是真正的下限。
 #
 # --platform=$BUILDPLATFORM 是多架构构建的关键：钉在**构建机**的架构上，不跟目标架构走。
 # 前端产物是 JS / CSS / HTML，与 CPU 架构无关，两个目标架构本可以共用同一份。
 # 不钉的话 buildx 会为 linux/arm64 再跑一遍这个阶段，而 amd64 的构建机上那一遍是在
 # QEMU 模拟的 aarch64 里跑的——npm ci 全是 fork/exec 和小文件读写，正是模拟最慢的一类负载，
 # 实测会从一分多钟变成几十分钟甚至看起来像卡死。钉上之后这个阶段只跑一次，且是原生速度。
-FROM --platform=$BUILDPLATFORM ${MIRROR}node:22-alpine AS web-builder
+#
+# digest 是 node:24-alpine 这个**移动标签**在钉的那一刻指向的那份多架构清单（amd64/arm64 都在里面）。
+# 标签留着只为可读性，真正生效的是 @sha256。升级见文件头。
+FROM --platform=$BUILDPLATFORM ${MIRROR}node:24-alpine@sha256:e67514e5d0f6c46656005e1b693b2ec9d52e80b641307de684d4a015ba7a4eaf AS web-builder
 WORKDIR /web
 
 # 重新声明以便在本阶段 RUN 中使用传入的构建参数（全局 ARG 仅在 FROM 行可见）
@@ -51,10 +70,17 @@ COPY web/ ./
 RUN npm run build:only
 
 # ---------- 阶段 2：构建后端 ----------
-# golang:1.26-alpine：Go 1.22 早已结束维护（官方只支持最近两个大版本），继续用它构建意味着
-# 二进制里静态链接的是一个不再接收安全补丁的标准库——net/http、crypto/tls 的漏洞修复都拿不到。
-# 版本下限同时由 go.mod 的 go 指令（1.25.0）约束，此处取更高的 1.26 以获得最新补丁。
-FROM --platform=$BUILDPLATFORM ${MIRROR}golang:1.26-alpine AS go-builder
+# golang:1.27-alpine：Go 官方只支持最近两个大版本，用已结束维护的版本构建意味着二进制里
+# 静态链接的是一个不再接收安全补丁的标准库——net/http、crypto/tls 的漏洞修复都拿不到。
+#
+# 这里取**当前稳定线**而不是刚好满足 go.mod 的那一版：go 指令（1.26.0，由 x/crypto v0.56.0
+# 的下限决定）是**编译器版本下限**，不是上限，用更新的工具链构建完全合法，且能拿到最新的
+# 标准库补丁；而 go.mod 仍停在 1.26.0，意味着手里只有 Go 1.26 的人照样能自行构建——
+# 抬高构建镜像不等于抬高对使用者的要求，这两件事刻意分开。
+#
+# 同样按 digest 钉死（升级办法见文件头）：浮动的 1.27-alpine 标签意味着同一个提交在两天里
+# 可能被两个不同的补丁版编译，出了问题连"用哪个工具链编的"都说不清。
+FROM --platform=$BUILDPLATFORM ${MIRROR}golang:1.27-alpine@sha256:cf6fca6641884b8433441b2b0652976f975e1d0fdd26d177eaaf8596087f3125 AS go-builder
 WORKDIR /src
 
 # 构建缓存加速（可选）
@@ -117,7 +143,20 @@ RUN go build -trimpath -mod=readonly \
 #
 # alpine:3.24：3.20 已于 2026-05 结束维护，ca-certificates / musl 的安全更新都停在那里；
 # ACME 与 DDNS 全程依赖根证书，运行镜像的证书库过期会直接导致签发与解析更新失败。
-FROM ${MIRROR}alpine:3.24 AS runtime
+#
+# digest 钉的是清单列表（amd64/arm64 都在其中），因此这一行对两个目标架构都成立。
+# 注意：apk add 拉的包不在 digest 覆盖范围内（那是构建时从 alpine 仓库取的当天版本），
+# 这也是要的效果——证书库和时区数据本来就该是构建当天的最新版。
+FROM ${MIRROR}alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b AS runtime
+
+# 实际用过的镜像源记进标签：官方镜像这三项都是空的（release.yml 不传这几个参数）。
+# `docker image inspect` 一看就知道手里这个镜像是不是自建的、依赖从哪来。
+ARG MIRROR
+ARG GOPROXY
+ARG NPM_REGISTRY
+LABEL io.mantou.build.mirror="${MIRROR}" \
+      io.mantou.build.goproxy="${GOPROXY}" \
+      io.mantou.build.npm-registry="${NPM_REGISTRY}"
 
 # 时区 + CA 证书（DDNS/ACME 走 HTTPS 需要）
 RUN apk add --no-cache ca-certificates tzdata

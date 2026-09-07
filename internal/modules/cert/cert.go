@@ -1051,7 +1051,7 @@ func precheckIssue(target config.Certificate, account config.ACMEAccount, dnsPro
 		return fmt.Errorf("未选择有效的 ACME 账户")
 	}
 	if caDirectoryURL(account.CA) == "" {
-		return fmt.Errorf("ACME 目录地址必须使用 https（当前账户 CA 为 %q）", account.CA)
+		return fmt.Errorf("%s", unsupportedCAMsg(account.CA))
 	}
 	// 仅支持 DNS-01：凭证缺失时 DNS 记录无从写入，必然在验证阶段失败。
 	if strings.TrimSpace(target.CredentialRef) == "" || dnsProvider == "" {

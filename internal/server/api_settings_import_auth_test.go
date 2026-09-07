@@ -167,7 +167,10 @@ func TestImportRevokesSessionsWhenCredentialsChanged(t *testing.T) {
 		}); err != nil {
 			t.Fatal(err)
 		}
-		mine, other := "token-当前这台", "token-另一台"
+		// 令牌值只能用 ASCII：http.Request.AddCookie 静默丢掉非法字节，
+		// "token-当前这台" 与 "token-另一台" 会一起塌成 "token-"，
+		// 于是"两条不同会话"变成同一条（见 reauth_test.go 里 callWithSession 那道断言）。
+		mine, other := "token-current-session", "token-another-session"
 		target.sessions.add(mine, "admin", time.Hour)
 		target.sessions.add(other, "admin", time.Hour)
 
@@ -192,7 +195,7 @@ func TestImportRevokesSessionsWhenCredentialsChanged(t *testing.T) {
 	t.Run("换了账户名：全部失效，包括当前这台", func(t *testing.T) {
 		target, targetManager, _ := newE2EEnv(t)
 		seedLocalConfig(t, targetManager) // 本机叫 local-admin，备份里叫 admin
-		mine := "token-当前这台"
+		mine := "token-current-session"   // 同上：只能用 ASCII
 		target.sessions.add(mine, e2eLocalAccount, time.Hour)
 
 		rec := importBackupWithAuth(t, target, backup, e2eLocalAccount, e2eLocalPassword, mine)
@@ -231,7 +234,7 @@ func TestImportRevokesSessionsWhenCredentialsChanged(t *testing.T) {
 		}); err != nil {
 			t.Fatal(err)
 		}
-		mine := "token-当前这台"
+		mine := "token-current-session" // 同上：只能用 ASCII
 		target.sessions.add(mine, "admin", time.Hour)
 
 		rec := importBackupWithAuth(t, target, backup, "admin", e2eAdminPassword, mine)

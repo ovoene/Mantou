@@ -305,6 +305,87 @@ func TestExtractTokenPrefersSchemeMatchingCookie(t *testing.T) {
 			t.Fatalf("期望取到 %q，实际 %q", "from-header", got)
 		}
 	})
+
+	t.Run("Bearer 优先于 Cookie", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(w)
+		ctx.Request = newSchemeRequest(t, false, http.MethodGet, "/", "")
+		ctx.Request.Header.Set("Cookie", sessionCookie+"=from-cookie")
+		ctx.Request.Header.Set("Authorization", "Bearer from-header")
+		// 请求头是调用方显式写上去的，Cookie 是浏览器自动附带的（见 sessionTokens）。
+		if got := s.extractToken(ctx); got != "from-header" {
+			t.Fatalf("期望取到 %q，实际 %q", "from-header", got)
+		}
+	})
+}
+
+// 一条残留的令牌不该把同一个请求里那条有效的挡在门外：authRequired 逐条试到通过为止。
+// 三个场景对应三种"残留"的来路——协议切换留下的 Cookie、升级前的旧名字 Cookie、
+// 以及脚本手动带 Bearer 而浏览器同时塞了一条过期 Cookie 的混合调用。
+func TestAuthRequiredTriesEveryCandidateToken(t *testing.T) {
+	s := newAuthTestServer(t)
+	cfg := s.deps.Config.Snapshot()
+	token, err := auth.IssueToken(cfg.Auth.JWTSecret, cfg.Auth.Username, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.sessions.add(token, cfg.Auth.Username, time.Hour)
+
+	r := gin.New()
+	r.Use(s.authRequired())
+	// 顺带断言：下游拿到的必须是鉴权认定的那条，而不是请求里优先级更高的那条残留。
+	r.GET("/me", func(c *gin.Context) {
+		if got := s.extractToken(c); got != token {
+			t.Errorf("下游取到的令牌不是鉴权认定的那条：%q", got)
+		}
+		c.Status(http.StatusNoContent)
+	})
+
+	for _, tc := range []struct {
+		name   string
+		secure bool
+		cookie string
+		bearer string
+	}{
+		{
+			name: "TLS 下 __Host- 那条是残留，明文那条有效", secure: true,
+			cookie: sessionCookieSecure + "=stale; " + sessionCookie + "=" + token,
+		},
+		{
+			name: "明文下普通那条是残留，旧名字那条有效", secure: false,
+			cookie: sessionCookie + "=stale; " + sessionCookieLegacy + "=" + token,
+		},
+		{
+			name: "Cookie 全是残留，Bearer 有效", secure: false,
+			cookie: sessionCookie + "=stale; " + sessionCookieLegacy + "=also-stale",
+			bearer: token,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := newSchemeRequest(t, tc.secure, http.MethodGet, "/me", "")
+			req.Header.Set("Cookie", tc.cookie)
+			if tc.bearer != "" {
+				req.Header.Set("Authorization", "Bearer "+tc.bearer)
+			}
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, req)
+			if rec.Code != http.StatusNoContent {
+				t.Fatalf("有效令牌应通过鉴权，得到 %d: %s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+
+	// 全是残留时仍然要拒绝——上面那条"逐条试"不能退化成放行。
+	t.Run("全部候选都无效仍拒绝", func(t *testing.T) {
+		req := newSchemeRequest(t, false, http.MethodGet, "/me", "")
+		req.Header.Set("Cookie", sessionCookie+"=stale; "+sessionCookieLegacy+"=also-stale")
+		req.Header.Set("Authorization", "Bearer nope")
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("期望 401，得到 %d: %s", rec.Code, rec.Body.String())
+		}
+	})
 }
 
 // 退出登录要清掉全部三个名字：协议切换后浏览器可能同时存着多条，只清相符的那条会让其余的

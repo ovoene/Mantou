@@ -22,14 +22,16 @@ import (
 
 	"mantou/internal/auth"
 	"mantou/internal/config"
+	"mantou/internal/fsx"
 	"mantou/internal/modules/wol"
 	"mantou/internal/netguard"
 	"mantou/internal/version"
 )
 
-// handleExportConfig 导出完整配置，备份文件始终以「登录账户名 + 密码」加密（AES-256-GCM）。
-// 账户名须与当前登录账户一致、密码须正确，校验通过后才派生密钥加密，避免用任意凭据加密。
-// 备份即密文，明文配置不会落盘；忘记密码将无法解密恢复，故导出时明确提示用户牢记。
+// handleExportConfig 导出完整配置，备份文件以「登录账户名 + 备份口令」加密（AES-256-GCM）。
+// 备份口令默认就是登录密码；也可以另给一个独立口令（请求里的 passphrase），此时登录密码
+// 只用来证明身份、不参与派生密钥。无论哪种，账户名与登录密码都必须先校验通过，
+// 避免用任意凭据加密。备份即密文，明文配置不会落盘；口令丢了就解不开，故导出时明确提示。
 const (
 	maxBackupFileSize = 128 * 1024 * 1024
 	maxBackupItemSize = 16 * 1024 * 1024
@@ -38,12 +40,27 @@ const (
 )
 
 func (s *Server) handleExportConfig(c *gin.Context) {
+	// 失败计数排在最前面：键取自会话 Cookie，不需要先把请求体读进来（见 reauth.go）。
+	if !s.reauthAllowed(c) {
+		return
+	}
 	s.backupMu.Lock()
 	defer s.backupMu.Unlock()
 
 	var req struct {
 		Account  string `json:"account"`
 		Password string `json:"password"`
+		// Passphrase 可选。填了它，备份就用它加密，登录密码只用于身份校验。
+		//
+		// 为什么要给这条路：不填时备份口令**就是**登录密码，于是「把备份交给别人保管」
+		// 与「把面板密码交给别人」变成同一件事——而备份里存着明文凭证（见 config_crypt.go
+		// 文件头），拿到备份的人不只能登面板，还能读到 DDNS、Webhook、证书私钥全套。
+		// 反过来，改登录密码也不会让旧备份跟着换口令：那些文件仍旧用当时的密码加密着，
+		// 而用户会记成"我的密码是新的那个"，等到要恢复时才发现解不开。
+		//
+		// 还有一条更实际的：登录密码受 bcrypt 的 72 字节上限约束，备份口令不受
+		//（PBKDF2 没这个限制），想用一长串 passphrase 保护离线文件时只有这条路。
+		Passphrase string `json:"passphrase"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil || req.Password == "" {
 		respondError(c, http.StatusBadRequest, "请提供加密所用的账户名与密码")
@@ -53,7 +70,39 @@ func (s *Server) handleExportConfig(c *gin.Context) {
 	if strings.TrimSpace(req.Account) != cfg.Auth.Username || !auth.VerifyPassword(cfg.Auth.PasswordHash, req.Password) {
 		// 注意：这里返回 403 而非 401。前端响应拦截器会在收到 401 时强制登出跳转登录页，
 		// 而导出密码错误属于正常业务失败，应仅提示用户、停留在当前页面。
+		s.reauthFail(c)
 		respondError(c, http.StatusForbidden, "密码错误")
+		return
+	}
+	s.reauthOK(c)
+	// 备份口令定下来：默认沿用登录密码（保持原有行为，界面不填那一栏就是这条）。
+	//
+	// 校验放在身份闸之后、收集证书之前：一个能自解释的 400 要在跑那一堆磁盘 IO 前给出，
+	// 而不是让用户等完整个导出流程再被告知口令太短。
+	backupPass := req.Password
+	if req.Passphrase != "" {
+		if n := len(req.Passphrase); n < minBackupPassphraseLen || n > maxBackupPassphraseLen {
+			respondError(c, http.StatusBadRequest, fmt.Sprintf("独立备份口令需在 %d 到 %d 个字节之间",
+				minBackupPassphraseLen, maxBackupPassphraseLen))
+			return
+		}
+		backupPass = req.Passphrase
+	}
+	// 下限对**实际用于派生密钥的那个口令**生效，不管它来自哪一侧（审计 S-01）。
+	//
+	// 少了这一条，「不填独立口令」就成了绕过下限的那条路：登录密码的下限只有 6
+	//（api_auth.go 的 minPasswordLen），于是整份备份——含全部凭证明文——的 KDF 输入
+	// 可以只有 6 字节。而下限本来就是为离线爆破定的（见 minBackupPassphraseLen 的说明），
+	// 那个理由与口令来自登录密码还是独立口令毫无关系。
+	//
+	// 拒绝而不是静默放行：这条路永远有出口——填一个独立备份口令就行，
+	// 所以不会把用户卡在"导不出来又没法改"的死角里。上限只对独立口令有意义
+	// （登录密码受 bcrypt 的 72 字节限制，本来就到不了 256）。
+	if len(backupPass) < minBackupPassphraseLen {
+		respondError(c, http.StatusBadRequest, fmt.Sprintf(
+			"备份口令至少需要 %d 个字节，当前登录密码只有 %d 个字节："+
+				"请在导出时填写「独立备份口令」，或先把登录密码改长一些",
+			minBackupPassphraseLen, len(backupPass)))
 		return
 	}
 	certBackups := make([]CertBackup, 0, len(cfg.Certs))
@@ -109,7 +158,7 @@ func (s *Server) handleExportConfig(c *gin.Context) {
 		respondError(c, http.StatusInternalServerError, "备份资源无效: "+err.Error())
 		return
 	}
-	data, err := EncryptBackup(cfg.Auth.Username, req.Password, cfg, certBackups, uploads)
+	data, err := EncryptBackup(cfg.Auth.Username, backupPass, cfg, certBackups, uploads)
 	if err != nil {
 		respondError(c, http.StatusInternalServerError, "加密配置失败")
 		return
@@ -128,6 +177,11 @@ func (s *Server) handleExportConfig(c *gin.Context) {
 // 逗号分隔的模块标识；缺省为全部），未选中的模块保持本机现状不动。
 // 仅接受本程序生成的加密备份信封，拒绝旧版明文配置。
 func (s *Server) handleImportConfig(c *gin.Context) {
+	// 与导出同款的失败计数（见 reauth.go）。放在读文件之前：被锁住的会话
+	// 连那 128 MB 都不必往上传。
+	if !s.reauthAllowed(c) {
+		return
+	}
 	s.backupMu.Lock()
 	defer s.backupMu.Unlock()
 
@@ -166,9 +220,11 @@ func (s *Server) handleImportConfig(c *gin.Context) {
 	// 而这里的会话是好的，只是密码填错了（与导出那一支同款）。
 	if strings.TrimSpace(up.authAccount) != before.Auth.Username ||
 		!auth.VerifyPassword(before.Auth.PasswordHash, up.authPassword) {
+		s.reauthFail(c)
 		respondError(c, http.StatusForbidden, "当前账户或密码不正确")
 		return
 	}
+	s.reauthOK(c)
 
 	// 导入范围先解析：解密要跑 60 万次 PBKDF2，参数写错没必要等到那之后才报错。
 	scope, err := parseImportScope(up.modules)
@@ -298,9 +354,16 @@ func (s *Server) handleImportConfig(c *gin.Context) {
 		s.deps.Log.Warn("清理恢复临时资源失败", "err", err.Error())
 	}
 	s.afterChange()
+	// 无论全选还是只导一部分都记一条。
+	//
+	// 原先只在部分导入时记，全选反而静默——而全选正是覆盖面最大的那一种：整份配置连
+	// 管理员凭据一起被换掉。事后从日志里只能看到一次登录，看不到"配置在这一刻被整体替换"，
+	// 恰恰是最需要留痕的那一步没有痕迹。
+	scopeText := "全部"
 	if !scope.all() {
-		s.deps.Log.Info("已按所选范围导入配置", "modules", strings.Join(scope.names(), "、"))
+		scopeText = strings.Join(scope.names(), "、")
 	}
+	s.deps.Log.Info("已导入配置", "modules", scopeText, "bytes", len(raw), "ip", c.ClientIP())
 	s.warnDanglingRefs(s.deps.Config.Snapshot())
 
 	after := s.deps.Config.Snapshot()
@@ -501,17 +564,57 @@ type restoreTransaction struct {
 	uploadOld  string
 }
 
+// restoreDiscardPath 回滚时把 root 挪开用的名字：`.<目录名>-restore-discard-<纳秒>`，
+// 落在 root 的同一个目录下（rename 不能跨设备，也不该跨到数据目录之外）。
+//
+// 单独成函数是为了让测试拿到与生产代码同一个名字来源——手写字面量的话，
+// 哪天这个模式变了，"残留能被清理页认出来"那条断言会照样绿着。
+func restoreDiscardPath(root string) string {
+	return filepath.Join(filepath.Dir(root),
+		"."+filepath.Base(root)+"-restore-discard-"+strconv.FormatInt(time.Now().UnixNano(), 10))
+}
+
+// restoreDirectory 回滚一个整体替换过的目录：把 old 里保存的那一份换回 root。
+//
+// 顺序刻意是「先把导入进来的 root 改名挪开 → 再把 old 改回 root → 最后才删挪开的那份」，
+// 而不是直觉上的「先删 root、再把 old 改回来」。两种写法都存在"root 不存在"的瞬间
+// （两个目标平台都没有原子交换两个目录的办法），区别在这个瞬间有多长：
+//
+//   - 先删：窗口是 RemoveAll 走完整棵刚导入进来的 uploads/certs，成百上千个文件的删除时间；
+//   - 先改名：窗口只有一次 rename，同一个目录下的元数据操作。
+//
+// 掉在窗口里（进程被杀、断电）的那种情况由启动期回收兜住：见 app.ReclaimRestoreLeftovers，
+// 它在 root 不存在且旁边有 `<目录名>.restore-old-<纳秒>` 时把最新的那个改回来。
+//
+// 挪开的那份用 `.<目录名>-restore-discard-<纳秒>` 命名，落在 storageLeftoverKind 认的
+// `.certs-restore-` / `.uploads-restore-` 前缀里（见 api_storage.go），所以它即便残留下来
+// 也能在「存储占用」里看见并清掉；同时它**不**叫 restore-old，启动期回收不会把这份
+// 已经被否决的导入数据当成原件捡回去。这两条都有测试盯着（api_settings_rollback_test.go）。
 func restoreDirectory(root, old string) error {
 	if root == "" {
 		return nil
 	}
-	if err := os.RemoveAll(root); err != nil {
-		return err
+	if old == "" {
+		// 导入前本来就没有这个目录（备份是"从无到有"），回滚就是把导入进来的删掉。
+		return os.RemoveAll(root)
 	}
-	if old != "" {
+	discard := restoreDiscardPath(root)
+	if err := os.Rename(root, discard); err != nil {
+		// 改名失败就退回原来的做法：root 必须先腾空，否则 old 那一份永远回不了位。
+		// root 压根不存在（已经被挪走过）时不用删，直接放回去。
+		if !errors.Is(err, os.ErrNotExist) {
+			if rmErr := os.RemoveAll(root); rmErr != nil {
+				return errors.Join(err, rmErr)
+			}
+		}
 		return os.Rename(old, root)
 	}
-	return nil
+	if err := os.Rename(old, root); err != nil {
+		// 原件没能回位：把挪开的那份放回来，至少保住"目录存在"这件事，
+		// 免得回滚本身把 uploads/ 变没了。
+		return errors.Join(err, os.Rename(discard, root))
+	}
+	return os.RemoveAll(discard)
 }
 
 func (tx *restoreTransaction) rollback() error {
@@ -614,7 +717,7 @@ func (s *Server) restoreBackupResources(cfg *config.Config, certs []CertBackup, 
 	defer os.RemoveAll(stage)
 	for _, file := range uploads {
 		dst := filepath.Join(stage, filepath.Clean(filepath.FromSlash(file.Path)))
-		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		if err := fsx.EnsureDir(filepath.Dir(dst)); err != nil {
 			_ = restoreDirectory(tx.certRoot, tx.certOld)
 			return nil, err
 		}

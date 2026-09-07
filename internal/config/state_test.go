@@ -125,8 +125,12 @@ func TestSaveConfigStripsRuntimeState(t *testing.T) {
 	if got := manager.Get().DDNS[0].LastIP; got != "1.2.3.4" {
 		t.Fatalf("内存运行态被误清: %q", got)
 	}
-	if _, err := os.Stat(configPath + ".tmp"); !os.IsNotExist(err) {
-		t.Fatalf("临时文件未清理: %v", err)
+	// 临时文件不许留下。名字带随机串（见 createTempFor），所以按 glob 查而不是查一个固定名字——
+	// 写死 configPath+".tmp" 的话，这条断言会在改用随机名之后永远为真，什么也不再盯。
+	if left, err := filepath.Glob(configPath + ".*"); err != nil {
+		t.Fatal(err)
+	} else if len(left) > 0 {
+		t.Fatalf("临时文件未清理: %v", left)
 	}
 }
 

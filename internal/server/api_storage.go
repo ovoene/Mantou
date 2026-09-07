@@ -48,12 +48,15 @@ func (s *Server) scanStorage(cfg *config.Config) ([]storageItem, bool) {
 	}
 	items := make([]storageItem, 0, 8)
 	truncated := false
-	add := func(it storageItem) {
+	// add 返回 false 表示列表已满：超出的部分只把 truncated 记上，不再往里收。
+	// 调用方据此**停下手里的遍历**——满了之后继续扫，扫出来的东西一个也进不了结果。
+	add := func(it storageItem) bool {
 		if len(items) >= maxStorageItems {
 			truncated = true
-			return
+			return false
 		}
 		items = append(items, it)
+		return true
 	}
 	// 判断"太新"的分界线。测试里靠 os.Chtimes 把文件时间往前拨来跨过它，不用注入时钟。
 	fresh := time.Now().Add(-storageFreshWindow)
@@ -92,7 +95,12 @@ func (s *Server) scanStorage(cfg *config.Config) ([]storageItem, bool) {
 		if info.ModTime().After(fresh) {
 			it.Note = "fresh"
 		}
-		add(it)
+		// 满了就用 SkipAll 收摊，别把 uploads 整棵子树走完：这个目录是用户上传的地盘，
+		// 条数没有上界（换过的背景图会一直攒着），而 500 条之后每一次 Info() 系统调用
+		// 都只是为了把结果丢掉。这个接口在面板"存储清理"页一进去就会被调。
+		if !add(it) {
+			return filepath.SkipAll
+		}
 		return nil
 	})
 
@@ -117,13 +125,15 @@ func (s *Server) scanStorage(cfg *config.Config) ([]storageItem, bool) {
 			if infoErr != nil {
 				continue
 			}
-			add(storageItem{
+			if !add(storageItem{
 				Path:    "certs/" + entry.Name(),
 				Kind:    "cert",
 				Size:    info.Size(),
 				ModTime: info.ModTime().UnixMilli(),
 				abs:     filepath.Join(certRoot, entry.Name()),
-			})
+			}) {
+				break
+			}
 		}
 	}
 
@@ -141,6 +151,13 @@ func (s *Server) scanStorage(cfg *config.Config) ([]storageItem, bool) {
 			}
 			if info.ModTime().After(fresh) {
 				continue // 可能是正在进行的导入或配置保存，别碰
+			}
+			// 容量检查提前到 dirSize 之前：这条已经确定是可列条目（种类、时间都过了），
+			// 列表满了就直接收摊，免得为一个注定进不了结果的目录递归走一遍整棵子树——
+			// 导入暂存目录里是一整份 uploads/certs 的拷贝，那不是几个文件的事。
+			if len(items) >= maxStorageItems {
+				truncated = true
+				break
 			}
 			abs := filepath.Join(dataDir, name)
 			size := info.Size()
@@ -170,6 +187,14 @@ func (s *Server) scanStorage(cfg *config.Config) ([]storageItem, bool) {
 
 // storageLeftoverKind 判断数据目录顶层的某个条目是不是暂存残留，返回空表示不是。
 // 这里的名字必须与 restoreBackupResources（导入暂存）和 writeFileAtomic（<文件名>.tmp）对齐。
+//
+// 四个目录前缀来自导入事务的三处产物，语义有区别，别合并成一条：
+//   - `<目录名>.restore-old-<纳秒>`：被替换掉的**原件**。启动期回收只认这一种
+//     （见 app.ReclaimRestoreLeftovers），因为只有它值得在崩溃后捡回来。
+//   - `.<目录名>-restore-<随机>`：还没启用的**暂存**（os.MkdirTemp，可能只写了一半）。
+//   - `.<目录名>-restore-discard-<纳秒>`：回滚时挪开的那份**已被否决的导入数据**
+//     （见 restoreDirectory）。刻意用这个前缀而不叫 restore-old，就是为了不被回收捡回去，
+//     同时仍能在这一页里被看见、被清掉。
 func storageLeftoverKind(name string, isDir bool) string {
 	if isDir {
 		switch {

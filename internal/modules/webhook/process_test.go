@@ -470,13 +470,18 @@ func TestAllowIP(t *testing.T) {
 		if ok, _ := off.allowIP(net.ParseIP("198.51.100.7")); !ok {
 			t.Fatal("总开关未开时名单不该生效")
 		}
+		// 解析不出对端地址时白名单失败关闭、黑名单放行（见 allowIP 的说明）。
 		on := newRT(t, config.WebhookReceiver{
 			IPFilter: true, IPFilterMode: "allow", AllowIPs: []string{"10.0.0.0/8"},
 		})
-		// 取不到对端地址只会出现在非 TCP 的测试传输上，在这里拒绝
-		// 会让"配了名单的接收器在某些环境下全挂"。
-		if ok, _ := on.allowIP(nil); !ok {
-			t.Fatal("解析不出 IP 时应放行")
+		if ok, reason := on.allowIP(nil); ok || !strings.Contains(reason, "白名单") {
+			t.Fatalf("白名单模式下解析不出 IP 应拒绝：ok=%v reason=%q", ok, reason)
+		}
+		deny := newRT(t, config.WebhookReceiver{
+			IPFilter: true, IPFilterMode: "deny", DenyIPs: []string{"198.51.100.0/24"},
+		})
+		if ok, _ := deny.allowIP(nil); !ok {
+			t.Fatal("黑名单模式下解析不出 IP 应放行")
 		}
 	})
 }

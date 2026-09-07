@@ -1,8 +1,11 @@
 package config
 
 import (
+	"strings"
+	"time"
 	"unicode"
 
+	"mantou/internal/ipx"
 	"mantou/internal/strutil"
 )
 
@@ -70,7 +73,9 @@ type Config struct {
 //     仅在未配置 ManifestURL 时用于检测更新，且可被任意值覆盖（满足「更新源可配置」约束，不写死）。
 //   - SignKey：自更新包 Ed25519 公钥（base64 编码的 32 字节）。配置后，上传更新包必须附带
 //     同名 .sig 签名文件且验签通过才允许覆盖二进制。
-//   - AllowUnsignedUpdate：未配置公钥时是否仍接收更新包。默认 false，即不接收。
+//   - AllowUnsignedUpdate：未配置公钥时是否仍接收更新包。默认 false，即不接收；
+//     打开后也只在 AllowUnsignedSince 起算的一段窗口内有效（见 AllowUnsignedUpdateTTL）。
+//   - AllowUnsignedSince：上一项被打开的时刻（Unix 秒），窗口的起点。
 //   - About/Description：关于页展示的自定义说明文本 / 从在线清单拉取的程序说明。
 type UpdateConfig struct {
 	ManifestURL string `json:"manifestUrl"`
@@ -87,10 +92,61 @@ type UpdateConfig struct {
 	//
 	// 又不能直接把没公钥的情况一禁了之：自己签一份 tar.gz 不是这个项目对用户的要求，
 	// 于是留这个开关——想跳过验签，先自己在设置里打开，别人替你打不开。
+	//
+	// 它单独为真**不**等于放行：还要落在 AllowUnsignedSince 起算的窗口之内
+	// （见 UnsignedUpdateAllowed）。
 	AllowUnsignedUpdate bool `json:"allowUnsignedUpdate"`
+	// AllowUnsignedSince 是上一项被打开的时刻（Unix 秒），由设置接口在「打开」那一刻写入、
+	// 关闭时清零。它把上面那个布尔值从「一扇一旦打开就再也不会关的门」变成一段有限的窗口。
+	//
+	// 为什么需要它：那个开关原先只有打开与关闭两态，而打开它的正常理由都是一次性的
+	// （要传一个自己构建的包）。传完之后没有任何机制提醒用户关回去，于是它会一直留在
+	// 打开状态——面板从此长期处在「任何一条有效会话都能覆盖二进制」的状态，
+	// 而这正是当初给它默认关闭想避免的事。
+	//
+	// 刻意不设后台任务去到点清零：那种做法多一处能漏跑的东西（进程没在跑、任务被跳过、
+	// 系统时间被改），而「有没有过期」本来就是一道纯计算。判定一律以计算结果为准，
+	// 配置里这个数只记录起点。
+	//
+	// 零值表示「没有记录过打开时刻」，按**没有窗口**处理（即不放行）。手改 config.json
+	// 或导入一份只有布尔值的旧备份都会落到这一支：宁可让用户到设置页重开一次
+	// （一次开关 + 一次密码），也不因为一个来源不明的布尔值就把门敞开。
+	AllowUnsignedSince int64 `json:"allowUnsignedSince,omitempty"`
 
 	About       string `json:"about"`
 	Description string `json:"description"`
+}
+
+// AllowUnsignedUpdateTTL 是「允许未验签的更新包」窗口的长度。
+//
+// 24 小时：这个开关的正常用法是「打开 → 传一个包 → 装完」，前后隔几分钟，
+// 24 小时已是两个数量级的余量，足够覆盖"先打开、第二天才把包传上去"。
+// 再长就失去意义了——它要防的正是那种"打开之后一直忘了关"。
+// 窗口过期后开关本身还在，只是不再放行；到设置页重开一次即可（需再验一次密码）。
+const AllowUnsignedUpdateTTL = 24 * time.Hour
+
+// UnsignedUpdateExpiry 返回当前「允许未验签的更新包」窗口的到期时刻。
+// ok 为假表示此刻根本没有窗口：开关关着，或开着但没有记录打开时刻。
+//
+// 起点被夹到不晚于 now：一份被手改或从别处导入的配置可以把打开时刻写到很远的将来，
+// 那样算出来的窗口等于永不过期，正好绕掉这道限制。夹一下之后最坏情况也只是
+// 从"现在"开始重新算一个正常长度的窗口。
+func (u UpdateConfig) UnsignedUpdateExpiry(now time.Time) (time.Time, bool) {
+	if !u.AllowUnsignedUpdate || u.AllowUnsignedSince <= 0 {
+		return time.Time{}, false
+	}
+	start := time.Unix(u.AllowUnsignedSince, 0)
+	if start.After(now) {
+		start = now
+	}
+	return start.Add(AllowUnsignedUpdateTTL), true
+}
+
+// UnsignedUpdateAllowed 报告此刻是否处在有效窗口内，即「未配置公钥时该不该收更新包」。
+// 它不看公钥：公钥配了就一律验签，这个窗口只管"没有公钥怎么办"（见 UpdateConfig.SignKey）。
+func (u UpdateConfig) UnsignedUpdateAllowed(now time.Time) bool {
+	exp, ok := u.UnsignedUpdateExpiry(now)
+	return ok && now.Before(exp)
 }
 
 // Panel 面板服务自身的监听与 HTTPS 配置。
@@ -669,7 +725,7 @@ type WebChild struct {
 	Headers       map[string]string `json:"headers"`
 	Access        WebAccess         `json:"access"`
 	TLS           bool              `json:"tls"`           // 该子项是否启用 HTTPS（端口只要有一个子项启用即以 TLS 监听）
-	TLSMinVersion string            `json:"tlsMinVersion"` // TLS 最低版本：""(默认1.2)/1.0/1.1/1.2/1.3
+	TLSMinVersion string            `json:"tlsMinVersion"` // TLS 最低版本：只接受 "1.2" / "1.3"；空值按 1.2（1.0/1.1 已禁用，加载期一律抬到 1.2）
 	// RedirectHTTPS 把明文请求 307 跳到 https。TLS=true 时该开关被**强制置真**
 	// （migrate 与 normalizeWebService 两条路径都会兜住，手改配置也绕不过）：
 	// 既然这个子项已经提供 HTTPS，就没有理由再放任明文访问。
@@ -697,6 +753,53 @@ type WebChild struct {
 	// "强制 HTTPS"与 HSTS 要不要生效。只有该子项确实挂在外层 TLS 终结代理
 	// （Cloudflare、nginx 等）后面时才应打开。
 	TrustProxyHeaders bool `json:"trustProxyHeaders"`
+}
+
+// IsProxy 报告这个子项是否走反向代理（即会去拨 Upstreams 里的地址）。
+//
+// 判定写成"不是 static、也不是 redirect"，而不是 Type == "proxy"，是为了跟着
+// 分发那边的实际口径：buildChildHandler 的 switch 只认 "static" 与 "redirect"
+// 两个 case，**其余一律走代理**（见 internal/modules/webservice/handler.go）。
+// 于是 Type 为空串（旧配置、手写配置、导入的备份）或写了个没人认识的值时，
+// 运行期得到的是一个代理子项——照着 Type == "proxy" 去判会漏掉这一整类，
+// 而任何"漏掉就等于不设防"的校验都不能建在那种判定上。
+//
+// 独立成一个方法是因为它被两侧共用：保存期校验（internal/server）与
+// Reload 期的运行防御（internal/modules/webservice）。两边各写一份的话，
+// 有一天分发那边加了新 case，两份判定就会悄悄分家。
+func (c WebChild) IsProxy() bool {
+	return c.Type != "static" && c.Type != "redirect"
+}
+
+// UpstreamTargetingLocalPort 报告这个子项的反代后端里有没有指向**本机 panelPort 端口**的，
+// 命中则返回那条后端地址（原样，便于用户在表单里对上号）。
+//
+// # 为什么这件事要拦
+//
+// 反代那一跳是面板自己发起的：请求到这里就变成一个从 127.0.0.1 打向面板的新连接，
+// 面板于是把每个外部请求都当成本机来的。失效的不是一道防护而是一组——回环无条件
+// 放行、拒绝名单与自动封禁认不出人、「仅局域网」形同虚设、审计日志里所有来源塌成
+// 127.0.0.1（详见 internal/ipx/local.go 文件头）。这与端口转发指向面板端口是同一个洞。
+//
+// 跳转目标刻意不在此列：302 是让浏览器自己再连一次，客户端 IP 原样保留，
+// 塌缩只发生在进程内那一跳上。静态子项不拨号，同样无关。
+//
+// # 为什么放在 config 而不是调用方那边
+//
+// 这个判定要在两处用：保存期拒绝（internal/server）与 Reload 期跳过并告警
+// （internal/modules/webservice）。两处各写一份的结果是有一天它们给出不同答案，
+// 于是出现「存进去了、运行期却被静默跳过」的哑规则——用户在界面上看不出任何异常。
+// 放在类型自己身上，两边引用的就必然是同一句话。
+func (c WebChild) UpstreamTargetingLocalPort(panelPort int) (string, bool) {
+	if !c.IsProxy() {
+		return "", false
+	}
+	for _, up := range c.Upstreams {
+		if ipx.URLTargetsLocalPort(up.URL, panelPort) {
+			return strings.TrimSpace(up.URL), true
+		}
+	}
+	return "", false
 }
 
 // WebListen 旧版监听结构，仅保留用于旧配置迁移。

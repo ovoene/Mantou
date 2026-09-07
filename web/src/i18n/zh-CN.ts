@@ -608,7 +608,9 @@ export default {
     updateSignKey: '自更新包签名公钥',
     updateSignKeyHint: 'Ed25519 公钥（base64 编码的 32 字节）。配置后，上传的更新包必须附带同名 .sig 签名文件且验签通过才会应用。留空时是否接收更新包由下一项决定。',
     updateAllowUnsigned: '允许未验签的更新包',
-    updateAllowUnsignedHint: '公钥留空时，上传的更新包不做验签。关闭时留空公钥则不接收更新包——上传更新包等于让面板执行一个新的二进制，没有验签就分辨不出它的来源。',
+    updateAllowUnsignedHint: '公钥留空时，上传的更新包不做验签。关闭时留空公钥则不接收更新包——上传更新包等于让面板执行一个新的二进制，没有验签就分辨不出它的来源。打开这一项要验证当前密码，且只在 {hours} 小时内有效、到期自动失效；有效期内每次上传未验签的更新包仍会再问一次密码。',
+    updateAllowUnsignedPwd: '打开「允许未验签的更新包」需验证当前账户密码',
+    updateAllowUnsignedExpires: '当前有效期至 {time}，到期后自动失效，需重新打开。',
     language: '界面语言',
     panelPort: '监听端口',
     portHint: '修改后需重启服务生效',
@@ -713,9 +715,16 @@ export default {
     exportBtn: '下载配置文件',
     exportDesc: '将当前全部配置下载为 JSON 文件用于备份或迁移',
     exportWarn: '导出文件包含登录信息、会话密钥与域名服务商凭证等敏感数据，请妥善保管',
-    exportEncrypt: '验证登录密码',
-    exportPwdHint: '导出的配置文件使用「当前登录密码」加密，请输入您的登录密码',
-    exportEncryptedHint: '备份将使用「登录账户 + 密码」加密，请牢记密码；忘记密码将无法恢复配置。',
+    exportEncrypt: '导出备份',
+    exportPwdHint: '登录密码用来确认「我是这台面板的管理员」。备份默认也用它加密；若在下面另设了独立口令，则改用那一个。',
+    exportPassword: '登录密码',
+    exportPassphrase: '独立备份口令（可选）',
+    // 这段话要说清三件事，缺一件用户就会在恢复时打不开文件：留空等于沿用登录密码、
+    // 填了之后登录密码就解不开了、以及恢复时该填哪一个。
+    exportPassphraseHint:
+      '留空则沿用登录密码加密。填了它，这份备份就只能用它解开，登录密码不再有效——把备份交给别人保管、或想用一个比登录密码更长的口令时用这栏。恢复时「密码」那栏要填的就是它。',
+    exportPassphraseLen: '独立备份口令需在 {min} 到 {max} 个字节之间（一个汉字算 3 个字节）',
+    exportEncryptedHint: '备份将使用「登录账户 + 备份口令」加密（默认即登录密码），请牢记该口令；忘记后将无法恢复配置。',
     // 导入第一步：验证本机管理员身份。与第二步（备份的解密口令）分成两个弹窗，
     // 界面上任何时候只出现一个密码框，免得两套凭据填反。
     importAuthTitle: '身份验证',
@@ -727,8 +736,8 @@ export default {
     importDecrypt: '解密备份',
     importAccount: '账户名',
     importPassword: '密码',
-    importPwdHint: '请输入备份时使用的账户名与密码',
-    importDecryptFail: '解密失败，账户名或密码不正确',
+    importPwdHint: '账户名填导出时的管理员账户名；密码填导出时用的备份口令——当时若另设了独立口令，这里就填那一个，不是登录密码',
+    importDecryptFail: '解密失败：账户名或备份口令不正确（导出时若另设了独立口令，这里要填那一个）',
     importConfig: '导入配置',
     importDesc: '从此前导出的 JSON 文件恢复配置',
     importWarn: '导入会覆盖当前全部配置，且部分改动需重启后生效',
@@ -748,7 +757,7 @@ export default {
     masterKeyDesc:
       '数据目录下的 master.key 是解开 config.json 中凭证字段（域名服务商凭证、ACME 账户私钥、会话签名密钥、二次验证密钥）的唯一钥匙——这些字段在磁盘上是加密保存的，因为仅靠文件权限挡不住「整个数据目录被复制走」（备份、挂卷排障、快照、误提交仓库）。',
     masterKeyWarn:
-      '若以「直接复制 data 目录」的方式备份，必须连同 master.key 一起复制；缺了它程序会在启动时明确报错，而不会静默丢弃凭证。用本页「导出配置」得到的备份不受此限制：其中的凭证由「账户名 + 登录密码」整体加密，换到新环境导入后立即可用，无需 master.key。',
+      '若以「直接复制 data 目录」的方式备份，必须连同 master.key 一起复制；缺了它程序会在启动时明确报错，而不会静默丢弃凭证。用本页「导出配置」得到的备份不受此限制：其中的凭证由「账户名 + 备份口令」整体加密，换到新环境导入后立即可用，无需 master.key。',
     masterKeyEnvHint:
       '也可用环境变量 MANTOU_MASTER_KEY 提供主密钥（32 字节的 hex 或 base64 表示），此时磁盘上不会存在 master.key，适合把密钥交给容器 secret、systemd credential 等外部密钥管理。',
     // 存储占用：数据目录里没人再引用的文件
@@ -929,7 +938,8 @@ export default {
     subtitle: '版本、更新与程序说明',
     uploadTitle: '上传更新包',
     uploadDesc: '上传下载好的 tar.gz 更新包，程序将替换自身并自动重启（Windows 平台不支持）。请仅上传来自可信来源的更新包；若已在「设置 → 在线更新」配置签名公钥，更新包须附带同名 .sig 签名并通过校验方可应用。',
-    signKeyMissing: '未配置自更新签名公钥，也未打开「允许未验签的更新包」，当前不接收更新包。可在「设置 → 在线更新」配置 Ed25519 公钥，或打开该开关。',
+    signKeyMissing: '未配置自更新签名公钥，也未打开「允许未验签的更新包」，当前不接收更新包。可在「设置 → 在线更新」配置 Ed25519 公钥，或打开该开关（该开关有有效期，过期后需重新打开）。',
+    uploadUnsignedPwd: '未配置签名公钥，上传未验签的更新包需验证当前账户密码',
     uploadBtn: '选择 tar.gz 并更新',
     uploadBadFile: '请选择 .tar.gz 更新包',
     uploadConfirm: '将用上传的更新包替换当前程序并重启，确定继续吗？',
@@ -1437,7 +1447,7 @@ export default {
       arrNoAliasGo: '我去起别名',
       snipBreak: '换行',
       newlineHint:
-        '换行不用你操心：钉钉 markdown 里单个换行不生效，正文发出前会自动补成空一行，消息里带进来的换行（比如 {{.body.text}}）也一样。点「换行」按当前格式插入，已经手动空过的行不会被再加一遍。',
+        "换行不用你操心：钉钉 markdown 里单个换行不生效，正文发出前会自动补成空一行，消息里带进来的换行（比如 {'{{.body.text}}'}）也一样。点「换行」按当前格式插入，已经手动空过的行不会被再加一遍。",
       fields: '字段别名',
       recvPicker: '选择接收器',
       recvPickerHint: '这里列的就是该接收器「解析 → 字段映射」里的别名：点别名插入取值，点「列表」插入循环写法。',

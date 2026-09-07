@@ -66,6 +66,51 @@ func TestLookupVisitCapsNestedExpansion(t *testing.T) {
 	}
 }
 
+// TestLookupVisitCapsWastedSteps 值数上限数的是"交出去的值"，可最花钱的路径形态
+// 恰恰一个值也交不出来：body.items[*].不存在的字段——每个元素都要做一次 map 查找，
+// p.n 一直是 0，于是那道闸永远不响，整份载荷从头走到尾（4 MB 里能塞两百万个元素，
+// 一个接收器又允许 1000 次取值）。maxLookupSteps 补的就是这一半。
+//
+// 只有最后一个元素带上那个字段：走完的话必然取到它，提前收手才会一个都取不到。
+// 这也是这道闸的代价——那种载荷里最后一个元素确实看不到了，与值封顶同向。
+func TestLookupVisitCapsWastedSteps(t *testing.T) {
+	const n = maxLookupSteps + 500
+	last := n - 1
+	root := starRoot(n, func(i int) any {
+		if i == last {
+			return map[string]any{"名称": "馒头"}
+		}
+		return map[string]any{"别的字段": "馒头"}
+	})
+	got, capped := lookupVisit(root, parsePath("body.items[*].名称"), func(any) bool { return true })
+	if got != 0 {
+		t.Fatalf("只有第 %d 个元素带那个字段，提前收手就该一个也取不到，实际取到 %d 个", last, got)
+	}
+	if !capped {
+		t.Fatal("走过的元素撞上上限也必须报告 capped，否则调用方以为自己看全了")
+	}
+}
+
+// TestLookupStepCapDoesNotPreemptValueCap 反向钉住：元素确实在产出值时，
+// 先响的必须还是值数那道闸（steps ≈ values，留了一倍余量给中间层）。
+// 这一条保证这次改动没有悄悄把"能取到多少个值"改小——那是用户看得见的数。
+func TestLookupStepCapDoesNotPreemptValueCap(t *testing.T) {
+	if maxLookupSteps <= maxLookupVisits {
+		t.Fatalf("步数上限（%d）必须高于值数上限（%d），否则值封顶永远轮不到",
+			maxLookupSteps, maxLookupVisits)
+	}
+	// 单层：每个元素产出一个值。
+	flat := starRoot(maxLookupVisits+500, plainItem)
+	if n, capped := lookupVisit(flat, parsePath("body.items[*].名称"), func(any) bool { return true }); n != maxLookupVisits || !capped {
+		t.Fatalf("单层展开应停在值数上限 %d，实际 n=%d capped=%v", maxLookupVisits, n, capped)
+	}
+	// 嵌套：中间层也要走，但仍在余量之内。
+	nested := nestedStarRoot(200, 200)
+	if n, capped := lookupVisit(nested, parsePath("body.groups[*].items[*].名称"), func(any) bool { return true }); n != maxLookupVisits || !capped {
+		t.Fatalf("嵌套展开应停在值数上限 %d，实际 n=%d capped=%v", maxLookupVisits, n, capped)
+	}
+}
+
 // TestLookupVisitStopsOnFirstWhenAsked 调用方说"够了"就立刻收工。
 // 这是绝大多数算子的常态：一个命中值就能定论，不必把数组走完。
 func TestLookupVisitStopsOnFirstWhenAsked(t *testing.T) {

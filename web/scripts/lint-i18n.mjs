@@ -1,4 +1,4 @@
-// 语言包体检。两道检查，共同点是「错了不报错、只是界面上少点东西」，
+// 语言包体检。三道检查，共同点是「错了不报错、只是界面上少点东西」，
 // 因此 vue-tsc 与 vite build 都查不出来，只能在 build 前置里挡：
 //
 //   ① 裸 @：vue-i18n 把文案里的 @ 当成「链接到另一条文案」的起始符（@:key / @.lower:key），
@@ -13,6 +13,14 @@
 //     实际写代码时只会开着一种语言点一遍，另一种语言那半边没人看得到。同族问题还有两个，
 //     一并在这里挡：一边是分组另一边是字符串（t() 拿到对象，渲染不出东西），以及占位符不一致
 //     （{n} 只写在一个语言里 → 另一种语言的那句话默默少了个数字）。
+//
+//   ③ 编译不过的文案：把每一条都真正丢给 vue-i18n 的消息编译器跑一遍。① 只挡了 @ 这一种
+//     写法，而编译器还有一整族语法要求，最容易踩的是花括号——{} 是占位符、里面套不了第二层，
+//     所以文案里想原样展示一段 Go 模板（{{.body.text}}）必须写成 {'{{.body.text}}'}。
+//     这一族在 vue-i18n 9 上只是控制台一条警告、界面照常显示原文，升到 11 之后改成**直接抛
+//     异常**，后果就和 ① 一样：渲染这条文案的那一整块界面（这里是弹窗里的一整栏，连带同栏的
+//     按钮）整片消失，页面上没有任何提示。顺带钉住转义语义：{'…'} 里的内容必须原样出现在
+//     渲染结果里，哪天转义规则变了也得当场红。
 import { readFileSync, readdirSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -118,8 +126,10 @@ function placeholders(v) {
   return [...new Set([...v.matchAll(/\{(\w+)\}/g)].map((m) => m[1]))].sort().join(',')
 }
 
-const zh = flatten(await loadPack('zh-CN.ts'), '', new Map())
-const en = flatten(await loadPack('en-US.ts'), '', new Map())
+const zhPack = await loadPack('zh-CN.ts')
+const enPack = await loadPack('en-US.ts')
+const zh = flatten(zhPack, '', new Map())
+const en = flatten(enPack, '', new Map())
 
 // 缺键分两条报，因为两个方向的表现完全不同（见文件头 ②），修的时候要知道会看到什么。
 const missingEn = [...zh.keys()].filter((k) => !en.has(k))
@@ -156,7 +166,58 @@ if (phDiff.length) {
   failed = true
 }
 
+// ---------- ③ 每条文案都能编译 ----------
+
+// 用 createI18n + t() 而不是直接调 @intlify/message-compiler：跑的就是运行时那条路，
+// 失败时机与线上完全一致，不必猜编译器的哪个入口对应哪种失败。语言包在 ② 里已经是真值了，
+// 直接喂进去，不引 esbuild。
+const { createI18n } = await import('vue-i18n')
+const i18n = createI18n({
+  legacy: false,
+  locale: 'zh-CN',
+  fallbackLocale: 'en-US',
+  // 这里只问「能不能编译」。缺键与回退是 ② 的活，HTML 提醒与本检查无关，全关掉，
+  // 免得构建日志被无关噪音刷掉真正的失败。
+  missingWarn: false,
+  fallbackWarn: false,
+  warnHtmlMessage: false,
+  messages: { 'zh-CN': zhPack, 'en-US': enPack },
+})
+
+const badMsg = []
+let compiled = 0
+for (const [loc, msgs] of [
+  ['zh-CN', zh],
+  ['en-US', en],
+]) {
+  i18n.global.locale.value = loc
+  for (const [key, raw] of msgs) {
+    if (typeof raw !== 'string') continue
+    compiled++
+    let out
+    try {
+      out = i18n.global.t(key)
+    } catch (e) {
+      badMsg.push(`  ${loc}  ${key}\n    ${String(e.message).split('\n')[0]}\n    ${raw}`)
+      continue
+    }
+    // 不传参渲染，带占位符的地方会是空串，所以转义只能用「包含」而不是全等来比。
+    for (const m of raw.matchAll(/\{'([^']*)'\}/g)) {
+      if (m[1] && !out.includes(m[1])) {
+        badMsg.push(`  ${loc}  ${key}\n    转义 {'${m[1]}'} 没有原样渲染出来，实得：${out}\n    ${raw}`)
+      }
+    }
+  }
+}
+
+if (badMsg.length) {
+  console.error(`${badMsg.length} 条文案过不了 vue-i18n 的消息编译器（线上会让整块界面凭空消失）：`)
+  console.error(badMsg.join('\n'))
+  console.error("想在文案里原样显示 { } @ | 这些字符，一律走字面量插值：{'{{.body.text}}'}、{'@'}。")
+  failed = true
+}
+
 if (failed) process.exit(1)
-console.log(`语言包检查通过：zh-CN / en-US 各 ${zh.size} 个键，占位符一致`)
+console.log(`语言包检查通过：zh-CN / en-US 各 ${zh.size} 个键，占位符一致，${compiled} 条文案编译通过`)
 
 

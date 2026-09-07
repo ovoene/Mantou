@@ -26,7 +26,7 @@ if "%GOSUMDB%"=="" set GOSUMDB=off
 
 REM force the local toolchain: keep go from downloading and switching to a different toolchain
 REM if go.mod's go directive ever moves ahead of the installed go. Safe as long as the
-REM installed go satisfies that directive (go.mod asks for 1.25.0), and it keeps packaging
+REM installed go satisfies that directive (go.mod asks for 1.26.0), and it keeps packaging
 REM working without network access to the toolchain server.
 REM (This was once credited with silencing a localized `invalid switch - "version"` line.
 REM It never did: that came from a `del /f internal/version/gen.go`, since removed.)

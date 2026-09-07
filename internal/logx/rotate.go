@@ -10,6 +10,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"mantou/internal/fsx"
 )
 
 // LogMaxSizeMB 磁盘日志单文件体积上限（MB），固定值、不可配置。
@@ -57,7 +59,9 @@ type RotatingFile struct {
 // 体积与份数则由包级常量固定（LogMaxSizeMB / LogMaxBackups），不接受调用方参数，
 // 以保证「磁盘日志占用 ≤ 5MB」这一上界在任何配置下都成立。
 func NewRotatingFile(path string, maxEntries int) (*RotatingFile, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	// 日志目录 0700：日志里有登录来源 IP、账户名、各模块的目标地址与失败原因，
+	// 不必让同机的其他用户翻（见 fsx.DirMode）。
+	if err := fsx.EnsureDir(filepath.Dir(path)); err != nil {
 		return nil, err
 	}
 	r := &RotatingFile{

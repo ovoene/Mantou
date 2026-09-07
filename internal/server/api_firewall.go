@@ -70,8 +70,9 @@ func (s *Server) handleGetFirewallBans(c *gin.Context) {
 		respondError(c, http.StatusServiceUnavailable, "入站防护未就绪")
 		return
 	}
-	list := s.firewall.banList(fwBanListLimit)
-	total := s.firewall.banCount()
+	// 一次取回列表与总数：分两次调用要抢两次锁，且两次之间表可能已经变了，
+	// 于是界面上会出现"列表 3 条、总数 2 条"这种自相矛盾的展示（同 handleGetGlobalFirewall）。
+	list, total := s.firewall.banSnapshot(fwBanListLimit)
 	if list == nil {
 		list = []fwBanView{}
 	}

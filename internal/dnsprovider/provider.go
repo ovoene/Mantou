@@ -18,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"mantou/internal/netguard"
 )
 
 // RecordRequest 是一次 A/AAAA 记录更新请求（DDNS 使用）。
@@ -141,8 +143,14 @@ var sharedTransport = sync.OnceValue(func() *http.Transport {
 
 // httpClient 返回一个带整体超时的客户端；底层 Transport 全局共享。
 // Client 本身只是结构体，每次调用新建的开销可忽略，也便于各服务商保留自己的超时取值。
+//
+// CheckRedirect 与 netguard.HTTPClient 共用同一条策略（审计 S-04）：跳到别的主机时
+// 把请求头摘掉。这条路比那边更该管——各适配器**每一个**请求都带着服务商的 API 令牌
+// （Header 里的 `Authorization` / `X-Auth-Key` / `X-Tencent-*` 之类，见各 provider_*.go），
+// 而标准库只会自己丢掉 `Authorization`、`Cookie`、`WWW-Authenticate` 三个头，
+// 其余照抄。ACME DNS-01 又是自动跑的，一次外泄不会有人在旁边看着。
 func httpClient(timeout time.Duration) *http.Client {
-	return &http.Client{Timeout: timeout, Transport: sharedTransport()}
+	return &http.Client{Timeout: timeout, Transport: sharedTransport(), CheckRedirect: netguard.CheckRedirect}
 }
 
 // ---------- 公共工具 ----------

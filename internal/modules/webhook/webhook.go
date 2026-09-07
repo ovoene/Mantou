@@ -117,8 +117,14 @@ type Module struct {
 	// 保存一次就能重新开跑。
 	limiter *ipx.IPLimiter
 
-	mu      sync.Mutex
-	spec    listenSpec
+	mu sync.Mutex
+	// spec 当前的监听决定因素。整体替换，用 atomic 而非放在 mu 底下的普通字段：
+	// 入站请求路径上要读它（serve 靠 tls/shared/domain 决定要不要校验 Host），
+	// 而那条路径的频率由公网决定。原先每条请求都为这一次读抢一把模块级互斥锁，
+	// 而同一把锁上还压着 Reload / startListen / stopListen 里的 net.Listen、
+	// srv.Close 这些会阻塞的动作——一次配置保存就能把当时在途的所有请求卡在锁上。
+	// 写者仍在 mu 里改（与 lastErr 一起），读者无锁，与 routes 同一套做法。
+	spec    atomic.Pointer[listenSpec]
 	srv     *http.Server
 	ln      net.Listener
 	lastErr string
@@ -149,6 +155,9 @@ func New(log *logx.Logger, stats StatsWriter, logPath string) *Module {
 		byPath:    map[string]*receiverRT{},
 		byPathAll: map[string]*receiverRT{},
 	})
+	// 先放一份零值，让读者（serve / Status / ReleasePort）不必判空：
+	// 第一次 Reload 之前模块本来就是"没启用、不监听"，零值正是这个意思。
+	m.spec.Store(&listenSpec{})
 	return m
 }
 
@@ -253,7 +262,7 @@ func (m *Module) applyListen(cfg *config.Config) error {
 		m.mu.Unlock()
 		return nil
 	}
-	same := m.spec == want && (m.srv != nil) == (want.enabled && !want.shared)
+	same := *m.spec.Load() == want && (m.srv != nil) == (want.enabled && !want.shared)
 	m.mu.Unlock()
 	if same {
 		return nil
@@ -262,7 +271,7 @@ func (m *Module) applyListen(cfg *config.Config) error {
 	m.stopListen()
 
 	m.mu.Lock()
-	m.spec = want
+	m.spec.Store(&want)
 	m.lastErr = ""
 	m.mu.Unlock()
 
@@ -292,7 +301,7 @@ func (m *Module) Handler() http.Handler { return m.handler() }
 // 那时 spec.shared 由 false 变 true，与 want 不同，不会被"配置没变"的快速路径跳过。
 func (m *Module) ReleasePort(port int) bool {
 	m.mu.Lock()
-	holding := m.srv != nil && m.spec.port == port
+	holding := m.srv != nil && m.spec.Load().port == port
 	m.mu.Unlock()
 	if !holding {
 		return false
@@ -331,6 +340,14 @@ func (m *Module) startListen(spec listenSpec) error {
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,
+		// 请求头总量上限。不设置时标准库用 1 MiB（http.DefaultMaxHeaderBytes），
+		// 而这个模块的并发连接上限是 maxConns(512)：512 × 1 MiB ≈ 512 MB，
+		// 单是请求头就能吃掉一台小设备的全部内存。MaxBodyKB 管不到这里——
+		// 头是在 Handler 之前读完的，那时体积上限、鉴权、限流都还没上场。
+		//
+		// 32 KiB 对第三方 Webhook 来源足够宽：这些请求头一般只有
+		// Content-Type + 一个签名头 + User-Agent。超限时标准库回 431，能看懂。
+		MaxHeaderBytes: 32 << 10,
 		// fw 为 nil 时 WrapErrorLog 原样返回 base：未注入防火墙等于不拦截，日志行为不变。
 		ErrorLog: fw.WrapErrorLog(m.log.Standard(slog.LevelWarn, "消息路由 TLS 或连接异常")),
 	}
@@ -496,8 +513,9 @@ func (m *Module) setErr(s string) {
 // warnings 只在大于零时给，前端据此决定要不要追加"N 项配置需要检查"那一句。
 func (m *Module) Status() module.Status {
 	table := m.routes.Load()
+	spec := *m.spec.Load()
 	m.mu.Lock()
-	spec, lastErr, listening := m.spec, m.lastErr, m.srv != nil
+	lastErr, listening := m.lastErr, m.srv != nil
 	m.mu.Unlock()
 
 	st := module.Status{Name: "webhook", Total: table.total, Active: table.active, Healthy: true}

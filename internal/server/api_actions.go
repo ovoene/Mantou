@@ -220,6 +220,18 @@ func (s *Server) handleExportCert(c *gin.Context) {
 		respondError(c, http.StatusNotFound, err.Error())
 		return
 	}
+	// 敏感操作审计。导出是这套接口里外泄面最大的一个动作——它把证书、可选连私钥一起
+	// 交到浏览器手上，而私钥一旦离开这台机器就再也收不回来了。启用/禁用证书都记了一条
+	// （见 handleToggleCert），没有理由这一个不记。
+	//
+	// 「含私钥」与否必须写进文案：事后追查时"只拿了公钥"和"把私钥也拿走了"是两件完全
+	// 不同的事，而请求参数不会留在日志里。来源 IP 同理（面板的 trustedProxies 已置 nil，
+	// c.ClientIP() 拿到的是真实对端地址，见 server.go 那段说明）。
+	scope := "（仅证书）"
+	if includePrivateKey {
+		scope = "（含私钥）"
+	}
+	s.logOp("导出", "SSL/TLS 证书", target.ID, target.Name, scope+"，来源 IP "+c.ClientIP())
 	resp := gin.H{"certPem": string(certPEM)}
 	if includePrivateKey {
 		resp["keyPem"] = string(keyPEM)
@@ -254,6 +266,17 @@ func (s *Server) handleImportCert(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, "导入失败: "+err.Error())
 		return
 	}
+	// 敏感操作审计，与导出成对。导入换掉的是这个站点对外出示的身份：换进来的证书之后会被
+	// 面板 HTTPS 与各 Web 子项直接使用，而这条路径不经过 registerCRUD，没有任何审计记录。
+	// 只记 ID / 名称与来源 IP，PEM 内容一个字节都不进日志。
+	name := req.ID
+	for _, cert := range s.deps.Config.Snapshot().Certs {
+		if cert.ID == req.ID {
+			name = cert.Name
+			break
+		}
+	}
+	s.logOp("导入", "SSL/TLS 证书", req.ID, name, "（手动上传证书与私钥），来源 IP "+c.ClientIP())
 	respondOK(c, gin.H{"ok": true})
 }
 

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	htmlpkg "html" // 别名：buildIndexHTML 里有个叫 html 的局部变量
 	"io/fs"
 	"log/slog"
 	"net"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"golang.org/x/net/netutil"
 
 	"mantou/internal/config"
 	"mantou/internal/dnsprovider"
@@ -36,6 +38,19 @@ import (
 	"mantou/internal/runstats"
 	"mantou/internal/strutil"
 )
+
+// maxPanelConns 是面板监听器上的并发连接上限（见 Start 里的 LimitListener）。
+//
+// 512 与消息路由那侧取同一个数（webhook.maxConns），是 Web 服务每监听 2000 的四分之一：
+// 面板是给人用的管理界面，浏览器对同一个源每标签页最多开 6 条连接，512 够几十个管理员
+// 同时开着页面轮询，正常使用永远碰不到这个界。
+//
+// LimitListener 的做法是**阻塞 Accept** 而不是拒绝连接——满了之后新连接停在内核 backlog 里
+// 等前面的释放，而不是收到 RST。这在别处需要斟酌，在面板这里是安全的：四道超时
+// （ReadHeaderTimeout / ReadTimeout / WriteTimeout / IdleTimeout，见 newHTTPServer）
+// 已经封住了单条连接能占住一个名额的时长，而面板没有 SSE / WebSocket 之类的长连接接口
+// （registerRoutes 下所有处理器都是一问一答），不存在"少数长连接把名额全占死"的形态。
+const maxPanelConns = 512
 
 // Deps 是服务器的依赖集合。
 type Deps struct {
@@ -83,9 +98,18 @@ type Server struct {
 	deps         Deps
 	http         *http.Server
 	limiter      *loginLimiter
-	setupLimiter *loginLimiter    // 初始化接口限流，防止面板暴露期间被抢注管理员
-	wakeLimiter  *wakeLimiter     // 手动网络唤醒限流，按设备计量（见 wakelimit.go）
-	sessions     *sessionRegistry // 服务端会话状态（"关闭才退、刷新保活"）
+	setupLimiter *loginLimiter // 初始化接口限流，防止面板暴露期间被抢注管理员
+	// reauthLimiter 已登录之后「再验一次当前密码」那几处的共享失败计数（见 reauth.go）。
+	// 按会话记、参数写死，与上面两个限流器互不影响。
+	//
+	// 不在 New 里建、改由 reauth() 按需建：本包里有几十处测试直接用 &Server{deps: …} 拼壳子，
+	// 只要哪个测试碰到那几条路由，这里就是 nil，而限流器的方法一律要读字段——nil 解引用
+	// panic 掉的是整个测试进程。同 setResourceCap 的取舍（见 api_resources.go）：
+	// 与其让每个构造点都记得填这一个字段，不如让唯一的读取点保证它一定在。
+	reauthLimiter *loginLimiter
+	reauthOnce    sync.Once
+	wakeLimiter   *wakeLimiter     // 手动网络唤醒限流，按设备计量（见 wakelimit.go）
+	sessions      *sessionRegistry // 服务端会话状态（"关闭才退、刷新保活"）
 	// firewall 面板入站防护：连接层拦截 + 请求层限速/自动封禁（见 firewall.go）。
 	// 它自己每次都从配置快照读策略，因此改设置立刻生效、不需要重启面板。
 	firewall *panelFirewall
@@ -94,7 +118,7 @@ type Server struct {
 	gfw          *inboundfw.Firewall
 	dnsProviders []dnsprovider.Info
 	basePath     string // 规范化后的访问路径前缀（""或"/xxx"）
-	indexHTML    []byte // 注入 base 前缀后的前端入口页（basePath 非空时使用）
+	indexHTML    []byte // 注入 <base> 与运行期基址变量后的前端入口页（见 buildIndexHTML）
 	// assetETags 嵌入前端资源的强校验符，键是嵌入 FS 内的相对路径。
 	// 启动时算一次（见 assets.go）；只存哈希串，不存文件内容。
 	assetETags map[string]string
@@ -154,6 +178,10 @@ func New(deps Deps) *Server {
 	// （防爆破、防抢注），并污染审计日志中的来源 IP。置 nil 后 ClientIP() 只取真实对端地址。
 	_ = r.SetTrustedProxies(nil)
 	r.Use(gin.CustomRecovery(s.recoverPanic))
+	// 安全响应头（反点击劫持 / 不外泄 Referer / 禁止 MIME 嗅探）。
+	// 刻意排在访问控制**前面**，好让面板发出的每个响应都带上它们——
+	// 包括入站防护自己的 403/429 与恢复中间件兜下的 500。理由见 securityHeaders。
+	r.Use(s.securityHeaders())
 	// 面板入站防护：来源名单 / 访问范围 / 限速 / 自动封禁。
 	//
 	// 紧跟恢复中间件之后，排在其余一切之前。恢复必须留在最外层（它要兜住这里面的
@@ -503,7 +531,14 @@ func (s *Server) Start() error {
 	if err != nil {
 		return err
 	}
-	ln = s.firewall.wrapListener(ln)
+	// 并发连接上限，层次与 Web 服务那侧一致（见 webservice/listener.go）：
+	// 入站防护在里、LimitListener 在外，被封禁的连接根本不进计数。
+	//
+	// 面板从前是这四个监听里唯一没有这道闸的：超时齐全（ReadHeaderTimeout / ReadTimeout /
+	// WriteTimeout / IdleTimeout，见 newHTTPServer）保证了单条连接占不了太久，但"同时能有多少条"
+	// 之前完全由对端决定。一次针对管理端口的连接洪水于是能把内存与文件描述符推到极限——
+	// 而面板恰恰是出事时唯一还能用来救场的入口，它必须是最后一个倒下的东西。
+	ln = netutil.LimitListener(s.firewall.wrapListener(ln), maxPanelConns)
 	if s.panelHTTPS {
 		if _, certErr := s.panelCertificate(); certErr != nil {
 			_ = ln.Close()
@@ -597,6 +632,18 @@ func (s *Server) registerFrontend(r *gin.Engine) {
 			return
 		}
 		if _, err := fs.Stat(s.deps.WebFS, trimmed); err != nil {
+			// 未命中静态文件。这里要分两种情况：请求的是**资源**就回 404，只有看着像
+			// 前端路由的路径才交回单页应用。
+			//
+			// 前端路由都是 views 表里的单段标识符（/overview、/settings…），不带扩展名；
+			// 而入口页里的资源引用一律带扩展名（./assets/index-xxxx.js、./favicon.ico）。
+			// 把「看着像文件」的请求也回一份 index.html，浏览器就会拿 HTML 当模块脚本或
+			// 样式表去解析——报错停在 MIME 上，看不出真正的原因其实是那个文件不存在
+			// （典型场合：旧版页面被缓存住，指向的 chunk 名字已经换掉了）。回 404 才说得清。
+			if looksLikeStaticFile(trimmed) {
+				s.writeNotFoundPage(c)
+				return
+			}
 			// 未命中静态文件 → 交回前端路由。
 			s.serveIndex(c, fileServer)
 			return
@@ -607,6 +654,16 @@ func (s *Server) registerFrontend(r *gin.Engine) {
 		c.Request.URL.Path = "/" + trimmed
 		fileServer.ServeHTTP(c.Writer, c.Request)
 	})
+}
+
+// looksLikeStaticFile 判断一条（已剥掉访问前缀的）路径请求的是不是静态文件：
+// 只看最后一段里有没有点。前端路由的路径都是不含点的单段标识符，资源引用都含点，
+// 这条线足够把两者分开，而且不需要维护一张扩展名白名单。
+func looksLikeStaticFile(p string) bool {
+	if i := strings.LastIndexByte(p, '/'); i >= 0 {
+		p = p[i+1:]
+	}
+	return strings.Contains(p, ".")
 }
 
 // recoverPanic 接住没人处理的 panic。堆栈照旧由 gin 打进日志，这里只管回给用户的那一页：
@@ -635,13 +692,18 @@ func (s *Server) recoverPanic(c *gin.Context, _ any) {
 // writeNotFoundPage 面板的 404。页面本体在 internal/errpage：面板、Web 服务、消息路由
 // 三处的错误页用同一张卡片，用户撞上哪一个都该看得出这是同一个系统。
 //
-// 只有"前缀之外"的请求会走到这里——前缀之内找不到的路径一律交回前端路由（单页应用
-// 自己的 404 更有用，那一页上还有导航）。
+// 走到这里的只有两类请求：访问前缀之外的，以及前缀之内但明显是在取一个不存在的
+// 静态文件的（见 looksLikeStaticFile）。像前端路由的路径一律交回单页应用——
+// 单页应用自己的 404 更有用，那一页上还有导航。
 //
 // 这一页刻意不提面板首页在哪、也不提这台机器上跑的是什么：走到这里的请求恰好是
 // "没猜中路径"的那一类，撞上 404 的多半就是在扫路径。把访问前缀写在页面上等于替对方
 // 把最后一步补齐。管理员知道自己的地址，不需要这一页来告知。
 func (s *Server) writeNotFoundPage(c *gin.Context) {
+	// 这一页不许被缓存：同一条地址随时会因为一次发布而变成有效的（改名过的 chunk
+	// 就是这样），而 404 在 HTTP 里是可以被启发式缓存的。缓存住一条 404，
+	// 表现是「发布修好了，用户那边还是白屏，清缓存才好」。
+	c.Header("Cache-Control", "no-store")
 	errpage.Write(c.Writer, c.Request, errpage.Page{
 		Status: http.StatusNotFound,
 		Title:  "页面不存在",
@@ -670,7 +732,10 @@ func (s *Server) serveIndex(c *gin.Context, fileServer http.Handler) {
 		c.Data(http.StatusOK, "text/html; charset=utf-8", s.indexHTML)
 		return
 	}
-	// 无访问前缀时直接读取并发送 index.html（同样不缓存），不依赖文件服务器默认缓存策略。
+	// 兜底：注入版没建起来（buildIndexHTML 读不到 index.html）时原样发一份。
+	// 走到这里说明嵌入的前端产物本身不完整——注入版失败的原因就是这一句也会失败，
+	// 所以实际上到不了；留着只为不至于在那种情况下什么都不回。
+	// 注意这条路径上没有 <base>，多段地址下的资源引用会跟着地址漂（见 buildIndexHTML）。
 	if s.deps.WebFS != nil {
 		if data, err := fs.ReadFile(s.deps.WebFS, "index.html"); err == nil {
 			c.Data(http.StatusOK, "text/html; charset=utf-8", data)
@@ -683,8 +748,8 @@ func (s *Server) serveIndex(c *gin.Context, fileServer http.Handler) {
 
 // buildIndexHTML 读取嵌入的 index.html；始终注入运行期基址变量 window.__MANTOU_BASE__，
 // 使前端 basePath 解析始终与后端当前配置一致（空串即根路径），避免浏览器复用了
-// 旧 HTML 导致基址错位、API 请求飞到错误路径。子路径部署时额外注入 <base> 标签，
-// 让前端资源与路由解析在子路径下正确工作。
+// 旧 HTML 导致基址错位、API 请求飞到错误路径。同时注入 <base> 标签，
+// 让前端资源引用与当前地址的层级脱钩（理由见下）。
 func (s *Server) buildIndexHTML() []byte {
 	if s.deps.WebFS == nil {
 		return nil
@@ -693,11 +758,19 @@ func (s *Server) buildIndexHTML() []byte {
 	if err != nil {
 		return nil
 	}
-	// 始终注入基址变量；子路径时再加 <base> 标签。
-	inject := `<script>window.__MANTOU_BASE__=` + jsString(s.basePath) + `;</script>`
-	if s.basePath != "" {
-		inject = `<base href="` + s.basePath + `/">` + inject
-	}
+	// <base> 在根路径部署时也要写（href="/"），不能只在子路径时写：
+	// 前端产物里的资源引用是相对路径（./assets/xxx.js，Vite 的 base:'./' 决定的），
+	// 没有 <base> 时浏览器按**当前地址所在目录**去解析它。于是访问 /a/b/c 这种多段
+	// 未知路径时（前端路由的兜底会把它改道到 /overview，但这份 HTML 是在改道之前
+	// 就发出去的），浏览器会去取 /a/b/assets/xxx.js —— 那条路径同样命中不了文件，
+	// 又被下面的兜底当成前端路由回了一份 index.html，浏览器拿 HTML 当模块脚本解析，
+	// 结果整页空白、控制台只有一句看不出因果的 MIME 报错。
+	// 写死 <base> 之后，资源引用只跟部署前缀有关，与地址有几段无关。
+	//
+	// 转义不能省：basePath 来自配置文件，normalizeBasePath 已把字符集限死（见那里的
+	// 说明），这里再转义一遍是为了防「哪天放宽了字符集」——属性里逃出一个引号就是注入。
+	inject := `<base href="` + htmlpkg.EscapeString(s.basePath+"/") + `">` +
+		`<script>window.__MANTOU_BASE__=` + jsString(s.basePath) + `;</script>`
 	html := string(data)
 	if idx := strings.Index(html, "<head>"); idx >= 0 {
 		pos := idx + len("<head>")
@@ -718,6 +791,8 @@ func jsString(s string) string {
 }
 
 // normalizeBasePath 规范化访问路径前缀：空或"/"→""；否则确保以"/"开头、无末尾"/"。
+// 形状不合规的（见 validBasePath）一律按""处理——手改过的配置文件也不能把非法值带进
+// 路由组和入口页的 <base href>。真正的拒绝在 API 层（保存时直接 400），这里是兜底。
 func normalizeBasePath(bp string) string {
 	bp = strings.TrimSpace(bp)
 	if bp == "" || bp == "/" {
@@ -726,7 +801,42 @@ func normalizeBasePath(bp string) string {
 	if !strings.HasPrefix(bp, "/") {
 		bp = "/" + bp
 	}
-	return strings.TrimRight(bp, "/")
+	bp = strings.TrimRight(bp, "/")
+	if bp == "" || !validBasePath(bp) {
+		return ""
+	}
+	return bp
+}
+
+// validBasePath 校验访问路径前缀的形状。入参是已经规范化过的形式（以"/"开头、无末尾"/"）。
+//
+// 字符集必须限死，因为这段字符串有两个去处，两边都不容错：
+//   - gin 的路由组前缀（r.Group(basePath)）——冒号和星号在那里是通配符语法；
+//   - 入口页的 <base href="…">——引号能从属性里逃出去，构成注入；`..` 能把整页的资源
+//     引用挪到上一层目录。
+//
+// 只收 URL 路径里不必转义的那几类字符（RFC 3986 的 unreserved）加上分段用的"/"：
+// 非 ASCII 看着能填，但浏览器会把它百分号编码后再发出来，与路由组里存的原始字节
+// 对不上，本来就是不能用的。
+func validBasePath(bp string) bool {
+	if !strings.HasPrefix(bp, "/") {
+		return false
+	}
+	for _, seg := range strings.Split(strings.TrimPrefix(bp, "/"), "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			return false // 空段（//）与相对段都会让前缀失去确定含义
+		}
+		for i := 0; i < len(seg); i++ {
+			ch := seg[i]
+			switch {
+			case ch >= 'a' && ch <= 'z', ch >= 'A' && ch <= 'Z', ch >= '0' && ch <= '9':
+			case ch == '-', ch == '_', ch == '.', ch == '~':
+			default:
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func addr(host string, port int) string {

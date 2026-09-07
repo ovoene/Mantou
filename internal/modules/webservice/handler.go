@@ -62,7 +62,7 @@ func buildChildHandler(m *Module, service string, ch config.WebChild) (http.Hand
 		base = redirectHandler(ch)
 	default: // proxy
 		var tr *http.Transport
-		base, tr = proxyHandler(m.log, service, ch)
+		base, tr = proxyHandler(m, service, ch)
 		if tr != nil {
 			idle = tr
 		}
@@ -468,7 +468,10 @@ func (p *bufferPool) Put(b []byte) {
 }
 
 // proxyHandler 构造反向代理处理器，并把它用的连接池一并交出去（见 buildChildHandler）。
-func proxyHandler(log *logx.Logger, service string, ch config.WebChild) (http.Handler, *http.Transport) {
+//
+// 收 *Module 而不是只收 log：下面那条 Transport 的拨号钩子是 m 的方法（见 dialguard.go），
+// 它要在拨号时读模块里那份面板端口。
+func proxyHandler(m *Module, service string, ch config.WebChild) (http.Handler, *http.Transport) {
 	// 收集有效后端及其权重：权重 ≤0 视为 1，并夹到上限，避免超大权重撑爆下方展开表。
 	type upstream struct {
 		url    *url.URL
@@ -494,7 +497,7 @@ func proxyHandler(log *logx.Logger, service string, ch config.WebChild) (http.Ha
 	}
 	if len(ups) == 0 {
 		// 同 staticHandler：真因进日志，页面上不提管理面。
-		log.Warn("反向代理站点没有可用后端，该子项将对访客返回 502",
+		m.log.Warn("反向代理站点没有可用后端，该子项将对访客返回 502",
 			"service", service, "childId", ch.ID)
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			errpage.Write(w, r, errpage.Page{
@@ -539,22 +542,47 @@ func proxyHandler(log *logx.Logger, service string, ch config.WebChild) (http.Ha
 	}
 
 	proxy := &httputil.ReverseProxy{
-		Director: func(req *http.Request) {
+		// 改写钩子用 Rewrite 而不是 Director（审计 L-03）。两者都能改出站请求，
+		// 差别在钩子跑在 ReverseProxy 内部的哪一步，而这个差别正好落在下面几十行
+		// 最在意的那几个头上：
+		//
+		// Director 跑完之后，标准库还会做两件事——先按**访客送来的** Connection 头
+		// 删「逐跳头」，再往 X-Forwarded-For 追加一次对端 IP。于是：
+		//   一、访客发一个 `Connection: X-Real-IP, X-Api-Key`，就能把我们刚注入的
+		//      X-Real-IP 与用户配在 ch.Headers 里的头删掉——删哪几个由访客点名。
+		//      后端于是退回「拿不到来源」「请求没带凭证」的分支，而访问日志这边
+		//      一切正常。标准库自己把 Director 的文档写成「This function is insecure」，
+		//      列的第一条就是这个。
+		//   二、我们设好的 XFF 会被再追加一次对端 IP，后端看到 `1.2.3.4, 1.2.3.4`：
+		//      按「最左即原始客户端」读还对，但链条长度多了一跳，而后端的 IP 名单、
+		//      限流与审计读的正是这一栏。
+		// 两条都由 forwardedheaders_test.go 钉住。
+		//
+		// Rewrite 这条路上，删逐跳头在**调用之前**完成，钩子里设的头没人再动，
+		// 也没有那次自动追加。代价有两处，都在下面处理：标准库会先删掉访客送来的
+		// Forwarded / X-Forwarded-*（所以「信任上游代理头」那一路要从 pr.In 取原值），
+		// 并对出站查询串跑一次 cleanQueryParams——只有出现 `;`、非法 %XX、或参数
+		// 超过一万个时才会重编码，正常查询串原样通过。
+		//
+		// pr.In 是访客送来的那份（只读），pr.Out 是要发给后端的那份。凡「访客说的」
+		// 都从 in 取、凡「我们发出去的」都写进 out，两者不再共用一个变量。
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			in, out := pr.In, pr.Out
 			// 访客请求的那个 Host 要在改写之前存下来：X-Forwarded-Host 说的是
-			// "访客访问的是哪个域名"，而 preserveHost 关着时 req.Host 一会儿就被
+			// "访客访问的是哪个域名"，而 preserveHost 关着时 out.Host 一会儿就被
 			// 换成上游地址了。
-			origHost := req.Host
-			t := pick(req)
-			req.URL.Scheme = t.Scheme
-			req.URL.Host = t.Host
+			origHost := in.Host
+			t := pick(in)
+			out.URL.Scheme = t.Scheme
+			out.URL.Host = t.Host
 			if !preserveHost {
-				req.Host = t.Host
+				out.Host = t.Host
 			}
 			if t.Path != "" && t.Path != "/" {
-				req.URL.Path = singleJoin(t.Path, req.URL.Path)
+				out.URL.Path = singleJoin(t.Path, out.URL.Path)
 			}
 			for k, v := range ch.Headers {
-				req.Header.Set(k, v)
+				out.Header.Set(k, v)
 			}
 			// 注入 X-Forwarded-*：让后端拿到真实客户端 IP（去掉端口）与原始协议/域名。
 			//
@@ -563,30 +591,36 @@ func proxyHandler(log *logx.Logger, service string, ch config.WebChild) (http.Ha
 			// 限流、审计全部跟着失真，而这几样恰恰是它们该挡住的东西。
 			// 只有开了「信任上游代理头」才说明 mantou 前面真有一层可信代理，
 			// 那时才该保留它送来的链条（与入站侧的 HTTPS 判定同一个开关）。
-			clientHost := ipx.RemoteHost(req.RemoteAddr)
-			if prior := req.Header.Get("X-Forwarded-For"); trustProxy && prior != "" {
-				req.Header.Set("X-Forwarded-For", prior+", "+clientHost)
+			clientHost := ipx.RemoteHost(in.RemoteAddr)
+			if prior := in.Header.Get("X-Forwarded-For"); trustProxy && prior != "" {
+				out.Header.Set("X-Forwarded-For", prior+", "+clientHost)
 			} else {
-				req.Header.Set("X-Forwarded-For", clientHost)
+				out.Header.Set("X-Forwarded-For", clientHost)
 			}
 			proto := "http"
-			if req.TLS != nil {
+			if in.TLS != nil {
 				proto = "https"
 			}
 			if trustProxy {
-				if given := forwardedProto(req.Header.Get("X-Forwarded-Proto")); given != "" {
+				if given := forwardedProto(in.Header.Get("X-Forwarded-Proto")); given != "" {
 					proto = given
 				}
 			}
-			req.Header.Set("X-Forwarded-Proto", proto)
+			out.Header.Set("X-Forwarded-Proto", proto)
 			if origHost != "" {
-				req.Header.Set("X-Forwarded-Host", origHost)
+				out.Header.Set("X-Forwarded-Host", origHost)
 			}
-			if !trustProxy {
+			if trustProxy {
+				// 访客送来的 Forwarded（RFC 7239 的写法）已被标准库删掉，而这条开关
+				// 说的正是"前面那层代理可信"，于是把原值照原样带给后端。
+				if fwd := in.Header.Values("Forwarded"); len(fwd) > 0 {
+					out.Header["Forwarded"] = append([]string(nil), fwd...)
+				}
+			} else {
 				// 同一件事的另外两种写法：nginx 系的后端读 X-Real-IP，
 				// RFC 7239 的读 Forwarded。只按住 XFF 而放这两个原样过去，等于没按住。
-				req.Header.Set("X-Real-IP", clientHost)
-				req.Header.Del("Forwarded")
+				// Forwarded 不必再删一次——Rewrite 这条路上标准库已经删过（见上）。
+				out.Header.Set("X-Real-IP", clientHost)
 			}
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
@@ -635,8 +669,27 @@ func proxyHandler(log *logx.Logger, service string, ch config.WebChild) (http.Ha
 		// HTTP_PROXY / HTTPS_PROXY / ALL_PROXY 通常是给别的用途设的（机场、公司网关）。
 		// 采信它等于把本该直连内网的流量静默拐进一个第三方代理——请求头里带着
 		// Basic 认证与业务令牌，而界面上没有任何地方看得出这件事。
-		Proxy:                 nil,
-		DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		Proxy: nil,
+		// 拨号钩子是两道合起来的一道闸（见 dialguard.go）：
+		//
+		// 一、只拦链路本地（169.254.0.0/16 与 fe80::/10），内网地址一律放过——
+		// 反代内网服务正是这个功能的用途，拦掉就没有功能了。留这一道窄的是因为
+		// 169.254.169.254 是各家云的实例元数据端点，一条指向它的后端等于把这台机器的
+		// 云凭证接口发布到公网，而它在界面上与任何一条正常的内网反代毫无区别
+		// （为什么不含 ULA、为什么解析不出 IP 时放过，见 netguard.BlockLinkLocal）。
+		//
+		// 二、拦下「解析后指向本机面板管理端口」的后端。保存期与 Reload 期都判过一次，
+		// 但两处都不查 DNS，于是后端写成一个解析到本机的域名时能绕过去；拨号期拿到的是
+		// 已经解析好的地址，是唯一补得上的地方（见 dialguard.go 文件头）。
+		//
+		// 拦下时的原因会经 sw.errMsg 进访问日志的 Reason 字段（502 页面本身不印，
+		// 那上面不该出现后端地址），ErrLinkLocalBlocked 与 ErrPanelPortDial 的文案
+		// 在那里可直接认出是哪一道。
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+			Control:   m.dialGuard,
+		}).DialContext,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          maxIdleConns,
 		MaxIdleConnsPerHost:   proxyMaxIdleConnsPerHost,
@@ -692,6 +745,12 @@ func redirectHandler(ch config.WebChild) http.Handler {
 	if target == "" {
 		// 同 staticHandler：真因进日志，页面上不提管理面。
 		logx.L().Warn("跳转站点没有填目标地址，该子项将对访客返回 500", "childId", ch.ID)
+	} else if reason := checkRedirectTarget(target); reason != "" {
+		// 目标不合法的处置与"没填"完全相同：装载时留下真因，运行期给访客一页 500。
+		// 清空 target 是让下面那个 if 接手，不必再多一个状态。
+		logx.L().Warn("跳转站点的目标地址不合法，该子项将对访客返回 500",
+			"childId", ch.ID, "target", target, "reason", reason)
+		target = ""
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if target == "" {
@@ -718,6 +777,31 @@ func redirectHandler(ch config.WebChild) http.Handler {
 		}
 		http.Redirect(w, r, loc, code)
 	})
+}
+
+// checkRedirectTarget 校验跳转目标：必须是带主机名的 http / https 绝对地址。
+// 合法返回空串，否则返回不合法的原因（进日志，不给访客看）。
+//
+// 口径与 probeRedirect 一处对齐（见 probe.go）：那里早就要求 http/https + 非空 Host，
+// 而这里从前什么都不查——同一个配置字段，探测说它不合法、处理器照样拿它发 302。
+//
+// 这道闸真正挡住的是**协议相对地址**。目标写成 "/" 或 "//host"、再开上「保留原始路径」，
+// 拼出来的 Location 就会以 "//" 开头：浏览器把它读成"沿用当前协议的另一个站点"，
+// 于是访客带着本站域名下的 Referer 被送去任意外站——一个能被拿去做钓鱼跳板的开放重定向。
+// 保存接口那侧也会拦（见 normalizeBackendURL 与 validateWebService），但配置还能被手改，
+// 而运行期这一处是最后一道。
+func checkRedirectTarget(target string) string {
+	u, err := url.Parse(target)
+	if err != nil {
+		return "URL 解析失败：" + err.Error()
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "只支持 http / https 目标"
+	}
+	if u.Host == "" {
+		return "缺少目标主机名"
+	}
+	return ""
 }
 
 // statusWriter 包裹 ResponseWriter 以捕获状态码，同时透传 Flush/Hijack，

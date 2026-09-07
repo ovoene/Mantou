@@ -132,12 +132,35 @@ func sniffKV(text, forcePair, forceKV string) (pairSep, kvSep string, pairs int)
 // countKVPairs 按给定分隔符能拆出多少个合法字段。
 func countKVPairs(text, pairSep, kvSep string) int {
 	n := 0
-	for _, chunk := range strings.Split(text, pairSep) {
+	forEachChunk(text, pairSep, func(chunk string) bool {
 		if _, _, ok := cutKVPair(chunk, kvSep); ok {
 			n++
 		}
-	}
+		return true
+	})
 	return n
+}
+
+// forEachChunk 按 sep 把 text 逐段交给 fn（fn 返回 false 即刻结束），
+// 段的划分与 strings.Split 完全一致，包括空段与末尾那一段。
+//
+// 刻意不用 strings.Split：它要为整段文本一次性建出全部子串的切片。text 是入站请求体，
+// 最大 4 MB，一段塞满 "a=1&" 的载荷能拆出上百万段，光那个 []string 就有几十 MB，
+// 而 sniffKV 会对 12 组候选分隔符各拆一次；splitKV 那边的两道数量闸
+// maxKVPairs / maxKVFields 都在拿到切片之后才起作用，一个字节也挡不住。
+// 逐段遍历不分配任何东西，各闸也能真正提前收手。
+func forEachChunk(text, sep string, fn func(chunk string) bool) {
+	for {
+		i := strings.Index(text, sep)
+		if i < 0 {
+			fn(text)
+			return
+		}
+		if !fn(text[:i]) {
+			return
+		}
+		text = text[i+len(sep):]
+	}
 }
 
 // splitKV 按给定分隔符拆字段。同名字段用 ", " 连接，与请求头、query 的多值口径一致。
@@ -148,13 +171,13 @@ func countKVPairs(text, pairSep, kvSep string) int {
 func splitKV(text, pairSep, kvSep string) map[string]any {
 	out := make(map[string]any, 8)
 	pairs := 0
-	for _, chunk := range strings.Split(text, pairSep) {
+	forEachChunk(text, pairSep, func(chunk string) bool {
 		k, v, ok := cutKVPair(chunk, kvSep)
 		if !ok {
-			continue
+			return true
 		}
 		if pairs >= maxKVPairs {
-			break
+			return false
 		}
 		pairs++
 		if prev, dup := out[k]; dup {
@@ -162,14 +185,15 @@ func splitKV(text, pairSep, kvSep string) map[string]any {
 				if len(s)+len(", ")+len(v) <= maxKVValueBytes {
 					out[k] = s + ", " + v
 				}
-				continue
+				return true
 			}
 		}
 		if len(out) >= maxKVFields {
-			break
+			return false
 		}
 		out[k] = v
-	}
+		return true
+	})
 	return out
 }
 

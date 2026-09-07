@@ -7,6 +7,8 @@ import (
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -18,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"mantou/internal/auth"
 	"mantou/internal/config"
 	"mantou/internal/strutil"
 
@@ -47,13 +50,81 @@ const (
 // errUpdateTooLarge 表示上传或解压的数据超出允许体积。
 var errUpdateTooLarge = errors.New("数据超出允许体积上限")
 
-// unsignedUpdateBlocked 判断当前配置下该不该接收更新包。
+// unsignedUpdateBlocked 判断当前配置下该不该接收更新包，并给出拒收时对用户说的那句话。
 //
-// 条件是"公钥留空、且没打开允许未验签"。抽成一个函数是为了能在任何平台上测到：
-// handleSelfUpdate 在 Windows 上第一行就返回 501，判断留在里面的话本机跑不到。
-func unsignedUpdateBlocked(u config.UpdateConfig) bool {
-	return strings.TrimSpace(u.SignKey) == "" && !u.AllowUnsignedUpdate
+// 配了公钥就一律放行到验签那一步（签名本身即授权）；没配公钥则要求「允许未验签的更新包」
+// 处在有效窗口内（见 config.UpdateConfig.UnsignedUpdateAllowed）。窗口过期与从未打开
+// 分开措辞：两者的下一步动作不同，一个是"去打开"，一个是"再打开一次"。
+//
+// 抽成函数是为了能在任何平台上测到：handleSelfUpdate 在 Windows 上第一行就返回 501，
+// 判断留在里面的话本机跑不到。now 从参数进来，好让过期这一支不必真的等一天。
+func unsignedUpdateBlocked(u config.UpdateConfig, now time.Time) (bool, string) {
+	if strings.TrimSpace(u.SignKey) != "" {
+		return false, ""
+	}
+	if u.UnsignedUpdateAllowed(now) {
+		return false, ""
+	}
+	if u.AllowUnsignedUpdate && u.AllowUnsignedSince > 0 {
+		return true, fmt.Sprintf("「允许未验签的更新包」已超过 %d 小时有效期，当前不接收更新包。"+
+			"请在「设置 → 在线更新」重新打开它（需再次验证密码），或配置更新包签名公钥",
+			int(config.AllowUnsignedUpdateTTL/time.Hour))
+	}
+	return true, "未配置更新包签名公钥，当前不接收更新包。可在「设置 → 在线更新」配置公钥，或打开「允许未验签的更新包」"
 }
+
+// adminCredentialsOK 报告一对账户名/密码是否对得上配置里的管理员凭据，
+// 供「敏感操作要当场再验一次密码」的几处复核共用（打开未验签开关、上传未验签的更新包）。
+//
+// 账户名 TrimSpace 后比较、密码原样交给 bcrypt：前者是用户在输入框里打出来的名字，
+// 首尾空格几乎总是误触；后者的空格是密码的一部分，碰不得。
+//
+// 单独一个函数而不是在两处各写一遍那个表达式：一是两处必须同口径——某天这里加一条
+// 「账户名不区分大小写」而另一处没跟上，就会出现一条路放行另一条拒绝；二是能测——
+// handleSelfUpdate 在 Windows 上第一行就返回 501，那条路上的复核在本机跑不到。
+//
+// 配置尚未初始化（用户名与哈希都是空串）时一律为假：VerifyPassword 拿空哈希验不过。
+func adminCredentialsOK(a config.Auth, account, password string) bool {
+	return strings.TrimSpace(account) == a.Username && auth.VerifyPassword(a.PasswordHash, password)
+}
+
+// operator 返回当前请求的操作者名，供审计记录使用。
+//
+// 鉴权中间件把它放进上下文（middleware.go 里的 c.Set("username", …)），所以到得了处理器
+// 的请求一定有这个值。留一个占位是给直接构造 gin.Context 的测试与将来可能的内部调用：
+// 审计记录宁可写"未知"，也不要因为少一个字段而整条不写。
+func operator(c *gin.Context) string {
+	if name := c.GetString("username"); name != "" {
+		return name
+	}
+	return "(未知)"
+}
+
+// updateAuditRecord 组装「即将覆盖二进制」那一条审计记录：返回该用 Warn 还是 Info、
+// 消息本身，以及结构化字段。
+//
+// 抽成函数只为一件事——能测。走到调用它的那一行需要一个真能跑起来的同架构二进制
+// 和一次真的文件覆盖，单元测试里做不到；而这条记录少任何一项，都要等到某次事后
+// 排查时才会发现"当初没记下来"。
+//
+// sigState 只有 "verified" 与 "unsigned" 两种取值，后者用 Warn：那是一次主动放宽，
+// 在日志里该比常规记录显眼一点。
+func updateAuditRecord(operatorName, ip, exeName, digest, sigState, arch string) (bool, string, []any) {
+	args := []any{
+		"exe", exeName, "operator", operatorName, "ip", ip,
+		"sha256", digest, "signature", sigState, "arch", arch,
+	}
+	if sigState == updateSigVerified {
+		return false, "自更新：更新包已通过签名校验，准备覆盖", args
+	}
+	return true, "自更新：按「允许未验签的更新包」放行一个未验签的更新包，准备覆盖", args
+}
+
+// 审计记录里 signature 字段的两种取值。
+const (
+	updateSigVerified = "verified"
+	updateSigUnsigned = "unsigned"
+)
 
 // handleSelfUpdate 接收上传的 tar.gz 更新包，就地替换当前可执行文件后重启。
 // 流程：流式解包 → 定位包内同名可执行文件 → 架构校验 → 签名校验 → `-version` 冒烟测试 →
@@ -76,14 +147,21 @@ func (s *Server) handleSelfUpdate(c *gin.Context) {
 	//
 	// 也不能一禁了之：自己生成密钥、给 tar.gz 签名，不是这个项目对用户的要求，
 	// 那样等于把一个能用的功能删掉。所以留「允许未验签的更新包」这个开关
-	//（设置 → 在线更新），默认关闭。
+	//（设置 → 在线更新），默认关闭、打开要验密码、且只在一段窗口内有效。
 	//
-	// 开关本身也在同一套鉴权后面，一个被盗的会话理论上能自己打开它——但那是一次
-	// 留在配置里、备份里、设置页上看得见的改动；而原来的默认值是任何一个有效会话
-	// 直接就能覆盖二进制，两者不是一回事。
-	if unsignedUpdateBlocked(cfg.Update) {
-		respondError(c, http.StatusForbidden,
-			"未配置更新包签名公钥，当前不接收更新包。可在「设置 → 在线更新」配置公钥，或打开「允许未验签的更新包」")
+	// 这一判在读请求体之前：拒收就不该先把几十 MB 收下来。
+	if blocked, msg := unsignedUpdateBlocked(cfg.Update, time.Now()); blocked {
+		respondError(c, http.StatusForbidden, msg)
+		return
+	}
+
+	// 未验签这条路下面要再验一次当前密码，那次校验与导出/导入/改账户共用一份失败计数
+	//（见 reauth.go）：都是"拿一条已有会话反复猜当前密码"，只限其中几条等于没限。
+	//
+	// 只在 signKey == "" 时取这道闸：配了公钥的上传根本不问密码，不该被别处的密码失败连坐。
+	//
+	// 位置与上面那一判同侧、都在读请求体之前：一条已经被锁住的会话不该先把 32 MB 传完再被拒。
+	if signKey == "" && !s.reauthAllowed(c) {
 		return
 	}
 
@@ -108,13 +186,42 @@ func (s *Server) handleSelfUpdate(c *gin.Context) {
 	exeDir := filepath.Dir(exePath)
 	exeName := filepath.Base(exePath)
 
-	part, err := multipartFilePart(c.Request)
+	// 未验签这条路上顺带收下 account / password 两个表单字段，用于下面的二次认证。
+	// 它们必须排在 file 之前（见 multipartFilePartFields），前端按这个顺序 append。
+	var acct, pwd string
+	want := map[string]*string{"account": &acct, "password": &pwd}
+	part, err := multipartFilePartFields(c.Request, want)
 	if err != nil {
 		respondError(c, http.StatusBadRequest, err.Error())
 		return
 	}
 	defer part.Close()
-	s.deps.Log.Info("收到自更新请求", "exe", exeName, "declaredSize", c.Request.ContentLength, "ip", c.ClientIP())
+
+	// 未验签这条路要求当场再验一次管理员密码。
+	//
+	// 为什么只在这一支要：配了公钥时，签名本身就是授权——拿不到私钥的人做不出能通过的包，
+	// 再问一次密码只是给用户添一道手续。而未验签时"包是谁做的"无从判断，唯一还能问的
+	// 就是"传它的人是不是本人"。这道口子的后果是执行任意二进制，与导出/导入备份同级，
+	// 因此用同一套做法（见 handleExportConfig）。
+	//
+	// 它也不与设置页那次验证重复：那一次证明的是"打开这个开关的人是本人"，
+	// 这一次证明的是"此刻上传这个包的人是本人"。开关一开就有一整段窗口，
+	// 窗口里的每一次上传都得自己过这一关，否则窗口期内一条被盗的会话照样能换掉二进制。
+	if signKey == "" {
+		if !adminCredentialsOK(cfg.Auth, acct, pwd) {
+			s.reauthFail(c)
+			// 403 而非 401：前端响应拦截器收到 401 会强制登出跳登录页，
+			// 而这里只是本次操作的凭据没对上，应当停在当前页提示。
+			s.deps.Log.Warn("自更新：未验签上传的身份复核失败，已拒绝",
+				"exe", exeName, "operator", operator(c), "ip", c.ClientIP())
+			respondError(c, http.StatusForbidden, "账户或密码错误，未验签的更新包已拒绝")
+			return
+		}
+		s.reauthOK(c)
+	}
+
+	s.deps.Log.Info("收到自更新请求", "exe", exeName, "declaredSize", c.Request.ContentLength,
+		"operator", operator(c), "ip", c.ClientIP())
 
 	// 解包到与目标同目录的临时文件（保证 rename 为同一文件系统上的原子操作）。
 	tmpPath := filepath.Join(exeDir, "."+exeName+".update-"+time.Now().Format("20060102150405"))
@@ -147,17 +254,35 @@ func (s *Server) handleSelfUpdate(c *gin.Context) {
 
 	// 完整性 / 真实性校验：若配置了更新签名公钥（Update.SignKey），则要求更新包内附同名
 	// .sig 签名文件，验签通过才允许覆盖，避免程序二进制被未授权替换。
-	// 走到 else 分支说明用户在设置里显式打开了「允许未验签的更新包」（否则前面已经拒了），
-	// 仍留一条告警：这一步的结果是换掉正在跑的二进制，值得在日志里留痕。
+	// 走到 else 分支说明用户在设置里显式打开了「允许未验签的更新包」且窗口未过期
+	//（否则前面已经拒了），并且刚刚过了一次密码复核。
+	sigState := updateSigUnsigned
 	if signKey != "" {
 		if err := verifyUpdateSignature(signKey, tmpPath, sigPath); err != nil {
 			_ = os.Remove(tmpPath)
+			s.deps.Log.Warn("自更新：更新包签名校验失败，已拒绝",
+				"exe", exeName, "operator", operator(c), "ip", c.ClientIP(), "err", err.Error())
 			respondError(c, http.StatusBadRequest, "更新包签名校验失败："+err.Error())
 			return
 		}
-		s.deps.Log.Info("自更新：更新包签名校验通过", "exe", exeName)
+		sigState = updateSigVerified
+	}
+
+	// 审计记录：这一步的结果是换掉正在跑的二进制，一条日志要能独立回答
+	// 「谁、从哪、装了什么、验没验签」四个问题——事后翻日志的人手上只有这一行。
+	//
+	// 摘要取解包出来的二进制而不是上传的 tar.gz：包体是流式消费的，留不下来；
+	// 而这个摘要对得上一份发布产物的 sha256sum，也正是真正被执行的那串字节。
+	sum, sumErr := sha256File(tmpPath)
+	digest := "(计算失败)"
+	if sumErr == nil {
+		digest = hex.EncodeToString(sum[:])
+	}
+	warn, auditMsg, auditArgs := updateAuditRecord(operator(c), c.ClientIP(), exeName, digest, sigState, pkgArch)
+	if warn {
+		s.deps.Log.Warn(auditMsg, auditArgs...)
 	} else {
-		s.deps.Log.Warn("自更新：未配置签名公钥，按已打开的「允许未验签的更新包」放行", "exe", exeName, "ip", c.ClientIP())
+		s.deps.Log.Info(auditMsg, auditArgs...)
 	}
 
 	// 保留原文件权限（默认可执行）。
@@ -213,7 +338,8 @@ func (s *Server) handleSelfUpdate(c *gin.Context) {
 		return
 	}
 
-	s.deps.Log.Info("自更新：可执行文件已替换，更新前版本已备份", "exe", exeName, "backup", backupPath)
+	s.deps.Log.Info("自更新：可执行文件已替换，更新前版本已备份",
+		"exe", exeName, "backup", backupPath, "operator", operator(c), "ip", c.ClientIP())
 	respondOK(c, gin.H{"ok": true, "restarting": true, "backup": backupPath})
 
 	// 延时：给响应留出回写时间，随后用新二进制替换当前进程映像，
@@ -395,10 +521,14 @@ func sha256File(path string) ([32]byte, error) {
 	return sum, nil
 }
 
-// detectBinaryArch 读取 Linux ELF 可执行文件头，返回其对齐的 Go GOARCH
-// （amd64 / arm64 / arm / 386 / riscv64 / ppc64 / mips）。
+// detectBinaryArch 读取 Linux ELF 可执行文件头，返回其对应的 Go GOARCH
+// （amd64 / arm64 / arm / 386 / riscv64 / loong64 / s390x / ppc64(le) / mips(le) / mips64(le)）。
 // 用于上传更新包时校验架构与当前运行的 runtime.GOARCH 是否一致。
 // 非 ELF（如 Windows PE / macOS Mach-O / 文本）一律视为「不是有效的 Linux 可执行文件」。
+//
+// 只手工读头部前 20 字节，不用 debug/elf：elf.NewFile 会连节头表与字符串表一起解析，
+// 而这里的输入是任何已认证用户都能上传的文件，让它照着文件里的数字去分配内存不值当。
+// 架构判断需要的三个字节全在这 20 字节里。
 func detectBinaryArch(path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -415,26 +545,87 @@ func detectBinaryArch(path string) (string, error) {
 	if hdr[0] != 0x7f || hdr[1] != 'E' || hdr[2] != 'L' || hdr[3] != 'F' {
 		return "", fmt.Errorf("更新包不是有效的 Linux 可执行文件（期望 ELF 格式）")
 	}
-	// e_machine：小端 2 字节，偏移 18。
-	machine := uint16(hdr[18]) | uint16(hdr[19])<<8
+
+	// EI_CLASS(hdr[4])：1=32 位，2=64 位。EI_DATA(hdr[5])：1=小端，2=大端。
+	// e_machine 之后的所有多字节字段都按 EI_DATA 声明的字节序存放，原先固定按小端读
+	// 是错的：一个真正的 GOARCH=mips 包（大端）里 e_machine 存成 00 08，按小端读出
+	// 0x0800，于是在 MIPS 机器上上传正确的包会被判成「无法识别的 CPU 架构」。
+	const (
+		elfClass64 = 2
+		elfLSB     = 1
+		elfMSB     = 2
+	)
+	var machine uint16
+	switch hdr[5] {
+	case elfLSB:
+		machine = binary.LittleEndian.Uint16(hdr[18:20])
+	case elfMSB:
+		machine = binary.BigEndian.Uint16(hdr[18:20])
+	default:
+		return "", fmt.Errorf("ELF 头的字节序标记无效（EI_DATA=%d）", hdr[5])
+	}
+	be := hdr[5] == elfMSB
+
+	// 字节序还要参与命名，不只是用来把 e_machine 读对：Go 给 MIPS 与 PPC64 的大小端
+	// 各留了一个独立的 GOARCH（mips/mipsle、ppc64/ppc64le），而 e_machine 两端共用同一个
+	// 值，只有 EI_DATA 分得开。若不分，一个小端 MIPS 包会在大端 MIPS 面板上通过这道闸
+	// （名字都算成 "mips"），要等后面的冒烟测试以 ENOEXEC 失败才拦下——而这道闸存在的
+	// 意义正是提前给出一句说得清的话。
+	//
+	// 其余架构 Go 只有一个端序的移植（如 arm/arm64 只有小端、s390x 只有大端），
+	// 端序不对说明这个包压根没有对应的 Go 目标，宁可报「无法识别」也不猜一个名字。
 	switch machine {
 	case 0x03: // EM_386
-		return "386", nil
-	case 0x08: // EM_MIPS
-		return "mips", nil
+		if !be {
+			return "386", nil
+		}
+	case 0x08: // EM_MIPS：大小端 × 32/64 位共四个 GOARCH
+		switch {
+		case be && hdr[4] == elfClass64:
+			return "mips64", nil
+		case be:
+			return "mips", nil
+		case hdr[4] == elfClass64:
+			return "mips64le", nil
+		default:
+			return "mipsle", nil
+		}
 	case 0x15: // EM_PPC64
-		return "ppc64", nil
-	case 0x28: // EM_ARM
-		return "arm", nil
+		if be {
+			return "ppc64", nil
+		}
+		return "ppc64le", nil
+	case 0x16: // EM_S390：Go 只有大端的 s390x
+		if be {
+			return "s390x", nil
+		}
+	case 0x28: // EM_ARM：Go 只有小端 arm
+		if !be {
+			return "arm", nil
+		}
 	case 0x3e: // EM_X86_64
-		return "amd64", nil
-	case 0xb7: // EM_AARCH64
-		return "arm64", nil
+		if !be {
+			return "amd64", nil
+		}
+	case 0xb7: // EM_AARCH64：Go 只有小端 arm64
+		if !be {
+			return "arm64", nil
+		}
 	case 0xf3: // EM_RISCV
-		return "riscv64", nil
-	default:
-		return "", fmt.Errorf("无法识别的 CPU 架构（e_machine=0x%04x）", machine)
+		if !be {
+			return "riscv64", nil
+		}
+	case 0x102: // EM_LOONGARCH
+		if !be {
+			return "loong64", nil
+		}
 	}
+	// 报错带上字节序：同一个 e_machine 值配错端序也会走到这里，光看数字会以为是别的问题。
+	endian := "小端"
+	if be {
+		endian = "大端"
+	}
+	return "", fmt.Errorf("无法识别的 CPU 架构（e_machine=0x%04x，%s）", machine, endian)
 }
 
 // writeFile 将 r 的内容写入 path（覆盖），单文件体积上限为 limit 字节。

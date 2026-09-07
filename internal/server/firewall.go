@@ -3,6 +3,7 @@ package server
 import (
 	"net"
 	"net/http"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -35,9 +36,11 @@ import (
 //
 // # 判定顺序
 //
-//	回环 → 拒绝名单 → 自动封禁 → 允许名单 → 访问范围(Mode) → 限速
+//	拒绝名单 → 回环 → 允许名单 → 自动封禁 → 访问范围(Mode) → 限速
 //
-// 顺序即语义，每一步为什么在这个位置见 decide 的注释。
+// 顺序即语义，每一步为什么在这个位置见 decide 的注释；拿不到对端 IP 时在这一串之前
+// 就直接拒绝（失败关闭，同上）。前五步是 decide 本身，限速在它之外——速率是「请求」
+// 的属性，只有中间件那一层数得到（见上面第 2 条），所以监听器那层只跑前五步。
 
 const (
 	// fwBanShrinkFloor 触发整表重建的最小峰值（同 mapx.ShrinkSparse 的语义）：
@@ -369,12 +372,23 @@ type fwBanView struct {
 	Rounds   int    `json:"rounds"`   // 累计被封次数
 }
 
-// bans 快照当前**仍在生效**的封禁，按到期时间倒序（最近封的在前）。
-// limit<=0 表示不限条数。
-func (f *panelFirewall) banList(limit int) []fwBanView {
-	f.mu.Lock()
-	defer f.mu.Unlock()
+// banSnapshot 一次取回「要展示的那几条」与「总共封了多少条」。
+//
+// 合成一个方法是因为接口层两者都要：分两次调用就要抢两次锁，且两次之间表可能已经变了，
+// 于是界面上会出现"列表 3 条、总数 2 条"这种自相矛盾的展示。
+// 与 inboundfw.BanSnapshot 同一份取舍——那边先做的，这边跟上。
+//
+// 排序放在**释放锁之后**，且用 sort.Slice 而不是插入排序。原先是在锁内跑 O(n²) 插入排序，
+// 依据是"条目数受 MemoryMB 折算出的上限约束、这个接口只在打开设置页时被调用"——
+// 两条都站不住：折算上限是 config.BanEntriesForMemoryMB(MaxGlobalFirewallMemoryMB)，
+// 即单表 81920 条（inboundfw 那边实测 27306 条要 2.88 秒，n² 外推到 8 万条是几十秒）；
+// 而 isBanned 在**每个面板请求**上都要拿同一把 f.mu，于是那几十秒里整个面板连不上——
+// 发生的时刻恰好是"正在被攻击、封禁表被填满"的时刻，也就是最需要能打开设置页的时刻。
+// 收集是 O(n) 且必须持锁（要读 entry），排序不碰共享状态，挪出来即可。
+func (f *panelFirewall) banSnapshot(limit int) (items []fwBanView, total int) {
 	now := time.Now()
+
+	f.mu.Lock()
 	out := make([]fwBanView, 0, len(f.bans))
 	for _, e := range f.bans {
 		if !now.Before(e.until) {
@@ -387,16 +401,19 @@ func (f *panelFirewall) banList(limit int) []fwBanView {
 			Rounds:   e.banRounds,
 		})
 	}
-	// 插入排序：条目数受 MemoryMB 折算出的上限约束，且这个接口只在用户打开设置页时被调用。
-	for i := 1; i < len(out); i++ {
-		for j := i; j > 0 && out[j].Until > out[j-1].Until; j-- {
-			out[j], out[j-1] = out[j-1], out[j]
+	f.mu.Unlock()
+
+	total = len(out)
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Until != out[j].Until {
+			return out[i].Until > out[j].Until
 		}
-	}
+		return out[i].IP < out[j].IP // 同秒到期时定序，免得每次刷新顺序都在跳
+	})
 	if limit > 0 && len(out) > limit {
 		out = out[:limit]
 	}
-	return out
+	return out, total
 }
 
 // banCount 当前仍在生效的封禁条数。

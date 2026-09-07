@@ -609,7 +609,9 @@ export default {
     updateSignKey: 'Self-update signature public key',
     updateSignKeyHint: 'Ed25519 public key (base64-encoded 32 bytes). When set, an uploaded update package must include a matching .sig signature file that verifies before it is applied. When left empty, whether packages are accepted at all is decided by the next option.',
     updateAllowUnsigned: 'Accept unsigned update packages',
-    updateAllowUnsignedHint: 'With no public key configured, uploaded packages are applied without signature verification. While this is off and the key is empty, update packages are not accepted — uploading one means the panel runs a new binary, and without a signature there is no way to tell where it came from.',
+    updateAllowUnsignedHint: 'With no public key configured, uploaded packages are applied without signature verification. While this is off and the key is empty, update packages are not accepted — uploading one means the panel runs a new binary, and without a signature there is no way to tell where it came from. Turning this on requires your current password and stays effective for {hours} hours only, lapsing automatically afterwards; every unsigned upload within that window is still asked for the password again.',
+    updateAllowUnsignedPwd: 'Enter your current account password to turn on "Accept unsigned update packages"',
+    updateAllowUnsignedExpires: 'Effective until {time}; it lapses automatically after that and has to be turned on again.',
     language: 'Language',
     panelPort: 'Listen port',
     portHint: 'Restart required to take effect',
@@ -708,9 +710,16 @@ export default {
     exportBtn: 'Download encrypted backup',
     exportDesc: 'Download all current configuration as an encrypted JSON file for backup or migration',
     exportWarn: 'The export contains sensitive data such as login info, session key and provider credentials — keep it safe',
-    exportEncrypt: 'Verify login password',
-    exportPwdHint: 'The exported backup is encrypted with your current login password — enter it here',
-    exportEncryptedHint: 'The backup is encrypted with your login account + password. Remember the password — it cannot be recovered if lost.',
+    exportEncrypt: 'Export backup',
+    exportPwdHint:
+      'Your login password proves you are this panel’s administrator. By default the backup is encrypted with it too; if you set a separate passphrase below, that one is used instead.',
+    exportPassword: 'Login password',
+    exportPassphrase: 'Separate backup passphrase (optional)',
+    exportPassphraseHint:
+      'Leave empty to keep using your login password. If set, only this passphrase can open the backup — the login password no longer works. Use it when handing the file to someone else, or when you want a longer secret than your login password. On restore, this is what goes in the “Password” field.',
+    exportPassphraseLen: 'The separate backup passphrase must be between {min} and {max} bytes',
+    exportEncryptedHint:
+      'The backup is encrypted with your login account + backup passphrase (the login password by default). Remember that passphrase — the backup cannot be recovered without it.',
     importConfig: 'Import configuration',
     importDesc: 'Restore configuration from a previously exported JSON file',
     importWarn: 'Importing overwrites all current configuration; some changes need a restart',
@@ -732,7 +741,7 @@ export default {
     masterKeyDesc:
       'master.key in the data directory is the only key that unlocks the credential fields inside config.json (DNS provider credentials, ACME account private keys, the session signing key and the 2FA secret). Those fields are stored encrypted, because file permissions alone cannot stop the whole data directory from being carried away — backups, mounted volumes, snapshots, an accidental commit.',
     masterKeyWarn:
-      'If you back up by copying the data directory, copy master.key along with it; without it the program fails loudly at startup instead of silently losing the credentials. A backup made with "Export configuration" on this page has no such requirement: its credentials are encrypted as a whole with your account name plus login password, so importing it on a new machine works immediately without master.key.',
+      'If you back up by copying the data directory, copy master.key along with it; without it the program fails loudly at startup instead of silently losing the credentials. A backup made with "Export configuration" on this page has no such requirement: its credentials are encrypted as a whole with your account name plus the backup passphrase, so importing it on a new machine works immediately without master.key.',
     masterKeyEnvHint:
       'The key may also be supplied through the MANTOU_MASTER_KEY environment variable (32 bytes as hex or base64). No master.key file exists on disk then, which suits handing the key to a container secret or a systemd credential.',
     // Storage: files in the data directory nothing points at any more
@@ -769,8 +778,10 @@ export default {
     importDecrypt: 'Decrypt backup',
     importAccount: 'Account',
     importPassword: 'Password',
-    importPwdHint: 'Enter the account name and password used when the backup was created',
-    importDecryptFail: 'Decryption failed: account name or password is incorrect',
+    importPwdHint:
+      'Account name: the administrator account used at export time. Password: the backup passphrase used at export time — if a separate passphrase was set then, enter that one, not the login password',
+    importDecryptFail:
+      'Decryption failed: account name or backup passphrase is incorrect (if a separate passphrase was set at export time, enter that one)',
     sessionHours: 'Token lifetime (hours)',
     sessionHoursHint: 'Applies to tokens issued by future logins only',
     sessionIdleMinutes: 'Idle timeout (minutes)',
@@ -928,7 +939,8 @@ export default {
     subtitle: 'Version, updates and program info',
     uploadTitle: 'Upload update package',
     uploadDesc: 'Upload a downloaded tar.gz package; the program replaces itself and restarts automatically (not supported on Windows). Only upload packages from a source you trust; if a signing key is configured under Settings → Online update, the package must include a matching .sig signature and pass verification before it is applied.',
-    signKeyMissing: 'No self-update signature public key is configured and unsigned packages are not allowed, so update packages are not accepted right now. Configure an Ed25519 public key under Settings → Online update, or turn that option on.',
+    signKeyMissing: 'No self-update signature public key is configured and unsigned packages are not allowed, so update packages are not accepted right now. Configure an Ed25519 public key under Settings → Online update, or turn that option on (it is time-limited and has to be turned on again once it lapses).',
+    uploadUnsignedPwd: 'No signature public key is configured — enter your current account password to upload an unsigned update package',
     uploadBtn: 'Choose tar.gz and update',
     uploadBadFile: 'Please choose a .tar.gz update package',
     uploadConfirm: 'This will replace the running program with the uploaded package and restart. Continue?',
@@ -1472,7 +1484,7 @@ export default {
       arrNoAliasGo: 'I will add an alias',
       snipBreak: 'Line break',
       newlineHint:
-        'Line breaks are handled for you: DingTalk markdown ignores a single newline, so the body gets a blank line inserted before it goes out — including newlines that arrive in the payload (e.g. {{.body.text}}). "Line break" inserts what the current format needs, and lines you already spaced out are left alone.',
+        "Line breaks are handled for you: DingTalk markdown ignores a single newline, so the body gets a blank line inserted before it goes out — including newlines that arrive in the payload (e.g. {'{{.body.text}}'}). \"Line break\" inserts what the current format needs, and lines you already spaced out are left alone.",
       fields: 'Field aliases',
       recvPicker: 'Pick a receiver',
       recvPickerHint:

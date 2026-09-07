@@ -8,6 +8,7 @@
 #   2. 手动触发（workflow_dispatch）：
 #       重跑一次构建并覆盖 ghcr 上的 latest 镜像，不创建 Release。
 #       用途是「上一次构建卡住或推送失败，再来一遍」。
+#       在标签上手动触发并勾选 republish 时，才会删除并重建同名 Release（默认拒绝，见 release 作业）。
 #
 # 产出：
 #   - GitHub Release 附件（多平台二进制）：
@@ -27,6 +28,21 @@
 #                        配置后 Linux 更新包会自动附带 mantou.sig；不配置则产出未签名包。
 #   DOCKERHUB_USERNAME   可选。Docker Hub 用户名（要同时推送 Docker Hub 时才配置）。
 #   DOCKERHUB_TOKEN      可选。Docker Hub Access Token。
+#
+# 供应链约定（改动这几处时请连同注释一起看）：
+#   - 所有 uses: 钉到提交 SHA，同行注释写对应版本号。主版本标签（@v4）可以被上游移动，
+#     而这条流水线手里有签名私钥，docker / release 两个作业还各自带着
+#     packages: write 与 contents: write（见下方 permissions 处的说明）。升级 = 改 SHA 与注释。
+#   - 基础镜像在 Dockerfile 里钉 digest（见那边的说明），因此 MIRROR 指向的加速站
+#     只能提供**同一份内容**，否则构建直接失败。
+#   - 发布前的漏洞扫描是**阻断**的：Go 侧在 checks 作业，前端生产依赖在 web 作业。
+#     两条发布路径（release 的附件、docker 的 ghcr latest）都排在这两道门禁之后。
+#     日常推送上的那份（ci.yml）故意不阻断，两者分工写在 ci.yml 头部。
+#   - Release 附件带构建来源证明（provenance），下载者可用
+#     `gh attestation verify <文件> --repo <owner>/<repo>` 验证是不是这条流水线产出的。
+#   - 同一个版本号不重复发布：已存在的 Release 默认拒绝覆盖，见 release 作业。
+#     建议在仓库设置里给 v* 标签加保护规则（Settings → Rules → Tag rulesets，
+#     禁止删除与强制更新），否则「标签本身被移动」这一层这条流水线管不到。
 # ============================================================================
 
 name: build-and-release
@@ -36,14 +52,29 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      republish:
+        description: '覆盖同名 Release（先删除再重建）。默认关闭。'
+        type: boolean
+        default: false
 
+# 工作流级只给读权限，写权限落到真正需要它的那两个作业上（docker 的 packages: write、
+# release 的 contents/id-token/attestations: write）。
+#
+# 为什么值得分开写：这里跑着五个作业，其中三个（checks / web / binaries）只是编译与扫描，
+# 但它们会执行仓库里的构建脚本、`go run` 拉下来的扫描器、以及 npm ci 装进来的整棵依赖树。
+# 工作流级挂着 contents: write + packages: write 时，这些代码手里都攥着一个能改仓库内容、
+# 能覆盖 ghcr 上 latest 镜像的令牌——而它们一次都用不到。
 permissions:
-  contents: write
-  packages: write
+  contents: read
+
+# 扫描器版本集中在这里，与 ci.yml 里那份保持一致（两条流水线各自独立，YAML 没法共享）。
+env:
+  GOVULNCHECK_VERSION: v1.7.0
 
 jobs:
   # --------------------------------------------------------------------------
-  # 0) 门禁：复用 ci.yml 的 Go 检查作为发布前提。
+  # 0) 门禁：复用 ci.yml 的 Go 检查作为发布前提，另加一道**阻断的**漏洞扫描。
   #
   # 为什么发布流水线要再跑一遍：ci.yml 跑在日常推送上，而标签可以打在任意提交上
   # （包括从未推送过、或推送后又被强推覆盖的提交）。没有这道门禁，一个未经检查的
@@ -55,12 +86,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: 配置 Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: '1.26'
+          go-version: '1.27'
           cache-dependency-path: go.sum
 
       - name: 确保 embed 占位文件存在
@@ -82,6 +113,19 @@ jobs:
           go vet ./...
           go test ./... -count=1
 
+      - name: govulncheck（阻断）
+        run: |
+          # 与 ci.yml 里那次的区别只有一个：这里**不加** `|| true`。
+          #
+          # 日常推送上不阻断是对的（今天绿的代码明天可能因为一条新公告变红，那不该拦住合并），
+          # 但发布是另一回事：Release 与 latest 镜像一旦推出去就装在别人机器上了，
+          # 而这个面板本身就跑在暴露面上。已知漏洞要么升依赖，要么别发。
+          #
+          # 扫描器版本钉死（GOVULNCHECK_VERSION）：漏洞库是活的，工具链不该是。
+          # 报到标准库时，绝大多数情况升一个 Go 补丁版就没了——上面 setup-go 写的是 '1.27'
+          # （取该线最新补丁），所以通常重跑一次就自愈。
+          go run "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}" ./...
+
   # --------------------------------------------------------------------------
   # 1) 前端：只构建一次 web/dist，通过 artifact 传给后续作业
   # --------------------------------------------------------------------------
@@ -90,24 +134,33 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: 配置 Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          # Node 20 已于 2026-04 结束维护；22 为 LTS（维护至 2027-04），与 Dockerfile 保持一致。
-          node-version: '22'
+          # 24 是当前 Active LTS，22 已进入只收安全补丁的维护期（2027-04 结束），与 Dockerfile
+          # 的 node:24-alpine 保持一致。真正的下限写在 web/package.json 的 engines 里（Node 22.12，
+          # 由 vite 8 与 vue-i18n 11 决定）——用更新的 LTS 出包不等于要求使用者升到 24。
+          node-version: '24'
           cache: npm
           cache-dependency-path: web/package-lock.json
 
       - name: 安装前端依赖
         run: npm ci --prefix web
 
+      - name: npm audit（阻断，仅生产依赖）
+        run: |
+          # 只看会被打进 web/dist 的那部分依赖（--omit=dev），门槛 high：
+          # devDependencies 里 vite/vue-tsc 那一大串公告多半是构建期工具的中低危，
+          # 拿它们阻断发布只会训练出「加 || true」的习惯。全量结果在 ci.yml 的 vuln 作业里。
+          npm audit --omit=dev --audit-level=high --prefix web
+
       - name: 构建前端
         run: npm run build:only --prefix web
 
       - name: 上传前端产物
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: web-dist
           path: web/dist
@@ -135,14 +188,15 @@ jobs:
             goarch: amd64
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: 配置 Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          # Go 1.22 已结束维护；版本下限由 go.mod 的 go 指令（1.25.0）约束，此处取更高的 1.26
-          # 以获得最新标准库安全补丁，并与 Dockerfile 的 golang:1.26-alpine 保持一致。
-          go-version: '1.26'
+          # Go 官方只支持最近两个大版本，用已结束维护的版本构建等于链接进一个不再收补丁的标准库。
+          # 这里取当前稳定线：go.mod 的 go 指令（1.26.0，由 x/crypto v0.56.0 的下限决定）是编译器
+          # 版本**下限**而非上限，用 1.27 构建合法，且与 Dockerfile 的 golang:1.27-alpine 一致。
+          go-version: '1.27'
           cache-dependency-path: go.sum
 
       - name: 校验依赖清单
@@ -154,7 +208,7 @@ jobs:
           go mod verify
 
       - name: 下载前端产物
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: web-dist
           path: web/dist
@@ -185,6 +239,91 @@ jobs:
           CGO_ENABLED=0 go build -trimpath -mod=readonly -ldflags "-s -w" \
             -o "dist/mantou${EXE}" ./cmd/mantou
 
+      # 冒烟：把刚编出来的二进制真起一次，确认它能启动并应答。
+      #
+      # 为什么必须有这一步。这条流水线其余的门禁——gofmt / vet / go test / vue-tsc /
+      # govulncheck / npm audit——全都在**源码**层面，没有一处执行过产物本身。也就是说
+      # 一个在 main() 第一行就 panic 的二进制，能一路走完发布流程挂到 Release 页面上。
+      # 依赖升级恰恰是最容易撞上这类事故的场合（gin 大版本改中间件语义、基础镜像换 libc）：
+      # 编译过、单测过、起来就炸。
+      #
+      # 位置刻意放在**签名与打包之前**：起不来的产物不该被签名，更不该被打包上传。
+      # 签了名的坏产物比没签名的坏产物更危险——自更新那条路会认它的签名。
+      #
+      # 只对 linux/amd64 跑：runner 是 ubuntu-latest，其余四个目标平台是交叉编译产物，
+      # 在这里根本执行不了。这是这道门禁的**已知边界**——它保证"这套源码能起来"，
+      # 不保证"每个平台的产物都能起来"。跨平台差异靠本地实测覆盖（见 docs/dependabot.md）。
+      - name: 冒烟（仅 linux/amd64，起进程打一次接口）
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        run: |
+          set -euo pipefail
+
+          # 先把版本旗标验掉：这一步不起监听，能单独确认二进制本身可执行、
+          # 且 ldflags 注入的版本号真的进去了（见上面「注入版本号」那一步）。
+          ./dist/mantou --version
+
+          # 一次性数据目录 + 高位端口，跑完即弃：不碰 runner 上任何其他状态。
+          SMOKE_DIR="$(mktemp -d)"
+          SMOKE_PORT=25731
+
+          # 监听地址与端口没有命令行旗标（cmd/mantou/main.go 只有 --data 与 --version），
+          # 只能预置一份最小 config.json。顺带把地址收到回环——CI 里不该有对外监听。
+          printf '{"panel":{"listen":"127.0.0.1","port":%d}}\n' "$SMOKE_PORT" \
+            > "$SMOKE_DIR/config.json"
+
+          echo "::group::启动"
+          MANTOU_DATA_DIR="$SMOKE_DIR" ./dist/mantou > "$SMOKE_DIR/smoke.log" 2>&1 &
+          SMOKE_PID=$!
+          echo "pid=$SMOKE_PID data=$SMOKE_DIR port=$SMOKE_PORT"
+          echo "::endgroup::"
+
+          # 无论后面哪一步失败都要收干净，否则作业会挂在这个后台进程上。
+          cleanup() {
+            kill "$SMOKE_PID" 2>/dev/null || true
+            wait "$SMOKE_PID" 2>/dev/null || true
+            rm -rf "$SMOKE_DIR"
+          }
+          trap cleanup EXIT
+
+          # 轮询而不是固定 sleep：CI runner 的负载不可预测，固定时长在慢机器上就是随机失败。
+          # 15 秒足够——面板正常启动是百毫秒级，真到 15 秒就是起不来。
+          ok=0
+          for i in $(seq 1 75); do
+            # 进程先死掉的话不必再等，直接把日志打出来。
+            if ! kill -0 "$SMOKE_PID" 2>/dev/null; then
+              echo "进程已退出（等待第 ${i} 次轮询时）"
+              break
+            fi
+            code="$(curl -s -m 2 -o /dev/null -w '%{http_code}' \
+              "http://127.0.0.1:${SMOKE_PORT}/api/init/status" || true)"
+            if [ "$code" = "200" ]; then
+              echo "冒烟通过：/api/init/status 返回 200（第 ${i} 次轮询，约 $((i*200)) ms）"
+              ok=1
+              break
+            fi
+            sleep 0.2
+          done
+
+          if [ "$ok" != "1" ]; then
+            echo "::error::冒烟失败：二进制未能在 15 秒内启动并应答 /api/init/status"
+            echo "----- 启动日志 -----"
+            cat "$SMOKE_DIR/smoke.log" || echo "(无日志)"
+            exit 1
+          fi
+
+          # 退出路径也一并验：SIGTERM 之后必须自己走完收尾，而不是被 CI 强杀。
+          # 这条挡的是"能起来但停不下来"——容器编排里那等于每次滚动更新都要等超时。
+          kill -TERM "$SMOKE_PID"
+          for i in $(seq 1 50); do
+            kill -0 "$SMOKE_PID" 2>/dev/null || { echo "优雅退出正常（约 $((i*200)) ms）"; break; }
+            sleep 0.2
+          done
+          if kill -0 "$SMOKE_PID" 2>/dev/null; then
+            echo "::error::冒烟失败：收到 SIGTERM 后 10 秒未退出"
+            cat "$SMOKE_DIR/smoke.log" || true
+            exit 1
+          fi
+
       - name: 签名（仅 Linux，需配置 UPDATE_SIGNING_KEY）
         if: matrix.goos == 'linux'
         env:
@@ -211,7 +350,7 @@ jobs:
           fi
 
       - name: 上传产物
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: mantou-${{ matrix.goos }}-${{ matrix.goarch }}
           path: mantou-${{ matrix.goos }}-${{ matrix.goarch }}.*
@@ -221,15 +360,25 @@ jobs:
   # 3) Docker：构建多架构镜像并推送到 GitHub Container Registry (ghcr.io)
   # --------------------------------------------------------------------------
   docker:
-    needs: checks
+    # 也挂在 web 之后，尽管本作业**不取** web 的产物（镜像里的前端由 Dockerfile 阶段 1
+    # 自己构建）。挂它是为了那道门禁：web 作业里的 `npm audit --omit=dev --audit-level=high`
+    # 是阻断的。只依赖 checks 的话，一个高危的前端生产依赖能拦住 Release 附件，却拦不住
+    # 推向 ghcr 的 latest——而镜像里装的是同一份前端。多等前端构建那一两分钟，
+    # 换来两条发布路径共用同一道门禁。
+    needs: [checks, web]
     runs-on: ubuntu-latest
+    # 推 ghcr 需要 packages: write（登录用的是 secrets.GITHUB_TOKEN）；
+    # contents: read 供检出代码。工作流级已收窄到只读，这里显式加上写包那一项。
+    permissions:
+      contents: read
+      packages: write
     # 兜底：不设的话作业默认能跑满 360 分钟。多架构构建一旦退化成 QEMU 模拟
     # （某个构建阶段忘了钉 --platform=$BUILDPLATFORM），表现就是长时间不结束而非报错，
     # 6 小时后才被掐掉。正常情况下这个作业几分钟就完事，40 分钟足够留余量。
     timeout-minutes: 40
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # 取全部历史与标签：下面「计算版本号」在手动触发时要靠 git describe 找最近的
           # 版本标签。默认的浅检出（depth=1）拿不到标签，只能退回 dev-<sha>，
@@ -261,13 +410,13 @@ jobs:
           echo "版本号：$VERSION"
 
       - name: 设置 QEMU（支持 arm64 交叉构建）
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
 
       - name: 设置 Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: 登录 GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -277,14 +426,14 @@ jobs:
       # 1) 取消下面注释；2) 在仓库 Secrets 配置 DOCKERHUB_USERNAME / DOCKERHUB_TOKEN；
       # 3) 在下方 build-push 的 tags 追加 docker.io/<用户名>/mantou 相关标签。
       # - name: 登录 Docker Hub
-      #   uses: docker/login-action@v3
+      #   uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
       #   with:
       #     username: ${{ secrets.DOCKERHUB_USERNAME }}
       #     password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: 生成镜像标签
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
           images: ${{ env.IMAGE_NAME }}
           # ghcr 上**永远只有 latest 这一个标签**：不发版本号标签，也不再发 dev。
@@ -305,7 +454,7 @@ jobs:
             org.opencontainers.image.version=${{ steps.version.outputs.VERSION }}
 
       - name: 构建并推送镜像
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           push: true
@@ -319,26 +468,58 @@ jobs:
 
   # --------------------------------------------------------------------------
   # 4) Release：仅对版本标签创建 GitHub Release 并挂载产物
+  #
+  # 一个版本号只发一次。这里刻意**不**做「先删后建」：Release 一旦推出去，就已经有人
+  # 下载过、有脚本按 URL 拉过、面板的在线更新也可能已经取过那份二进制；把同一个 tag
+  # 下的附件换成另一份内容，等于让"v1.2.3"这个名字指向两种东西，而下载过的人无从察觉。
+  # 已存在就直接失败，让人先想清楚该发的是不是一个新版本号。
+  # 确实要重发（比如附件传坏了、代码没变）时，手动触发并把 republish 勾上。
   # --------------------------------------------------------------------------
   release:
     needs: binaries
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
+    # 作业级权限会整体覆盖上面的工作流级设置，所以 contents: write 要重写一遍。
+    # 另外两项是构建来源证明（provenance）需要的：id-token 用来换 OIDC 令牌，
+    # attestations 用来把证明写进仓库。
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
       - name: 下载全部产物
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: mantou-*
           path: dist
           merge-multiple: true
 
+      - name: 生成构建来源证明
+        # 把「这些附件是本仓库这条工作流在这个提交上构建出来的」这件事记进 GitHub 的
+        # attestation 存储（背后是 Sigstore）。下载者可以验证：
+        #   gh attestation verify mantou-linux-amd64.tar.gz --repo ${{ github.repository }}
+        #
+        # 顺带说明为什么没有单独的 SBOM 附件：Go 二进制自带模块清单，
+        # `go version -m mantou` 就能列出全部依赖及其版本，且离线可查、不会与产物脱节。
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: dist/*
+
       - name: 创建 Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 标签推送时这个变量是空的（inputs 只在手动触发时存在）⇒ 默认拒绝覆盖。
+          REPUBLISH: ${{ inputs.republish }}
         run: |
-          # 同名 tag 重新发布时，先删除已存在的 Release（不存在则忽略），
-          # 避免 gh release create 报 "already exists" 导致覆盖失败。
-          gh release delete "$GITHUB_REF_NAME" --yes --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if [ "$REPUBLISH" != "true" ]; then
+              echo "::error::$GITHUB_REF_NAME 已经有 Release 了。同一个版本号不再覆盖发布——" \
+                   "请改用新的版本号；确实要重发这一份，就手动触发本流水线并勾上 republish。" >&2
+              exit 1
+            fi
+            echo "::warning::republish=true，正在删除 $GITHUB_REF_NAME 的现有 Release 并重建"
+            gh release delete "$GITHUB_REF_NAME" --yes --repo "$GITHUB_REPOSITORY"
+          fi
           gh release create "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --title "mantou ${GITHUB_REF_NAME}" \

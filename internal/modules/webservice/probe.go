@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -45,6 +46,12 @@ func normalizeProbeInterval(sec int) time.Duration {
 
 // probeTimeout 单次探测的上下文/客户端超时，防止后端无响应时探测goroutine 长时间挂起。
 const probeTimeout = 3 * time.Second
+
+// probeConcurrency 一轮 sweep 里同时在探的子项数上限（见 probeSweep 的说明）。
+// 取 8 而不是不设限：探测是纯等待型的，8 个并发已经足以让「一个连不上的后端拖垮同批
+// 其余子项排期」这件事消失；而子项数可以到几十上百，全放开会在某个后端整体不可达时
+// 一次性起同样多的 goroutine、各握一条连接，对宿主机和对端都不礼貌。
+const probeConcurrency = 8
 
 // probeTarget 描述一个待主动探测的子项后端，字段按模式取用其一。
 type probeTarget struct {
@@ -196,76 +203,115 @@ func probeReasonClass(errMsg string, status int) string {
 // probeSweep 按各子项所属父项的探测间隔，仅对「已到期」的子项执行一次可达性探测并写 linkStatus。
 // 调度状态（下次探测时间）存于 probeNext，按 childID 维护；与真实流量、10/s 日志限速完全解耦。
 // 在持 m.mu 拷贝目标快照后释放锁再探测/写状态，避免探测（含网络等待）长时间占用模块锁。
-// 每次探测完成后，仅在「链接状态变化」（或首次探测）时：
-//  1. 写一条程序日志（Info/正常；Warn/错误+原因）→ 总览页「程序日志」面板；
-//  2. 追加一条 AccessEntry（event=probe）到环形缓冲 → 子项日志对话框「后端状态」列。
 //
-// 两处共用同一 needLog 判定，避免每 60s 重复刷屏；启动 / 新增子项的首次探测会各记一条「初始状态」。
+// 到期的子项**并发探**（上限 probeConcurrency），不再一个接一个。串行版本的问题不是慢，
+// 而是慢的那个会把别人的排期一起拖掉：单个子项最坏要 3s × 上游数，而调度心跳是 2 秒，
+// 于是一个连不上的后端就足以让同一批里其余子项的「下次探测」推迟到几十秒甚至几分钟之后——
+// 界面上那几个子项的后端状态停在旧值，看起来像探测不工作了。各子项的探测之间没有任何
+// 共享状态（两个 HTTP 客户端只读复用，结果写入各自的 childID 条目），并发是安全的。
 func (m *Module) probeSweep(now time.Time) {
 	m.mu.Lock()
 	targets := make([]probeTarget, len(m.probeTargets))
 	copy(targets, m.probeTargets)
 	m.mu.Unlock()
+
+	// 先在一次加锁里把到期的挑出来并排下一次的期，再去探。
+	// 排期用的是 sweep 起点那个 now（调度的时钟），与结果时间戳不是一回事，见 probeAndRecord。
+	due := make([]probeTarget, 0, len(targets))
+	m.probeMu.Lock()
 	for _, t := range targets {
-		m.probeMu.Lock()
 		if nt, ok := m.probeNext[t.childID]; ok && !now.After(nt) {
-			m.probeMu.Unlock()
 			continue // 该子项所属父项的探测间隔未到，跳过
 		}
 		m.probeNext[t.childID] = now.Add(t.interval)
-		m.probeMu.Unlock()
-		ok, status, errMsg := m.probeOne(t)
-		ts := now.UnixMilli()
-		m.statMu.Lock()
-		st := m.linkStatus[t.childID]
-		if ok {
-			st.LastOK = ts // 成功：仅刷新 LastOK；即便曾有失败记录，LastOK 更新后 UI 判定为「正常」
-		} else {
-			st.LastErr = ts
-			st.LastStatus = status // 失败状态码（连接失败为 0）
-		}
-		m.linkStatus[t.childID] = st
-		// 链接状态日志去重：仅在状态变化或首次探测时记录一条，避免每 60s 重复刷屏。
-		// 启动 / 新增子项的首次探测会进入 if 分支（prev 不存在）。
-		prev, logged := m.linkLogState[t.childID]
-		needLog := !logged || prev != ok
-		if needLog {
-			m.linkLogState[t.childID] = ok
-		}
-		m.statMu.Unlock()
-		if needLog {
-			svc := t.service
-			if svc == "" {
-				svc = t.childID
-			}
-			// 统一构造 reason：成功时为空；失败时按「结果类别：具体原因」组织
-			// （类别取 不可访问 / 超时 / 其他情况），供总览程序日志与子项「后端状态」列共用。
-			reason := ""
-			if !ok {
-				reason = probeReasonClass(errMsg, status)
-			}
-			// 1) 程序日志：与总览页「程序日志」面板共享的边缘触发记录。
-			//    失败行形如「后端 X 不可访问：dial tcp …」，类别即「后端的结果」，冒号后跟具体原因。
-			if ok {
-				m.log.Info("后端 "+svc+" 连接正常", "childId", t.childID)
-			} else {
-				m.log.Warn("后端 "+svc+" "+reason, "childId", t.childID, "status", status)
-			}
-			// 2) 子项日志环形缓冲：同样边缘触发，事件类型 event=probe，
-			//    前端「后端状态」列直接渲染 Reason。耗时/来源 IP 对探测无意义，置 0/空。
-			m.recordAccess(AccessEntry{
-				Time:    ts,
-				ChildID: t.childID,
-				Service: svc,
-				Method:  eventLabel(eventProbe),
-				Status:  status,
-				DurMS:   0,
-				Remote:  "",
-				Event:   eventProbe,
-				Reason:  reason,
-			})
-		}
+		due = append(due, t)
 	}
+	m.probeMu.Unlock()
+
+	switch len(due) {
+	case 0:
+		return
+	case 1:
+		m.probeAndRecord(due[0]) // 一个目标不值得起 goroutine
+		return
+	}
+	sem := make(chan struct{}, probeConcurrency)
+	var wg sync.WaitGroup
+	wg.Add(len(due))
+	for _, t := range due {
+		sem <- struct{}{}
+		go func(t probeTarget) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			m.probeAndRecord(t)
+		}(t)
+	}
+	wg.Wait()
+}
+
+// probeAndRecord 探一个子项并把结果写进 linkStatus。
+// 每次探测完成后，仅在「链接状态变化」（或首次探测）时：
+//  1. 写一条程序日志（Info/正常；Warn/错误+原因）→ 总览页「程序日志」面板；
+//  2. 追加一条 AccessEntry（event=probe）到环形缓冲 → 子项日志对话框「后端状态」列。
+//
+// 两处共用同一 needLog 判定，避免每 60s 重复刷屏；启动 / 新增子项的首次探测会各记一条「初始状态」。
+//
+// 时间戳取「探完的这一刻」，不是 sweep 的起点：一次探测本身可以耗到 3s × 上游数，
+// 用起点的话日志与「后端状态」列上写的是这条结果实际产生之前的时刻，
+// 排查时把它与后端自己的日志对时间会对不上。
+func (m *Module) probeAndRecord(t probeTarget) {
+	ok, status, errMsg := m.probeOne(t)
+	ts := time.Now().UnixMilli()
+	m.statMu.Lock()
+	st := m.linkStatus[t.childID]
+	if ok {
+		st.LastOK = ts // 成功：仅刷新 LastOK；即便曾有失败记录，LastOK 更新后 UI 判定为「正常」
+	} else {
+		st.LastErr = ts
+		st.LastStatus = status // 失败状态码（连接失败为 0）
+	}
+	m.linkStatus[t.childID] = st
+	// 链接状态日志去重：仅在状态变化或首次探测时记录一条，避免每 60s 重复刷屏。
+	// 启动 / 新增子项的首次探测会进入 if 分支（prev 不存在）。
+	prev, logged := m.linkLogState[t.childID]
+	needLog := !logged || prev != ok
+	if needLog {
+		m.linkLogState[t.childID] = ok
+	}
+	m.statMu.Unlock()
+	if !needLog {
+		return
+	}
+	svc := t.service
+	if svc == "" {
+		svc = t.childID
+	}
+	// 统一构造 reason：成功时为空；失败时按「结果类别：具体原因」组织
+	// （类别取 不可访问 / 超时 / 其他情况），供总览程序日志与子项「后端状态」列共用。
+	reason := ""
+	if !ok {
+		reason = probeReasonClass(errMsg, status)
+	}
+	// 1) 程序日志：与总览页「程序日志」面板共享的边缘触发记录。
+	//    失败行形如「后端 X 不可访问：dial tcp …」，类别即「后端的结果」，冒号后跟具体原因。
+	if ok {
+		m.log.Info("后端 "+svc+" 连接正常", "childId", t.childID)
+	} else {
+		m.log.Warn("后端 "+svc+" "+reason, "childId", t.childID, "status", status)
+	}
+	// 2) 子项日志环形缓冲：同样边缘触发，事件类型 event=probe，
+	//    前端「后端状态」列直接渲染 Reason。耗时/来源 IP 对探测无意义，置 0/空。
+	m.recordAccess(AccessEntry{
+		Time:    ts,
+		ChildID: t.childID,
+		Service: svc,
+		Method:  eventLabel(eventProbe),
+		Status:  status,
+		DurMS:   0,
+		Remote:  "",
+		Event:   eventProbe,
+		Reason:  reason,
+	})
 }
 
 // probeOne 按子项模式分发到对应的可达性探测。
@@ -283,40 +329,62 @@ func (m *Module) probeOne(t probeTarget) (ok bool, status int, errMsg string) {
 	}
 }
 
-// probeProxy 对反代上游逐个发起轻量 HTTP GET（3s 超时）：任一上游返回 <400 即视为可达；
+// probeProxy 对反代上游逐个发起轻量 HTTP GET（**每个上游各 3s 超时**）：任一上游返回 <400 即视为可达；
 // 全部上游均连接失败 → 不可达（status=0，记录最后一个 err.Error()）；
 // 全部返回 ≥400 → 不可达（记录首个失败码）；errMsg 始终反映最后一次失败的具体原因。
+//
+// 超时窗口必须**每个上游各算一份**，不能在循环外开一个共用的：共用时第一个上游耗光 3 秒，
+// 后面每一个都拿到一个已经过期的 ctx，于是 client.Do 立刻返回 context deadline exceeded。
+// 表现是探测报「超时」，而那几个上游可能根本是好的——只不过它们连拨号的机会都没有。
+// 这个错法在只有一个上游时完全看不出来（两种写法等价），而多上游正是配了这个功能的人才会有的形态。
+//
+// 另一半在客户端上：m.probeClient 的 Timeout 同样是 probeTimeout，因此单个上游的总耗时
+// 由两道同值的闸共同兜着，最坏情形下整个子项的探测约 3s × 上游数——够长，所以调用方
+// （probeSweep）不再串行跑各子项，见那里的说明。
 func (m *Module) probeProxy(upstreams []string, insecure bool) (ok bool, status int, errMsg string) {
 	if len(upstreams) == 0 {
 		return false, 0, "未配置上游"
 	}
 	client := m.probeClient(insecure)
-	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
-	defer cancel()
 	for _, u := range upstreams {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-		if err != nil {
-			errMsg = err.Error() // URL 解析/构造错误，记录后继续
-			continue
+		got, code, err := probeUpstream(client, u)
+		if got {
+			return true, code, ""
 		}
-		req.Header.Set("User-Agent", "mantou-health-probe")
-		resp, err := client.Do(req)
-		if err != nil {
-			errMsg = err.Error() // 连接错误（拒绝/超时/DNS），记录最后一个
+		if err != "" {
+			errMsg = err // 连接错误（拒绝/超时/DNS）或 URL 构造错误，记录最后一个
 			continue
-		}
-		resp.Body.Close()
-		if resp.StatusCode < 400 {
-			return true, resp.StatusCode, ""
 		}
 		if status == 0 {
-			status = resp.StatusCode // 记录首个失败码，继续尝试其余上游
+			status = code // 记录首个失败码，继续尝试其余上游
 		}
 	}
 	if status == 0 && errMsg == "" {
 		errMsg = "无可用上游"
 	}
 	return false, status, errMsg
+}
+
+// probeUpstream 探一个上游。返回 (是否可达, HTTP 状态码, 错误信息)：
+// 错误信息非空表示连不上（此时状态码无意义），为空且不可达表示后端回了 ≥400。
+//
+// 单独一个函数是为了让那句 defer cancel() 落在**每个上游各自**的作用域里：
+// 写在 for 循环体内的 defer 要等整个函数返回才执行，攒着的 ctx 与它们的定时器
+// 会一直活到最后一个上游探完。
+func probeUpstream(client *http.Client, u string) (ok bool, status int, errMsg string) {
+	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return false, 0, err.Error()
+	}
+	req.Header.Set("User-Agent", "mantou-health-probe")
+	resp, err := client.Do(req)
+	if err != nil {
+		return false, 0, err.Error()
+	}
+	resp.Body.Close()
+	return resp.StatusCode < 400, resp.StatusCode, ""
 }
 
 // probeStatic 静态站点：本地根目录可 stat 即视为可达；失败时返回 os.Stat 的错误信息。

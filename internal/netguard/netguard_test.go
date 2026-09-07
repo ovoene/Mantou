@@ -33,6 +33,9 @@ func TestIsPrivateOrReservedBlocks(t *testing.T) {
 		{"::ffff:100.64.0.1", "IPv4 映射的运营商级 NAT"},
 		{"64:ff9b::c0a8:101", "NAT64 内嵌 192.168.1.1"},
 		{"2002:c0a8:101::1", "6to4 内嵌 192.168.1.1"},
+		{"2001::1", "Teredo 前缀本身"},
+		{"2001:0:4136:e378:8000:63bf:3fff:fdd2", "常见形态的 Teredo 地址"},
+		{"2001:0:ffff:ffff:ffff:ffff:ffff:ffff", "Teredo 段上界（钉住掩码是 /32 而非更窄）"},
 	}
 	for _, c := range cases {
 		ip := net.ParseIP(c.ip)
@@ -62,6 +65,9 @@ func TestIsPrivateOrReservedAllowsPublic(t *testing.T) {
 		"239.255.255.255", // 多播上界之内，交由 IsMulticast 处理，此处仅确认 240/4 不越界
 		"2001:4860:4860::8888",
 		"2606:4700::1111",
+		// Teredo 只占 2001:0000::/32，各 RIR 分配给用户的地址从 2001:200::/23 起，
+		// 掩码若写宽成 /16 会把整个 2001:: 段的公网地址全部误拦。
+		"2001:200::1",
 		"2003::1", // 紧邻 2002::/16 之外
 	} {
 		ip := net.ParseIP(s)

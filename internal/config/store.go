@@ -9,16 +9,20 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
+	"time"
 
+	"mantou/internal/fsx"
 	"mantou/internal/logx"
 )
 
 // CurrentVersion 是当前配置结构版本，用于将来做迁移。
-const CurrentVersion = 11
+const CurrentVersion = 12
 
 // Manager 负责配置的加载、持久化与线程安全访问。
 type Manager struct {
@@ -475,13 +479,14 @@ func notifyFsync(path string) {
 // 而这一步只是加固，失败不影响已经 fsync 过的文件数据。
 func writeFileAtomic(path string, data []byte, perm os.FileMode, policy fsyncPolicy) error {
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	// 0700：这个目录里有 config.json（含凭据密文）与 master.key（解开它们的钥匙），
+	// 文件本身是 0600，目录也一并关上（见 fsx.DirMode）。
+	if err := fsx.EnsureDir(dir); err != nil {
 		return fmt.Errorf("创建目录失败: %w", err)
 	}
-	tmp := path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	tmp, f, err := createTempFor(path, perm)
 	if err != nil {
-		return fmt.Errorf("创建临时文件失败: %w", err)
+		return err
 	}
 	if _, err := f.Write(data); err != nil {
 		f.Close()
@@ -500,7 +505,7 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode, policy fsyncPol
 		os.Remove(tmp)
 		return fmt.Errorf("关闭临时文件失败: %w", err)
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err := renameWithRetry(tmp, path); err != nil {
 		os.Remove(tmp)
 		return fmt.Errorf("替换文件失败: %w", err)
 	}
@@ -512,6 +517,82 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode, policy fsyncPol
 		}
 	}
 	return nil
+}
+
+// createTempFor 在 path 同目录下建一个独占的临时文件，返回它的路径与句柄。
+//
+// 名字带随机串（os.CreateTemp），不再是固定的 `<文件名>.tmp`。固定名字的问题不是
+// "撞名"这么轻——两个写入方开的是**同一个**文件：A 刚把 3KB 写进去，B 用 O_TRUNC 把它
+// 截成 0 再写自己的，A 接着 fsync 并 rename，rename 出去的是两份内容的混合物。
+// 运气好是 JSON 解不开（下次启动"配置损坏"），运气不好是解得开——一份谁都没写过的
+// 配置被当成真的。同一个数据目录被两个进程打开时这条路真的走得到（见 F-05），
+// 而进程内的 sync.RWMutex 管不到别的进程。随机名让每次写入各有一个独立的临时文件，
+// rename 本身是原子的，最终留下的一定是完整的某一份。
+//
+// 后缀仍然是 .tmp，且中间只插随机串：/api/storage 靠这个后缀把断电留下的残留列成
+// "可清理"（见 storageLeftoverKind），换个名字那条清理路径就瞎了。
+func createTempFor(path string, perm os.FileMode) (string, *os.File, error) {
+	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return "", nil, fmt.Errorf("创建临时文件失败: %w", err)
+	}
+	// os.CreateTemp 固定按 0600 建，与三个调用方要的正好一致，通常一次 chmod 都不用做。
+	// 只在真要别的权限位时才补：在不表达权限位的文件系统上，一次注定失败的 chmod
+	// 会把"保存配置"整条路堵死。
+	if perm.Perm() != 0o600 {
+		if err := f.Chmod(perm); err != nil {
+			name := f.Name()
+			f.Close()
+			os.Remove(name)
+			return "", nil, fmt.Errorf("设置临时文件权限失败: %w", err)
+		}
+	}
+	return f.Name(), f, nil
+}
+
+// renameRetryAttempts / renameRetryBase 替换目标文件的重试预算：
+// 退避 10 / 20 / 40 / 80 / 160 / 320ms，最坏多花 630ms，且只在真撞上时才花。
+const (
+	renameRetryAttempts = 7
+	renameRetryBase     = 10 * time.Millisecond
+)
+
+// renameWithRetry 做原子替换，撞上 Windows 的瞬时冲突时退避重试。
+//
+// 只有 Windows 有这个问题：MoveFileEx 替换目标文件时，如果同一瞬间**另一个写入方
+// 也在替换同一个目标**，或者杀毒 / 备份 / 索引服务刚好握着那个文件的句柄，
+// 会返回 ERROR_ACCESS_DENIED（5）或 ERROR_SHARING_VIOLATION（32）。
+// 冲突是瞬时的，几毫秒后就没了，但用户看到的是"保存失败: Access is denied"，
+// 完全看不出是跟什么撞了——而这条路上是保存配置，报错就等于这次改动没生效。
+//
+// unix 上没有这一类：rename 覆盖已存在的目标是原子的，别人开着它也照样成功，
+// 所以那边一次都不重试（避免把 EACCES / EROFS 这种"再试一万次也一样"的错误拖上半秒）。
+func renameWithRetry(oldPath, newPath string) error {
+	var err error
+	for i := 0; i < renameRetryAttempts; i++ {
+		if err = os.Rename(oldPath, newPath); err == nil || !renameRetryable(err) {
+			return err
+		}
+		time.Sleep(renameRetryBase << i)
+	}
+	return err
+}
+
+// renameRetryable 判断这次 rename 失败值不值得再试。
+//
+// 用 runtime.GOOS 而不是给这个包再拆一对平台文件：判断只有两个错误码，
+// 而这个 return 在 unix 上永远是 false，那边 5 / 32 是 EIO / EPIPE，
+// 与这里说的两回事——先按平台挡住，数字的含义就不会串。
+func renameRetryable(err error) bool {
+	if runtime.GOOS != "windows" {
+		return false
+	}
+	var errno syscall.Errno
+	if !errors.As(err, &errno) {
+		return false
+	}
+	// winerror.h：5 = ERROR_ACCESS_DENIED，32 = ERROR_SHARING_VIOLATION。
+	return errno == 5 || errno == 32
 }
 
 // Default 返回一份带合理默认值的配置。
@@ -732,6 +813,34 @@ func migrate(c *Config) {
 		// 突然带上一道会掐连接的防护——这与 v10 那一块刻意让"升级"与"全新安装"取值不同的
 		// 情况正好相反，因为这次连全新安装都是关着的。
 		c.GlobalFirewall = defaultGlobalFirewall()
+	}
+	if c.Version < 12 {
+		// v12 升级：「允许未验签的更新包」由一个长期开关变成有限窗口
+		// （update.allowUnsignedSince，见 UpdateConfig.AllowUnsignedSince）。
+		//
+		// 旧配置里只有布尔值，没有起算时刻，按 UnsignedUpdateAllowed 的口径会落到
+		// 「开着但没有窗口」这一支，也就是不放行。这一块给已经打开它的用户补一个起点，
+		// 让升级后仍有完整一段窗口可用。
+		//
+		// 为什么不干脆让这批人重开一次（那样更严）：v10 那一块已经把话说明白了——
+		// 一次版本升级不该有能力静默收回用户已经打开的能力。打开过这个开关的人
+		// 往前有正当理由（自己构建、传自签的包），让他们在升级后遇到一次莫名的
+		// 「未配置公钥」拒收，比走完一遍"重开 + 验密码"更难查。
+		//
+		// 起点取"现在"而非某个更早的时刻：这是新加的字段，无从知道当初是哪天打开的，
+		// 而窗口本身就是给一次即时操作用的。补出来的窗口只会往长的那一侧偏一点，
+		// 且过期之后就再也回不到"长期打开"了。
+		//
+		// 只补给已打开的那批：关着的时候这个数没有意义，写进去只会让 config.json
+		// 多一个反直觉的键（omitempty 也不会替我们省掉它）。
+		//
+		// 注意 Load 不回写 migrate 的结果（只有 JWT 密钥缺失那一支会存盘），
+		// 所以在下一次配置写入之前，每次重启都会重新补这个起点、窗口跟着顺延。
+		// 这一点可以接受：真要卡死那个窗口，得反复重启面板，而重启面板需要的权限
+		// 比这个开关本身高得多；到设置页动任何一项就会把它固化下来。
+		if c.Update.AllowUnsignedUpdate && c.Update.AllowUnsignedSince <= 0 {
+			c.Update.AllowUnsignedSince = time.Now().Unix()
+		}
 	}
 	if c.Version < CurrentVersion {
 		c.Version = CurrentVersion
