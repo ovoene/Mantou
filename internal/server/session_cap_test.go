@@ -72,16 +72,30 @@ func TestSessionRegistryNeverEvictsTheNewSession(t *testing.T) {
 func TestSessionRegistryEvictsDeadEntriesFirst(t *testing.T) {
 	r := newTestRegistry(t)
 
-	// 一条活的，且刚刚露过面。
+	// 一条活的，而且刻意让它成为全表 lastSeenAt **最老**的一条。
+	//
+	// 这是本用例的要害：如果 trimToCap 少了第一阶段（先清死条目）而直接按"最久没露面"
+	// 淘汰，被挑走的就正好是它——所以这条断言真的能钉住第一阶段的存在。
 	const alive = "tok-alive"
 	r.add(alive, testSessionUser, time.Hour)
 
-	// 把表填满，其中绝大多数是已经绝对过期的死条目。
-	// 死条目排在活的前面被清掉，活的这条就不该被碰。
-	for i := 0; i < sessionMaxEntries+10; i++ {
+	// 灌到恰好等于上限，一条不多：sessionMaxEntries-1 条短命的 + 上面那条 = 上限。
+	//
+	// "一条不多"是刻意的。灌过头的话，插入过程中 trimToCap 就会被触发，而那一刻这批
+	// 短命条目往往还没到 1ms（CI 的机器跑得比 1ms 快），于是它走第二阶段淘汰"最老的"，
+	// 把 alive 提前挑走——本机循环慢、条目先过期，所以一直是绿的，CI 上就转红。
+	// 现在整个灌入过程都不触发 trim，时序假设也就不存在了。
+	for i := 0; i < sessionMaxEntries-1; i++ {
 		r.add(capToken(i), testSessionUser, time.Millisecond)
 	}
-	time.Sleep(20 * time.Millisecond)
+	if got := sessionCount(r); got != sessionMaxEntries {
+		t.Fatalf("准备阶段应恰好灌到上限 %d 条，实际 %d（触发过淘汰，用例前提已被破坏）",
+			sessionMaxEntries, got)
+	}
+	time.Sleep(20 * time.Millisecond) // 等这批短命的真的过期
+
+	// 表已满，这一次插入触发淘汰：第一阶段就该把那 511 条死条目全清掉，
+	// 位置够了，第二阶段一条活的都不用动——alive 必须留下。
 	r.add("tok-trigger", testSessionUser, time.Hour)
 
 	if !sessionExists(r, alive) {
