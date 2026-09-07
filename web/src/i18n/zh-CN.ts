@@ -1343,7 +1343,7 @@ export default {
       // 起始符（@:key），后面接中文就是语法错误，渲染这条文案的整块界面会直接空掉。
       atMobiles: "{'@'} 指定手机号",
       atMobilesPlaceholder: '手机号，回车添加',
-      atMobilesHint: "被 {'@'} 的人需在群内。留空表示不 {'@'} 任何人。",
+      atMobilesHint: "填被 {'@'} 的人在钉钉/企业微信注册的手机号（不是通讯录里的办公号），且需在群内。只能是数字。留空表示不 {'@'} 任何人。",
       atAll: "{'@'} 所有人",
       wecomAtNote: "企业微信只有 text 类型支持 {'@'}：模板选 Markdown 时，{'@'} 设置不会生效。",
       method: '请求方法',

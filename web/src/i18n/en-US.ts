@@ -1372,7 +1372,7 @@ export default {
       secretHint: 'Fill this when the DingTalk bot uses "signed" security; leave blank for IP range or keyword mode.',
       atMobiles: 'Mention by phone',
       atMobilesPlaceholder: 'Phone number, press Enter to add',
-      atMobilesHint: 'Mentioned people must be in the group. Leave empty to mention nobody.',
+      atMobilesHint: 'Use the phone number registered with DingTalk/WeCom (not the office number in the directory). Digits only. The person must be in the group. Leave empty to mention nobody.',
       atAll: 'Mention everyone',
       wecomAtNote: 'WeCom supports mentions in text messages only: with a Markdown template, mention settings are ignored.',
       method: 'Method',

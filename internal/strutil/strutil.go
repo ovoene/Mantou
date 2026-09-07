@@ -7,7 +7,11 @@
 // 中间，encoding/json 会把残缺序列换成 U+FFFD，在面板上显示为乱码方块。
 package strutil
 
-import "unicode/utf8"
+import (
+	"strings"
+	"unicode"
+	"unicode/utf8"
+)
 
 // Truncate 把 s 裁剪到最多 maxBytes 字节；只有确实发生裁剪时才追加 suffix。
 //
@@ -31,4 +35,38 @@ func Truncate(s string, maxBytes int, suffix string) string {
 		cut--
 	}
 	return s[:cut] + suffix
+}
+
+// StripInvisible 删掉 s 里的全部不可见字符：Unicode 空白，以及「格式字符」
+// （Cf 类，含零宽空格 U+200B、BOM U+FEFF、双向标记 U+200E/200F、单词连接符 U+2060、
+// 软连字符 U+00AD 等）。可见字符一律原样保留。
+//
+// 为什么需要它。粘贴是最主要的输入方式，而网页、IM、Excel 里复制出来的一段文本
+// 常常尾随或内嵌这类字符。它们在**任何**界面上都渲染成零宽度或空白，因此
+// 「肉眼一模一样但两个字符串不相等」是它们唯一的表现——那正是最难排查的一类故障。
+//
+// 与 strings.TrimSpace 的区别有两处，都关键：
+//   - TrimSpace 只认空白，Cf 类不属于空白，一个都不会被它碰到；
+//   - TrimSpace 只裁首尾，而粘贴带进来的字符也可能落在中间（"139<ZWSP>12521835"）。
+//
+// 只在「值本身不允许包含不可见字符」的字段上用它——手机号、标识符、路径这类。
+// 不要用在自由文本上：那里的空格是内容，删掉就改变了原意。
+func StripInvisible(s string) string {
+	// 绝大多数输入是干净的，先扫一遍避免无谓的分配。
+	if strings.IndexFunc(s, invisible) < 0 {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if !invisible(r) {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// invisible 判断一个字符是否零宽或空白。
+func invisible(r rune) bool {
+	return unicode.IsSpace(r) || unicode.Is(unicode.Cf, r)
 }

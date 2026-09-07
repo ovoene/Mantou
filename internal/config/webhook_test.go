@@ -311,6 +311,57 @@ func TestNormalizeReceiverSourceTypeDefaultsToAuto(t *testing.T) {
 	}
 }
 
+// TestNormalizeNotifyTargetStripsInvisibleFromMobiles 粘贴带进来的不可见字符要被抹掉。
+//
+// 这条盯的是一个真实故障：从钉钉资料页复制手机号会带上零宽字符（U+200B / U+FEFF …），
+// 它们不属于 Unicode 空白，TrimSpace 一个都不碰，于是号码带着它存进配置、
+// 拼进钉钉正文变成 "@13912521835<U+200B>"，钉钉匹配不到人，@ 静默失效。
+// 界面上那个标签和干净的号长得一模一样，肉眼查不出来。
+//
+// 放在规范化里（而不是只在保存时校验）是刻意的：migrate 每次 Load 都跑一遍，
+// 所以**已经存着脏号的配置会在下次启动时自动被修好**，不必让人重敲。
+func TestNormalizeNotifyTargetStripsInvisibleFromMobiles(t *testing.T) {
+	const clean = "13912521835"
+	zwsp, feff, wj := string(rune(0x200B)), string(rune(0xFEFF)), string(rune(0x2060))
+
+	tgt := NotifyTarget{
+		ID:   "t1",
+		Type: "dingtalk",
+		AtMobiles: []string{
+			clean + zwsp,             // 尾随零宽空格：最常见的一种
+			feff + clean,             // 开头 BOM
+			"139" + wj + "12521835",  // 夹在号码中间
+			"  " + clean + "  ",      // 首尾空白，TrimSpace 本来就管得住
+			"139 1252 1835",          // 中间空格：TrimSpace 管不住，这里也要清掉
+			zwsp + string(rune(' ')), // 清完就空了，应当被整条丢弃
+		},
+	}
+	NormalizeNotifyTarget(&tgt)
+
+	if len(tgt.AtMobiles) != 5 {
+		t.Fatalf("清完只剩全空的那条应被丢弃，期望 5 条，实际 %d 条：%q", len(tgt.AtMobiles), tgt.AtMobiles)
+	}
+	for i, got := range tgt.AtMobiles {
+		if got != clean {
+			t.Errorf("第 %d 条未清净：%q（码点 %U）", i, got, []rune(got))
+		}
+	}
+
+	// 幂等：migrate 在每次 Load 与每次 Replace 时都会跑（见本文件顶部的约定）。
+	before := append([]string(nil), tgt.AtMobiles...)
+	NormalizeNotifyTarget(&tgt)
+	if len(tgt.AtMobiles) != len(before) {
+		t.Fatalf("不幂等：再跑一遍条数从 %d 变成 %d", len(before), len(tgt.AtMobiles))
+	}
+
+	// 可见字符不能动——号码本身错不错由保存时的校验负责报错，不是在这里悄悄改写。
+	keep := NotifyTarget{ID: "t2", Type: "dingtalk", AtMobiles: []string{"+8613912521835", "139-1252-1835"}}
+	NormalizeNotifyTarget(&keep)
+	if keep.AtMobiles[0] != "+8613912521835" || keep.AtMobiles[1] != "139-1252-1835" {
+		t.Errorf("可见字符被改写：%q", keep.AtMobiles)
+	}
+}
+
 // 字段映射名要直接出现在 {{.名字}} 里：空格、点号这类字符会让模板在解析期就失败，
 // 必须在保存时拦下来，而不是等第一条消息进来才报错。汉字是合法的（text/template 用 unicode.IsLetter）。
 func TestValidMappingName(t *testing.T) {

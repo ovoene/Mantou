@@ -565,6 +565,17 @@ func validateNotifyTarget(t config.NotifyTarget) error {
 		if len(m) > config.MaxNotifyAtMobileLen {
 			return fmt.Errorf("@ 的手机号「%s」过长（上限 %d 字节）", strutil.Truncate(m, 24, "…"), config.MaxNotifyAtMobileLen)
 		}
+		// 号码里出现数字与开头的 + 之外的任何字符，钉钉/企业微信都匹配不到人，
+		// @ 会静默失效——而界面上看不出任何异常。这类值在这里直接挡掉，
+		// 比让人过几天才发现"@ 没生效"要好。
+		//
+		// 不校验位数：号段与国际号的长度都不受本程序控制，写死 11 位只会误伤。
+		// 不可见字符不必在这里判——规范化已经把它们抹掉了（见 NormalizeNotifyTarget），
+		// 这道校验跑在规范化之后。
+		if !looksLikeMobile(m) {
+			return fmt.Errorf("@ 的手机号「%s」含数字之外的字符；请填被 @ 的人在钉钉/企业微信上注册的手机号（可带 + 前缀，不要空格、横杠或姓名）",
+				strutil.Truncate(m, 24, "…"))
+		}
 	}
 	// 长度先判、再编译：一份超长模板会让 tmplx.Compile 为它建一棵比源文本还大的语法树，
 	// 而"它太长了"这个结论压根不取决于编译结果。
@@ -579,6 +590,27 @@ func validateNotifyTarget(t config.NotifyTarget) error {
 		}
 	}
 	return nil
+}
+
+// looksLikeMobile 判断一个字符串「有可能是」群机器人认得的手机号：
+// 至少一位数字，且除了可选的开头 +（国际号前缀）之外全是数字。
+//
+// 刻意只做这一层判断，不管位数也不管号段。号段年年新增，国际号长度各不相同，
+// 而这里的目的不是替运营商校验，只是挡掉那些**一定**匹配不到人的输入：
+// 姓名、带空格或横杠的号、全角数字、混进来的备注文字。真正的号对不对，
+// 只有钉钉/企业微信那边知道。
+func looksLikeMobile(s string) bool {
+	s = strings.TrimPrefix(s, "+")
+	if s == "" {
+		return false
+	}
+	// 按字节比按 rune 更严：全角数字（U+FF11 等）在这里会被判掉，而它本就该被判掉。
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // checkNotifyHeaders 卡住附加请求头的条数与键值长度。

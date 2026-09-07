@@ -252,6 +252,45 @@ func TestNotifyTargetAtMobilesLimit(t *testing.T) {
 	}
 }
 
+// TestNotifyTargetAtMobilesMustBeDigits 号码里混进非数字时当场拒掉。
+//
+// 挡的是"@ 静默失效"这一类：钉钉/企业微信匹配不到人时不会报错，消息照发、
+// 执行历史照样记成功，只是那个 @ 变成一段普通文字。界面上完全看不出来，
+// 通常要等到有人问"为什么没收到提醒"才发现。所以宁可在保存这一刻就说清楚。
+func TestNotifyTargetAtMobilesMustBeDigits(t *testing.T) {
+	// 能过的：纯数字，以及带国际号前缀的。位数刻意不校验（号段与国际号长度都会变）。
+	for _, ok := range []string{"13912521835", "+8613912521835", "075512345678", "1"} {
+		tgt := httpTarget()
+		tgt.AtMobiles = []string{ok}
+		if err := validateNotifyTarget(tgt); err != nil {
+			t.Errorf("%q 应放过，实际 %v", ok, err)
+		}
+	}
+
+	// 该被拒的。姓名那条是最值得挡的：填名字是最自然的误用，
+	// 而它 100% 匹配不到人（钉钉的 @ 只认手机号）。
+	for _, bad := range []string{
+		"顾凤萍",
+		"139 1252 1835",
+		"139-1252-1835",
+		"１３９１２５２１８３５", // 全角数字：肉眼像数字，实际不是
+		"13912521835（销售）",
+		"+",
+		"+86 139 1252 1835",
+	} {
+		tgt := httpTarget()
+		tgt.AtMobiles = []string{bad}
+		err := validateNotifyTarget(tgt)
+		if err == nil {
+			t.Errorf("%q 应被拒", bad)
+			continue
+		}
+		if !strings.Contains(err.Error(), "数字") {
+			t.Errorf("%q 的报错该点明「只能是数字」，实际 %q", bad, err.Error())
+		}
+	}
+}
+
 // 走一遍真实路由：上限确实接在保存路径上，且被拒之后一条都不存。
 // 只在 validateNotifyTarget 上测的话，"这个函数压根没被 CRUD 调用"这种接线错漏不出来。
 func TestNotifyTargetLimitsEnforcedOnSave(t *testing.T) {

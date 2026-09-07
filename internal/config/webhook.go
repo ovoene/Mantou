@@ -5,6 +5,8 @@ import (
 	"encoding/hex"
 	"net"
 	"strings"
+
+	"mantou/internal/strutil"
 )
 
 // 本文件是消息路由（Webhook → 规则 → 模板 → 通知）配置的**规范化**入口。
@@ -456,6 +458,20 @@ func NormalizeNotifyTarget(t *NotifyTarget) {
 		t.Retry = MaxNotifyRetry
 	}
 
+	// 手机号除了去首尾空白，还要把不可见字符**整条抹掉**（含号码中间的）。
+	//
+	// 这一条是踩出来的。从钉钉资料页、网页表格里复制号码，经常尾随一个零宽字符
+	// （U+200B / U+FEFF / U+200E …）；它们不属于 Unicode 空白，TrimSpace 一个都不碰，
+	// 于是号码带着它存进配置、拼进钉钉正文变成 "@13912521835<U+200B>"。
+	// 钉钉拿这串匹配不到群成员，@ 就静默失效——而界面上那个标签和干净的号
+	// 长得**一模一样**，肉眼、复制、再粘贴都查不出区别。
+	//
+	// 抹掉是安全的：手机号里这类字符没有任何合法用途。放在规范化而不是校验里，
+	// 是为了让已经存着脏号的配置在下一次保存（以及每次 Load 的 migrate）时自动被修好，
+	// 而不是从此报错、逼人手动重敲。
+	for i := range t.AtMobiles {
+		t.AtMobiles[i] = strutil.StripInvisible(t.AtMobiles[i])
+	}
 	t.AtMobiles = trimNonEmpty(t.AtMobiles)
 	// 请求头的键去空白；空键会被 net/http 拒绝，且没有任何意义。
 	if len(t.Headers) > 0 {
