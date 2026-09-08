@@ -70,9 +70,8 @@ type LogEntry = {
 //
 // 为什么不在模板里直接调 fmtProgramLogLine / formatFields：这个面板每 3 秒整体刷新一次，
 // 模板里的函数调用没有缓存，每次重绘都要为每一行重跑一遍分词（fmtProgramLogLine 是个
-// 几十行的状态机）+ 两次 formatFields（原模板里 v-if 和插值各调一次）+ 一次
-// toLocaleTimeString（Intl 调用，单次约几十微秒）。数据每 3 秒才变一次，
-// 却按重绘次数付费，纯属浪费。挪到 load() 里就变成「每条日志算一次」。
+// 几十行的状态机）+ 两次 formatFields（原模板里 v-if 和插值各调一次）+ 一次时间串拼装。
+// 数据每 3 秒才变一次，却按重绘次数付费，纯属浪费。挪到 load() 里就变成「每条日志算一次」。
 type LogRow = {
   key: string
   level: string
@@ -134,6 +133,21 @@ function fmtTime(ms?: number): string {
   const d = new Date(ms)
   const p = (n: number) => (n < 10 ? '0' + n : '' + n)
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+}
+
+// 程序日志一行的时间：YYYY-MM-DD HH:mm:ss。入参是后端 Entry.Time 的 RFC3339 串。
+//
+// 只有时分秒的话，跨天之后就分不清哪条是今天的了——日志面板本来就是回看用的。
+// 不按语言分写（上面 fmtDate 那样的「x年x月x日」），也不用 toLocaleString：
+// 这一列是等宽字体里的对齐列，而中文写法的宽度随月/日位数变（9月8日 与 12月28日 差两个字），
+// en-US 的 toLocaleTimeString 又会给出 12 小时制的「2:31:05 PM」，两种都会让时间列参差。
+// 定长数字格式在两种语言下都是日志时间戳的通行写法，也与上面启动时间的 24 小时制一致。
+function fmtLogTime(iso: string): string {
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return iso
+  const p = (n: number) => (n < 10 ? '0' + n : '' + n)
+  const date = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+  return `${date} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
 }
 
 function baseChart(el: HTMLDivElement) {
@@ -605,7 +619,7 @@ function buildLogRows(entries: LogEntry[]): LogRow[] {
       key: dup === 0 ? e.time : `${e.time}#${dup}`,
       level: e.level,
       levelCls: e.level.toLowerCase(),
-      timeStr: new Date(e.time).toLocaleTimeString(),
+      timeStr: fmtLogTime(e.time),
       tokens: colorizeCertDays(fmtProgramLogLine(e.message)),
       fields: formatFields(e.fields),
     })
@@ -932,9 +946,17 @@ const memScopeText = computed(() => {
   font-family: 'SFMono-Regular', ui-monospace, Menlo, Consolas, monospace;
   font-size: 12px;
 }
+/* 时间列补上年月日后占 125px（12px 等宽字体下的 19 个字符）。窄屏上侧边栏还占着 96px，
+ * 这个列表实测只剩 233px：级别 46 + 时间 125 + 两道间距 = 187，消息挤到几十像素，
+ * 一条长告警能折成七百多像素高的一竖条。
+ * 所以让消息列在放不下时自己换到第二行独占整行——basis 200px 是「够读一行中文」的下限，
+ * 由剩余空间自己决定折不折，不写断点：这个列表的可用宽度取决于侧边栏和面板内边距，
+ * 不是视口宽度的固定函数，写死 max-width 值反而对不上。 */
 .log-row {
   display: flex;
-  gap: 8px;
+  flex-wrap: wrap;
+  column-gap: 8px;
+  row-gap: 2px;
   padding: 3px 4px;
   border-radius: 6px;
   font-weight: 600;
@@ -962,6 +984,8 @@ const memScopeText = computed(() => {
   color: var(--mt-text-soft);
 }
 .log-msg {
+  flex: 1 1 200px;
+  min-width: 0;
   color: var(--mt-text);
   word-break: break-all;
 }
