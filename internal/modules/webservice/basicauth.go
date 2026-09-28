@@ -261,6 +261,16 @@ func withBasicAuth(m *Module, ch config.WebChild, next http.Handler) http.Handle
 			})
 			return
 		}
+		// 凭证在这一层已经用完了，不再往里传。
+		//
+		// 原先原样交给下一层：反代会把 `Authorization: Basic …`（base64 即明文）逐请求转发给后端。
+		// 这一道口令是网关自己的，后端既不需要、也不该拿到它——而后端地址常常是 http://
+		// 内网地址，于是"开 Basic 认证必须先开 HTTPS、口令不许明文过网"这条约束在反代那一跳上
+		// 形同虚设，口令还会落进后端自己的访问日志。后端若有自己的认证，这个头本来也是错的那一份。
+		//
+		// Clone 而不是就地删：net/http 约定处理器不改动传进来的 Request。
+		r = r.Clone(r.Context())
+		r.Header.Del("Authorization")
 		next.ServeHTTP(w, r)
 	})
 }

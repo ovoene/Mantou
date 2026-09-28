@@ -212,12 +212,12 @@ export const actions = {
     return api.get<{ text: string; items: string[] }>(`/meta/cron-describe?${qs.toString()}`)
   },
   issueCert: (id: string) => api.post<{ ok: boolean; result: string }>(`/certs/${id}/issue`),
-  // 导出默认带私钥：证书离开面板一般是要装到别的服务上，只有公钥那半边装不起来。
-  // 后端仅在 includePrivateKey=true 时才读私钥文件并回 keyPem。
-  exportCert: (id: string, includePrivateKey = true) =>
-    api.get<{ certPem: string; keyPem?: string }>(
-      `/certs/${id}/export${includePrivateKey ? '?includePrivateKey=true' : ''}`,
-    ),
+  // 只导出证书（不含私钥），凭会话即可。
+  exportCert: (id: string) => api.get<{ certPem: string; keyPem?: string }>(`/certs/${id}/export`),
+  // 连私钥一起导出：后端要当场验一次当前账户与密码（见 handleExportCertWithKey）。
+  // 走 POST 是为了让凭据留在请求体里，不进地址栏、浏览器历史与访问日志。
+  exportCertWithKey: (id: string, account: string, password: string) =>
+    api.post<{ certPem: string; keyPem?: string }>(`/certs/${id}/export`, { account, password }),
   importCert: (payload: { id: string; certPem: string; keyPem: string }) =>
     api.post<{ ok: boolean }>(`/certs/import`, payload),
   // 启用/禁用证书（列表快捷操作）；禁用被面板 HTTPS 引用的证书时后端返回 409。

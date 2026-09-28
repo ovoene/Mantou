@@ -46,6 +46,22 @@ func TestValidateCronTaskRejectsUnschedulableSpec(t *testing.T) {
 	}
 }
 
+// TestValidateCronTaskEveryTooShortSaysSo @every 写得太密：写法本身没错，报错要直说"太密"，
+// 不能套用"无法解析 + 标准 5 段格式"那句——那会让人去改一个本来就对的格式。
+func TestValidateCronTaskEveryTooShortSaysSo(t *testing.T) {
+	err := validateCronTask(nil, cronTask(true, "@every 10s"))
+	if err == nil {
+		t.Fatal("@every 10s 应被拒")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "间隔过短") || !strings.Contains(msg, "每分钟一次") {
+		t.Errorf("应说明间隔过短并给出最密的写法，实际 %q", msg)
+	}
+	if strings.Contains(msg, "无法解析") {
+		t.Errorf("能解析的表达式不该报成无法解析：%q", msg)
+	}
+}
+
 // TestValidateCronTaskAllowsDisabledBadSpec 关掉一条坏任务这件事必须永远做得到。
 //
 // 计划任务没有轻量 toggle 端点，列表里那个开关走的是整行 PUT（把存着的坏表达式原样送回来）。

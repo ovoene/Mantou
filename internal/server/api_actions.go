@@ -20,6 +20,8 @@ func (s *Server) registerActions(g *gin.RouterGroup) {
 	g.POST("/ddns/:id/run", s.handleRunDDNS)
 	g.POST("/certs/:id/issue", s.handleIssueCert)
 	g.GET("/certs/:id/export", s.handleExportCert)
+	// 连私钥一起导出要当场验一次密码，所以是另一条 POST 路由（凭据放请求体，不进地址栏与日志）。
+	g.POST("/certs/:id/export", s.handleExportCertWithKey)
 	g.POST("/certs/import", s.handleImportCert)
 	g.POST("/certs/:id/toggle", s.handleToggleCert)
 	g.POST("/crontasks/:id/run", s.handleRunCronTask)
@@ -197,7 +199,57 @@ func (s *Server) handleIssueCert(c *gin.Context) {
 	c.JSON(http.StatusAccepted, gin.H{"data": gin.H{"ok": true, "result": "证书签发任务已提交"}})
 }
 
+// handleExportCert 导出证书（不含私钥）。
+//
+// 连私钥一起导出走 handleExportCertWithKey：那一支要当场验一次当前密码。这里若仍按
+// includePrivateKey=true 放行，那道复核就等于没有，所以明确拒绝并说清该怎么做——
+// 旧版页面收到这个 403 会自动退回"只导出证书"（见 Certs.vue 的 exportCert）。
 func (s *Server) handleExportCert(c *gin.Context) {
+	if c.Query("includePrivateKey") == "true" {
+		respondError(c, http.StatusForbidden, "导出私钥需要验证当前账户与密码，请刷新页面后重试")
+		return
+	}
+	s.exportCert(c, false)
+}
+
+// exportCertKeyReq 导出私钥时的身份复核。
+type exportCertKeyReq struct {
+	Account  string `json:"account"`
+	Password string `json:"password"`
+}
+
+// handleExportCertWithKey 导出证书与私钥，动手之前当场验一次当前账户与密码。
+//
+// 为什么私钥要单独过这一关：这套接口里别的凭证一律不让一条会话读到——域名服务商密钥、
+// 通知目标的请求头在列表里脱敏，整份备份导出要验密码（handleExportConfig）——唯独证书私钥
+// 原先只凭会话就能整份取走。而它是后果最持久的那一样：会话可以撤、密码可以改，
+// 一份带走的私钥却能一直冒充这个域名，直到证书过期为止。
+//
+// 失败计数与导出备份、改账户等那几处共用一份（见 reauth.go）：都是"拿一条会话反复猜当前密码"。
+// 403 而不是 401：会话是好的，只是这一次的凭据没对上，不该让前端把人强制登出。
+func (s *Server) handleExportCertWithKey(c *gin.Context) {
+	if !s.reauthAllowed(c) {
+		return
+	}
+	defer s.reauthDone(c)
+	var req exportCertKeyReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		respondError(c, http.StatusBadRequest, "请求参数无效")
+		return
+	}
+	if !adminCredentialsOK(s.deps.Config.Snapshot().Auth, req.Account, req.Password) {
+		s.reauthFail(c)
+		s.deps.Log.Warn("导出证书私钥的身份复核失败，已拒绝",
+			"id", c.Param("id"), "operator", operator(c), "ip", c.ClientIP())
+		respondError(c, http.StatusForbidden, "当前账户或密码不正确，私钥未导出")
+		return
+	}
+	s.reauthOK(c)
+	s.exportCert(c, true)
+}
+
+// exportCert 导出指定证书，includePrivateKey 决定带不带私钥（调用方负责把关）。
+func (s *Server) exportCert(c *gin.Context, includePrivateKey bool) {
 	if s.deps.Cert == nil {
 		respondError(c, http.StatusServiceUnavailable, "证书模块未就绪")
 		return
@@ -214,7 +266,6 @@ func (s *Server) handleExportCert(c *gin.Context) {
 		respondError(c, http.StatusNotFound, "证书不存在")
 		return
 	}
-	includePrivateKey := c.Query("includePrivateKey") == "true"
 	certPEM, keyPEM, err := s.deps.Cert.Export(*target, includePrivateKey)
 	if err != nil {
 		respondError(c, http.StatusNotFound, err.Error())
@@ -262,6 +313,31 @@ func (s *Server) handleImportCert(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, "缺少证书 ID、证书或私钥")
 		return
 	}
+	// 只能导入到配置里已有的证书条目上。
+	//
+	// 原先 ID 只校验了"是个合法文件名"：任意一个配置里没有的 ID 也照样写出 <ID>.crt / .key，
+	// 并立刻进了内存里的证书索引。那张索引按域名认领，而且"到期更晚的赢"——一张不属于任何
+	// 条目的证书于是能抢走真证书的域名；SNI 解析拿到它之后发现这个 ID 不在配置里（按禁用处理），
+	// 握手直接失败，站点打不开，直到下一次保存配置重建索引为止。留在磁盘上的两个文件也成了孤儿。
+	//
+	// 路径方式的证书同样不收：它的内容来自用户指定的磁盘路径（Reload 时从那里读），
+	// 往证书目录里写一份只会与真正生效的那份对不上。
+	var target *config.Certificate
+	for _, cert := range s.deps.Config.Snapshot().Certs {
+		if cert.ID == req.ID {
+			item := cert
+			target = &item
+			break
+		}
+	}
+	if target == nil {
+		respondError(c, http.StatusNotFound, "证书不存在")
+		return
+	}
+	if target.Method == "path" {
+		respondError(c, http.StatusBadRequest, "这张证书是「路径」方式，内容直接读取磁盘上的文件，不能在这里导入；请修改它的证书与私钥路径")
+		return
+	}
 	if err := s.deps.Cert.Import(req.ID, []byte(req.CertPEM), []byte(req.KeyPEM)); err != nil {
 		respondError(c, http.StatusBadRequest, "导入失败: "+err.Error())
 		return
@@ -269,14 +345,7 @@ func (s *Server) handleImportCert(c *gin.Context) {
 	// 敏感操作审计，与导出成对。导入换掉的是这个站点对外出示的身份：换进来的证书之后会被
 	// 面板 HTTPS 与各 Web 子项直接使用，而这条路径不经过 registerCRUD，没有任何审计记录。
 	// 只记 ID / 名称与来源 IP，PEM 内容一个字节都不进日志。
-	name := req.ID
-	for _, cert := range s.deps.Config.Snapshot().Certs {
-		if cert.ID == req.ID {
-			name = cert.Name
-			break
-		}
-	}
-	s.logOp("导入", "SSL/TLS 证书", req.ID, name, "（手动上传证书与私钥），来源 IP "+c.ClientIP())
+	s.logOp("导入", "SSL/TLS 证书", req.ID, target.Name, "（手动上传证书与私钥），来源 IP "+c.ClientIP())
 	respondOK(c, gin.H{"ok": true})
 }
 
@@ -400,7 +469,17 @@ type toggleWebServiceReq struct {
 // handleToggleWebService 启用或禁用指定 Web 服务父项（列表快捷操作）。
 // 审计用"启用/禁用"动词（非"保存"，满足用户"列表操作不写保存日志"），
 // 编辑弹窗底部「保存」按钮仍走完整 PUT /webservices/:id 路径产生"保存"条目，互不干扰。
-// 启用时若端口与面板冲突则直接拒绝。
+//
+// 启用时跑的是与保存**同一套**完整校验（validateWebService），而且是在配置写锁内
+// 先翻转、再校验、不过就回滚，与子项开关（handleToggleWebServiceChild）同一形状。
+//
+// 原先这里只查了两件事（端口撞面板、与消息路由共用端口），而父项的大部分约束恰恰
+// 只在"父项启用"时才生效：同一（地址族, 端口）只许一个启用父项、跨父项 TLS 一致、
+// 域名在同一端口上的归属与面板域名保留、"默认站点"只能有一个。于是"先存成停用、
+// 再点一下列表开关"就能把保存时会被拒的配置开起来——两个父项被静默聚合进同一个监听，
+// 一方的 TLS 设置被另一方覆盖，界面上两边都是绿的。
+//
+// 禁用不校验：关掉一个服务只会减少约束，必须永远走得通。
 func (s *Server) handleToggleWebService(c *gin.Context) {
 	id := c.Param("id")
 	var req toggleWebServiceReq
@@ -408,40 +487,38 @@ func (s *Server) handleToggleWebService(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, "请求参数无效")
 		return
 	}
-	cfg := s.deps.Config.Snapshot()
-	var ws *config.WebService
-	for i := range cfg.WebServices {
-		if cfg.WebServices[i].ID == id {
-			ws = &cfg.WebServices[i]
-			break
-		}
-	}
-	if ws == nil {
-		respondError(c, http.StatusNotFound, "Web 服务不存在")
-		return
-	}
-	if req.Enabled && ws.Port == cfg.Panel.Port {
-		respondError(c, http.StatusBadRequest,
-			fmt.Sprintf("Web 服务端口 %d 与面板管理端口冲突，请改用其他端口", ws.Port))
-		return
-	}
-	// 与消息路由共用端口的前提也要在这条快捷路径上校验：否则一键启用之后
-	// 这个服务绑不上端口，用户在列表里看不出原因，只有程序日志里一行"地址已被占用"。
-	if req.Enabled {
-		if err := checkWebhookPortShare(cfg, *ws); err != nil {
-			respondError(c, http.StatusBadRequest, err.Error())
-			return
-		}
-	}
+	var (
+		name     string
+		found    bool
+		validErr error
+	)
 	if err := s.deps.Config.Update(func(c *config.Config) {
 		for i := range c.WebServices {
-			if c.WebServices[i].ID == id {
-				c.WebServices[i].Enabled = req.Enabled
-				return
+			if c.WebServices[i].ID != id {
+				continue
 			}
+			found = true
+			name = c.WebServices[i].Name
+			was := c.WebServices[i].Enabled
+			c.WebServices[i].Enabled = req.Enabled
+			if req.Enabled {
+				if err := validateWebService(c, c.WebServices[i], s.deps.DataDir); err != nil {
+					c.WebServices[i].Enabled = was // 回滚：落盘的状态始终合法
+					validErr = err
+				}
+			}
+			return
 		}
 	}); err != nil {
 		respondError(c, http.StatusInternalServerError, "保存失败")
+		return
+	}
+	if !found {
+		respondError(c, http.StatusNotFound, "Web 服务不存在")
+		return
+	}
+	if validErr != nil {
+		respondError(c, http.StatusBadRequest, validErr.Error())
 		return
 	}
 	s.afterChange()
@@ -452,7 +529,7 @@ func (s *Server) handleToggleWebService(c *gin.Context) {
 		if req.Enabled {
 			verb = "启用"
 		}
-		s.logOp(verb, "Web 服务", id, ws.Name, "")
+		s.logOp(verb, "Web 服务", id, name, "")
 	}
 	respondOK(c, gin.H{"id": id, "enabled": req.Enabled})
 }

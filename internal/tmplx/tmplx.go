@@ -381,7 +381,16 @@ func tplTruncate(n int, v any) string {
 }
 
 // tplPad 右侧补空格到 n 个显示宽度（粗略：汉字算 2）。用于在等宽字体里对齐成列的数据。
+//
+// n 封顶到比 MaxRenderBytes 多一个字节。输出上限（capWriter）管的是**写出去**的字节，
+// 而补空格是在写之前就整段分配好的：{{pad 1000000000 .x}} 会先要一块 1 GB 的内存，
+// 再被截成 64 KB。模板预览是边打字边渲染的，把宽度一位一位敲进去的途中就会真的发出这次渲染。
+// 超过渲染上限的那部分反正写不出去；多留的那一个字节让 capWriter 照旧判出"截断了"、
+// 打上截断标记，所以封在这里对可见结果没有任何影响。
 func tplPad(n int, v any) string {
+	if n > MaxRenderBytes+1 {
+		n = MaxRenderBytes + 1
+	}
 	s := toStr(v)
 	w := 0
 	for _, r := range s {
@@ -511,12 +520,88 @@ func tplToJSON(v any) string {
 	return string(b)
 }
 
+// tplToJSONIndent 带缩进的 JSON，排版与 json.MarshalIndent(v, "", "  ") 逐字节一致。
+//
+// 不直接调 MarshalIndent：缩进的体积随嵌套深度平方增长，而深度由外部推来的载荷决定。
+// 一份 20 KB 的 [[[[…]]]]（一万层，正好是 JSON 解码器允许的上限）缩进之后是 200 MB，
+// 过程中累计要分配一个多 GB——入站接收器上一个"把整份载荷原样转发"的模板
+// （{{toJSONIndent .body}}，最常见的调试写法）就能被一条请求撑爆内存，整个进程随之退出。
+// 输出上限（capWriter）在这里帮不上忙：它截的是写出去的字节，而那一整段是先在内存里排好的。
+//
+// 所以改成先紧凑序列化（体积与载荷同阶），再自己缩进、写过 MaxRenderBytes 就停。
+// 超出的那部分本来就会被 capWriter 截掉，可见结果与之前完全相同。
 func tplToJSONIndent(v any) string {
-	b, err := json.MarshalIndent(v, "", "  ")
+	b, err := json.Marshal(v)
 	if err != nil {
 		return ""
 	}
-	return string(b)
+	return string(indentJSON(b, MaxRenderBytes))
+}
+
+// indentJSON 把 json.Marshal 产出的紧凑 JSON 排成两空格缩进，输出一旦超过 limit 字节就停下
+// （停下时的长度略大于 limit，调用方据此仍能判出"被截断了"）。
+//
+// 规则照搬 encoding/json 的 Indent：左括号之后换行并加深一层，逗号之后换行，
+// 冒号之后补一个空格，右括号之前换行并退回一层；空的 {} 与 [] 不拆开。
+// 输入只来自 json.Marshal，因此是合法且不含多余空白的——只需要分清哪些字节在字符串里面。
+// TestIndentJSONMatchesStdlib 逐字节对照标准库。
+func indentJSON(src []byte, limit int) []byte {
+	dst := make([]byte, 0, min(2*len(src), limit)+16)
+	depth := 0
+	needIndent := false // 刚写了左括号，要等下一个字节才知道它是不是空的
+	inString, escaped := false, false
+	newline := func() {
+		dst = append(dst, '\n')
+		for i := 0; i < depth && len(dst) <= limit; i++ {
+			dst = append(dst, ' ', ' ')
+		}
+	}
+	for _, c := range src {
+		if len(dst) > limit {
+			break
+		}
+		if inString {
+			dst = append(dst, c)
+			switch {
+			case escaped:
+				escaped = false
+			case c == '\\':
+				escaped = true
+			case c == '"':
+				inString = false
+			}
+			continue
+		}
+		if needIndent && c != ']' && c != '}' {
+			needIndent = false
+			depth++
+			newline()
+		}
+		switch c {
+		case '"':
+			inString = true
+			dst = append(dst, c)
+		case '{', '[':
+			needIndent = true
+			dst = append(dst, c)
+		case ',':
+			dst = append(dst, c)
+			newline()
+		case ':':
+			dst = append(dst, c, ' ')
+		case '}', ']':
+			if needIndent {
+				needIndent = false
+			} else {
+				depth--
+				newline()
+			}
+			dst = append(dst, c)
+		default:
+			dst = append(dst, c)
+		}
+	}
+	return dst
 }
 
 // FuncNames 返回可用函数名列表（已按名称排序），供面板的模板编辑器做提示。

@@ -17,6 +17,8 @@
 #   - MIRROR        : 基础镜像前缀（加速站），结尾需带 / ；为空则走 docker.io
 #   - GOPROXY       : Go 模块代理，为空回退到官方代理 + direct
 #   - NPM_REGISTRY  : npm 镜像源，为空则走官方源
+#   三者都不能带凭据（形如 https://用户:口令@主机）：它们会被记进最终镜像的标签与历史，
+#   阶段 3 发现 @ 会直接拒绝构建。
 #
 # 供应链：三个基础镜像都按 digest 钉死（见各 FROM 行）。这三个参数因此只决定**从哪里取**，
 # 不决定**取到什么**——digest 是内容地址，加速站给错了东西构建会直接失败；同理 Go 依赖由
@@ -158,8 +160,17 @@ LABEL io.mantou.build.mirror="${MIRROR}" \
       io.mantou.build.goproxy="${GOPROXY}" \
       io.mantou.build.npm-registry="${NPM_REGISTRY}"
 
-# 时区 + CA 证书（DDNS/ACME 走 HTTPS 需要）
-RUN apk add --no-cache ca-certificates tzdata
+# 先拦带凭据的镜像源地址，再装时区 + CA 证书（DDNS/ACME 走 HTTPS 需要）。
+#
+# MIRROR / GOPROXY / NPM_REGISTRY 会原样进入上面的标签，也会随这一条 RUN 记进镜像历史
+# （docker history --no-trunc 看得到），镜像推到哪里它们就跟到哪里。地址里带了凭据
+# （https://用户:口令@主机）的话，口令就成了镜像的一部分——所以直接拒绝构建。
+# 私有代理要认证时，用 BuildKit 的 --secret 挂 netrc / .npmrc，别把口令写进地址。
+# 这三个值正常都不含 @（镜像前缀、代理地址、npm 源地址），不会误伤；报错时也不回显它们的值。
+RUN case "${MIRROR}${GOPROXY}${NPM_REGISTRY}" in \
+      *@*) echo "构建参数 MIRROR / GOPROXY / NPM_REGISTRY 里有 @（疑似「用户:口令@」形式的凭据）：它们会被写进镜像标签与历史，已拒绝构建。" >&2; exit 1 ;; \
+    esac \
+    && apk add --no-cache ca-certificates tzdata
 
 WORKDIR /app
 COPY --from=go-builder /out/mantou /app/mantou

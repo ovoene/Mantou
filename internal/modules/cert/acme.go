@@ -247,7 +247,7 @@ func (i *acmeIssuer) Issue(ctx context.Context, c config.Certificate, account *c
 		}
 	}
 	// 规范化域名：拆分逗号/空格分隔的脏数据、去重、校验通配符位置。
-	// 例如用户在单个输入框填写 "whicc.top,*.whicc.top"，会被正确拆分为两个独立 identifier。
+	// 例如用户在单个输入框填写 "example.com,*.example.com"，会被正确拆分为两个独立 identifier。
 	domains, err := normalizeDomains(c.Domains)
 	if err != nil {
 		return nil, nil, err

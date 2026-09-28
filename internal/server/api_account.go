@@ -35,6 +35,7 @@ func (s *Server) handleChangeAccount(c *gin.Context) {
 	if !s.reauthAllowed(c) {
 		return
 	}
+	defer s.reauthDone(c)
 	var req changeAccountReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		respondError(c, http.StatusBadRequest, "请求参数无效")
@@ -147,6 +148,7 @@ func (s *Server) handleVerifyIdentity(c *gin.Context) {
 	if !s.reauthAllowed(c) {
 		return
 	}
+	defer s.reauthDone(c)
 	var req verifyIdentityReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		respondError(c, http.StatusBadRequest, "请求参数无效")

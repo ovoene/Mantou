@@ -59,6 +59,8 @@ type PreviewResult struct {
 	// Receiver 实际用来解析样本、提供别名的接收器名。为空表示没挑接收器：
 	// 此时别名一律取不到值，界面据此提示用户选一个，而不是让他以为是模板写错了。
 	Receiver string `json:"receiver,omitempty"`
+	// RootTooDeep 样本的嵌套层数超过 maxRootDepth，Root 没有下发（理由见那个常量）。
+	RootTooDeep bool `json:"rootTooDeep,omitempty"`
 }
 
 // previewReceiver 预览要用的接收器运行态。
@@ -101,6 +103,9 @@ func (m *Module) PreviewTemplate(receiverID string, raw []byte, headers map[stri
 		Root:       ev.Root,
 		Unresolved: ev.Unresolved,
 		Receiver:   rc.cfg.Name,
+	}
+	if rootTooDeep(ev.Root) {
+		out.Root, out.RootTooDeep = nil, true
 	}
 	if len(raw) > 0 {
 		out.Sniffed = SniffSourceType(raw)

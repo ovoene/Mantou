@@ -710,6 +710,43 @@ func sameSecret(got, want string) bool {
 
 // ---- 小工具 ----
 
+// maxRootDepth 下发给面板的解析结果（Root）最多允许的嵌套层数。
+//
+// Root 要整个序列化进接口响应（试运行抓包、样本试运行、模板预览），而 encoding/json
+// 序列化超过一万层就直接报错。解码允许的上限恰好也是一万层，响应又在外面包了几层，
+// 于是一份九千九百多层的载荷解得开、却回不去：gin 吞掉那个错误，面板收到一个空的 200。
+// 抓包一份能留三小时，这个接收器的试运行面板在这段时间里就一直是空白的。
+//
+// 256 远超任何真实载荷的深度；面板上的字段树本来也只展开 6 层（web 端 fieldPaths.ts）。
+const maxRootDepth = 256
+
+// rootTooDeep 判断 v 的嵌套是否超过 maxRootDepth 层。
+//
+// 递归而不用显式栈：深度一过上限就原路返回，递归最多 maxRootDepth+1 层；
+// 显式栈要把同一层的兄弟节点全压进去，一个两百万元素的数组就是几十兆的临时切片。
+func rootTooDeep(v any) bool { return deeperThan(v, 0) }
+
+func deeperThan(v any, depth int) bool {
+	if depth > maxRootDepth {
+		return true
+	}
+	switch t := v.(type) {
+	case map[string]any:
+		for _, c := range t {
+			if deeperThan(c, depth+1) {
+				return true
+			}
+		}
+	case []any:
+		for _, c := range t {
+			if deeperThan(c, depth+1) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // lookupPath 把请求的 URL 路径折成与配置里同一套写法的查找键。
 //
 // 表里的键全都是 config.NormalizeWebhookPath 的输出（去首尾斜杠、折叠重复斜杠、
@@ -815,6 +852,9 @@ type DryRunResult struct {
 	// 用户此刻正在调词表，既要知道"这条会被拦"，也要看到"不拦的话会发出什么"。
 	Blocked       bool   `json:"blocked,omitempty"`
 	BlockedReason string `json:"blockedReason,omitempty"`
+	// RootTooDeep 这条载荷的嵌套层数超过 maxRootDepth，Root 没有下发（见 rootTooDeep）。
+	// 渲染与命中判定照常给出：它们各自有长度闸，也不受这件事影响。
+	RootTooDeep bool `json:"rootTooDeep,omitempty"`
 }
 
 // DryRunMessage 试运行里一条渲染结果。
@@ -846,6 +886,9 @@ func dryRunOf(ev *event, res result, targetNames map[string]string) *DryRunResul
 		NoBranch:   res.NoBranch,
 		Truncated:  res.Truncated,
 		TargetName: targetNames,
+	}
+	if rootTooDeep(ev.Root) {
+		out.Root, out.RootTooDeep = nil, true
 	}
 	for _, msg := range res.Messages {
 		dm := DryRunMessage{

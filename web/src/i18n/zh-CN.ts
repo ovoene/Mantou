@@ -122,6 +122,17 @@ export default {
     version: '版本',
     recvTotal: '累计接收',
     sentTotal: '累计发送',
+    // 外网 IP 卡片。地址由后端按 DDNS 的「公网取址」检测（只在有人看总览时，几分钟一轮）。
+    publicIp: '外网 IP',
+    ipRefresh: '重新检测',
+    ipDetecting: '检测中…',
+    ipUnavailable: '未获取到',
+    ipCheckedAt: '检测于 {time}',
+    // 最近一次检测失败时，卡片上仍显示上一次取到的地址，悬停说明是几点取到的、这次为什么失败。
+    ipStale: '最近一次检测失败，显示的是 {time} 取到的地址。原因：{err}',
+    ipCopyHint: '点击复制',
+    ipCopied: '已复制',
+    ipCopyFail: '当前环境不允许自动复制，请手动选中后复制',
     modules: '模块状态',
     total: '总数',
     active: '活跃',
@@ -500,6 +511,10 @@ export default {
     exported: '证书已导出',
     exportedWithKey: '已导出证书与私钥两个文件',
     exportedNoKey: '证书已导出，但没能读到私钥（只导出了证书文件）',
+    exportedCertOnly: '已只导出证书文件（未导出私钥）',
+    exportKeyPwd: '连私钥一起导出需验证当前账户密码。私钥一旦离开这台机器就收不回来，请妥善保管导出的文件。',
+    exportWithKey: '导出证书与私钥',
+    exportCertOnly: '只导出证书',
     dns01Hint: '通过 DNS-01 验证签发，需在 DNS 凭证中配置对应服务商；支持通配符证书（*.example.com）。',
     credential: '域名服务商',
     acme: 'ACME 账户',
@@ -606,7 +621,8 @@ export default {
     updateGithubRepo: 'GitHub 仓库',
     updateGithubRepoHint: 'owner/name 形式（如 ovoene/Mantou），或完整 https URL。留空使用默认 ovoene/Mantou；仅在未配置自托管清单时生效。',
     updateSignKey: '自更新包签名公钥',
-    updateSignKeyHint: 'Ed25519 公钥（base64 编码的 32 字节）。配置后，上传的更新包必须附带同名 .sig 签名文件且验签通过才会应用。留空时是否接收更新包由下一项决定。',
+    updateSignKeyHint: 'Ed25519 公钥（base64 编码的 32 字节）。配置后，上传的更新包必须附带同名 .sig 签名文件且验签通过才会应用。留空时是否接收更新包由下一项决定。更换公钥需要验证当前密码。',
+    updateSignKeyPwd: '更换自更新包签名公钥需验证当前账户密码（配了公钥后上传验签通过的更新包不再询问密码）',
     updateAllowUnsigned: '允许未验签的更新包',
     updateAllowUnsignedHint: '公钥留空时，上传的更新包不做验签。关闭时留空公钥则不接收更新包——上传更新包等于让面板执行一个新的二进制，没有验签就分辨不出它的来源。打开这一项要验证当前密码，且只在 {hours} 小时内有效、到期自动失效；有效期内每次上传未验签的更新包仍会再问一次密码。',
     updateAllowUnsignedPwd: '打开「允许未验签的更新包」需验证当前账户密码',
@@ -1518,6 +1534,8 @@ export default {
       rootHint: '这是按「取值根路径」处理后模板真正能取到的结构。',
       // 正文被截断的那一份不留字段树：树是按整段正文解出来的，留着它这道上限就没意义了。
       rootDropped: '这条消息太大，只留了开头一段，字段结构没有保留。要看字段名，可以让对方推一条小一些的，或在上面手贴一段样本。',
+      // 嵌套层数过深的那一份同样不下发字段树（后端 maxRootDepth）：它序列化不进接口响应。
+      rootTooDeep: '这条消息的嵌套层数太深，字段结构没有保留；渲染与命中判定不受影响。正常的推送不会有这么多层，请核对对方发来的内容。',
     },
   },
   msg: {

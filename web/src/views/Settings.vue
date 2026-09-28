@@ -192,8 +192,11 @@ const update = reactive<UpdateCfg>({
 })
 const savingUpdate = ref(false)
 // 载入时那一刻的窗口状态。用来判断这次保存是不是一次「打开」——只有打开才要验密码，
-// 关掉、改清单地址、填公钥都不用（后端口径见 handleUpdateSettings）。
+// 关掉、改清单地址都不用（后端口径见 handleUpdateSettings）。
 const allowUnsignedLoaded = ref(false)
+// 载入时那一刻的签名公钥。换成一把新的非空公钥同样要验密码：配了公钥之后上传更新包不再问密码，
+// 所以"信任哪一把公钥"与打开未验签开关是同一个量级；清空公钥与原样保存不问。
+const signKeyLoaded = ref('')
 
 // 窗口到期时刻的本地时间文案，供开关下方的提示使用；没有有效窗口时为空串。
 const allowUnsignedExpiresText = computed(() => {
@@ -453,6 +456,7 @@ async function loadSettings() {
       update.releaseUrl = s.update.releaseUrl ?? ''
       update.githubRepo = s.update.githubRepo ?? ''
       update.signKey = s.update.signKey ?? ''
+      signKeyLoaded.value = update.signKey.trim()
       update.allowUnsignedUpdate = !!s.update.allowUnsignedUpdate
       update.allowUnsignedExpiresAt = typeof s.update.allowUnsignedExpiresAt === 'number' ? s.update.allowUnsignedExpiresAt : 0
       if (s.update.allowUnsignedTtlHours > 0) update.allowUnsignedTtlHours = s.update.allowUnsignedTtlHours
@@ -680,11 +684,19 @@ async function saveUpdate() {
   // 打开「允许未验签的更新包」要当场再验一次密码：那一项一开，任何一条有效会话都能
   // 上传一个包把面板二进制换掉。后端在这一次提交上要求凭据（见 handleUpdateSettings），
   // 这里先问，免得白提交一次收一个 403。关掉它、以及窗口已经开着时的其它保存都不问。
-  const needAuth = update.allowUnsignedUpdate && !allowUnsignedLoaded.value
+  //
+  // 换成一把新的签名公钥同理：配了公钥之后上传更新包不再问密码，换公钥就等于换掉
+  // "谁签的包可以直接装上"。清空公钥、原样保存同一把公钥都不问。
+  const opening = update.allowUnsignedUpdate && !allowUnsignedLoaded.value
+  const newKey = update.signKey.trim()
+  const keyChanging = newKey !== '' && newKey !== signKeyLoaded.value
+  const needAuth = opening || keyChanging
   let password = ''
   if (needAuth) {
     try {
-      const r = await ElMessageBox.prompt(t('settings.updateAllowUnsignedPwd'), t('settings.updateAllowUnsigned'), {
+      const r = await ElMessageBox.prompt(
+        t(keyChanging ? 'settings.updateSignKeyPwd' : 'settings.updateAllowUnsignedPwd'),
+        t(keyChanging ? 'settings.updateSignKey' : 'settings.updateAllowUnsigned'), {
         inputType: 'password',
         confirmButtonText: t('common.confirm'),
         cancelButtonText: t('common.cancel'),
@@ -714,7 +726,9 @@ async function saveUpdate() {
       update.allowUnsignedUpdate = !!res.update.allowUnsignedUpdate
       update.allowUnsignedExpiresAt = typeof res.update.allowUnsignedExpiresAt === 'number' ? res.update.allowUnsignedExpiresAt : 0
       allowUnsignedLoaded.value = update.allowUnsignedUpdate
+      if (typeof res.update.signKey === 'string') update.signKey = res.update.signKey
     }
+    signKeyLoaded.value = update.signKey.trim()
     ElMessage.success(t('msg.saveOk'))
   } catch (e: any) {
     ElMessage.error(e?.message || t('common.failed'))

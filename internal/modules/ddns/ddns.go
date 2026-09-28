@@ -223,8 +223,15 @@ func (r *ruleRunner) interval() time.Duration {
 	r.mu.Lock()
 	sec := r.rule.IntervalSec
 	r.mu.Unlock()
-	if sec <= 0 {
+	switch {
+	case sec <= 0:
 		sec = 300
+	case sec < MinIntervalSec:
+		// 保存接口已经拦着（见 ValidateRule），这里兜的是导入与手改 config.json：
+		// 每一拍都要请求一次第三方取址服务，过密会被对方按频率封掉本机出口 IP。
+		sec = MinIntervalSec
+	case sec > MaxIntervalSec:
+		sec = MaxIntervalSec
 	}
 	return time.Duration(sec) * time.Second
 }
@@ -285,6 +292,16 @@ func (r *ruleRunner) execute(ctx context.Context) (string, error) {
 	prevIP := r.lastIP
 	r.mu.Unlock()
 
+	// 动手之前先确认规则本身的写法（与保存接口同一份判定，见 validate.go）。
+	// 保存接口只在启用时校验，而停用中的规则也能被手动「立即执行」；导入与手改的配置
+	// 更是一道校验都没过。域名与主机记录会被拼进服务商 API 的请求路径，不能拿着没查过的值去发。
+	if err := ValidateRule(rule); err != nil {
+		if !stoppedEarly(ctx) { // 被掐断的那一轮不落状态，与下面取址失败那一支同口径
+			r.setStatus(false, "规则配置无效: "+err.Error(), false)
+		}
+		return "", err
+	}
+
 	cfg := r.cfgMgr.Snapshot()
 	blockPrivate := cfg.Settings.Security.BlockPrivateNetwork
 
@@ -322,9 +339,12 @@ func (r *ruleRunner) execute(ctx context.Context) (string, error) {
 			firstErr = serr
 			continue
 		}
-		provider := t.Provider
+		// 服务商以**凭证自己**记的为准，目标上的 Provider 只在凭证没记时兜底（旧配置）。
+		// 原先反过来：目标上写着哪家就调哪家，于是一条目标能把 A 家的密钥发去 B 家的接口。
+		// 界面从不写这个字段，它只会来自旧配置、导入或手改——正是不该被信任的那几条路。
+		provider := provName
 		if provider == "" {
-			provider = provName
+			provider = t.Provider
 		}
 		p, perr := dnsprovider.Get(provider)
 		if perr != nil {

@@ -94,6 +94,23 @@ func (m *Manager) snapshot() []Module {
 	return append([]Module(nil), m.modules...)
 }
 
+// ReloadLatest 在重载锁内现取一份配置再重载全部模块；get 返回 nil 时不重载。
+//
+// 配置变更后的热重载应当走这里，而不是"先取配置、再调 ReloadAll"：取配置那一步若在锁外，
+// 两次并发的保存可能以相反的顺序拿到锁——带着新配置的那次先重载完，带着旧配置的那次
+// 随后又把模块改回去。磁盘上是新配置，模块却跑在旧配置上（刚关掉的转发或站点仍在对外服务），
+// 直到下一次有人改配置才纠正过来。在锁内现取，后执行的那次一定看得到不旧于前一次的配置。
+func (m *Manager) ReloadLatest(get func() *config.Config) {
+	m.reloadMu.Lock()
+	defer m.reloadMu.Unlock()
+	cfg := get()
+	if cfg == nil {
+		m.log.Error("读取配置失败，跳过模块重载")
+		return
+	}
+	m.reloadLocked(cfg)
+}
+
 // ReloadAll 用给定配置重载全部模块。
 //
 // 三条约定：
@@ -107,7 +124,11 @@ func (m *Manager) snapshot() []Module {
 func (m *Manager) ReloadAll(cfg *config.Config) {
 	m.reloadMu.Lock()
 	defer m.reloadMu.Unlock()
+	m.reloadLocked(cfg)
+}
 
+// reloadLocked 是 ReloadAll 的本体；调用方须持有 reloadMu。
+func (m *Manager) reloadLocked(cfg *config.Config) {
 	m.mu.RLock()
 	closed := m.closed
 	m.mu.RUnlock()

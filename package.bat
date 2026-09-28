@@ -7,7 +7,7 @@ REM Output: ./mantou-<VERSION>-linux-<arch>.tar.gz in current dir
 REM Requires: go, node/npm, system tar (Win10+)
 
 set APP=mantou
-set VERSION=Ver 1.0.9
+set VERSION=Ver 1.0.10
 set BIN_DIR=bin
 set PKG_GOOS=linux
 if not "%~1"=="" ( set PKG_ARCHS=%~1 ) else ( set PKG_ARCHS=amd64 arm64 )
@@ -42,8 +42,11 @@ for /f "skip=1 delims=. " %%i in ('wmic os get localdatetime') do set LD=%%i & g
 set BUILD_TIME=%LD:~0,4%-%LD:~4,2%-%LD:~6,2% %LD:~8,2%:%LD:~10,2%:%LD:~12,2%
 
 REM 1) build frontend into web/dist
+REM npm ci (not npm install): install exactly what package-lock.json says and never rewrite it.
+REM npm install may update the lock file, and release.sh commits with `git add -A`, so a
+REM packaging run could quietly carry an unreviewed dependency change up to GitHub.
 pushd web
-call npm install
+call npm ci
 if errorlevel 1 goto :fail
 call npm run build:only
 if errorlevel 1 goto :fail
@@ -54,7 +57,7 @@ REM The first run generates a random key pair and prints the public key; the pri
 REM is kept in update-signing.key (never commit/share it). Later runs reuse the same key
 REM so the public key configured in mantou stays valid.
 if not exist %BIN_DIR% mkdir %BIN_DIR%
-go build -trimpath -o %BIN_DIR%\updsign.exe ./cmd/updsign
+go build -trimpath -mod=readonly -o %BIN_DIR%\updsign.exe ./cmd/updsign
 if errorlevel 1 goto :fail
 if not exist update-signing.key (
   echo == generating self-update signing key pair ==
@@ -98,14 +101,15 @@ REM unformatted gen.go would make `make check` / the CI gofmt gate fail while po
 REM file the developer never edited. The gates also skip it explicitly, this is the other half.
 call go fmt ./internal/version/ >nul 2>&1
 
-call go mod tidy
-if errorlevel 1 goto :fail
+REM no `go mod tidy` here: packaging must not rewrite go.mod / go.sum (same reason as npm ci
+REM above). -mod=readonly below makes an out-of-date go.sum fail loudly instead of being
+REM silently "fixed" -- matching the CI and Dockerfile builds.
 
 set CGO_ENABLED=0
 set GOOS=%PKG_GOOS%
 set GOARCH=%ARCH%
 if not exist %BIN_DIR% mkdir %BIN_DIR%
-go build -trimpath -ldflags "-s -w" -o %BIN_DIR%/%APP% ./cmd/mantou
+go build -trimpath -mod=readonly -ldflags "-s -w" -o %BIN_DIR%/%APP% ./cmd/mantou
 set CGO_ENABLED=
 set GOOS=
 set GOARCH=

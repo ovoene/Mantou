@@ -90,6 +90,14 @@ func compileIPPattern(pattern string) (*regexp.Regexp, error) {
 // 避免某个端点长时间挂起拖垮整轮取址（父 context 通常无截止时间）。
 const publicProbeTimeout = 5 * time.Second
 
+// DetectPublicIP 按「公网取址」探测本机当前的出口 IP，stack 为 ipv4 / ipv6。
+//
+// 导出给总览页的外网 IP 卡片用：两边走同一组端点、同一套公网校验，
+// 卡片上显示的就是 DDNS 按「公网取址」会写进域名的那个地址。
+func DetectPublicIP(ctx context.Context, stack string) (string, error) {
+	return ipFromPublic(ctx, stack)
+}
+
 // ipFromPublic 逐个请求内置公网端点，返回首个「通过协议栈校验且为公网」的 IP。
 // 端点互为冗余：单个端点超时 / 连接失败 / 返回异常都会自动跳到下一个；
 // 并拒绝私有 / 保留地址（公网取址结果必须是可路由的公网 IP），兼顾容错与准确性。

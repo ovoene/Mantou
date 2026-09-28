@@ -237,8 +237,10 @@ git add -A
 # 位置放（比如把 master.key 挪出 data/），推上去就是公开泄露，而 GitHub 上的历史删不干净
 # （tag、fork、各级缓存都还留着旧对象）。所以在推之前按文件名再拦一次。
 # 查索引而不是工作区：索引就是紧接着要提交的那份内容，.gitignore 已经在上一句里生效过了。
+# 除密钥之外还拦两类：面板导出的配置备份（Mantou-<14 位时间>.json，内含全部凭据与证书私钥），
+# 以及任意层级的 data/ 运行期目录（在子目录里启动过一次程序就会多出一个）。
 CRED_HITS="$(git ls-files -c |
-  grep -Ei '(^|/)(update-signing\.key|master\.key|\.env(\..*)?)$|\.(key|pem|crt|p12|pfx)$|^data/' || true)"
+  grep -Ei '(^|/)(update-signing\.key|master\.key|\.env(\..*)?|Mantou-[0-9]{14}\.json)$|\.(key|pem|crt|p12|pfx)$|(^|/)data/' || true)"
 if [ -n "$CRED_HITS" ]; then
   err "暂存区里有疑似凭据文件，已中止发布（这些内容一旦推上 GitHub 就删不干净）："
   echo "$CRED_HITS" | sed 's/^/    /'

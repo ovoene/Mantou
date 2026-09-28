@@ -11,6 +11,7 @@ import { useNarrow } from '@/composables/useNarrow'
 import { useResource, fmtTime, fmtTimeMs, fmtBytes } from '@/composables/useResource'
 import { useCloseOnLeave } from '@/composables/useCloseOnLeave'
 import { usePolling } from '@/composables/usePolling'
+import { copyText } from '@/composables/copyText'
 import ReceiverDialog from '@/components/webhook/ReceiverDialog.vue'
 import RuleDialog from '@/components/webhook/RuleDialog.vue'
 import TargetDialog from '@/components/webhook/TargetDialog.vue'
@@ -642,27 +643,9 @@ function fullUrl(row: WebhookReceiver): string {
 }
 
 async function copyUrl(row: WebhookReceiver) {
-  const text = fullUrl(row)
-  try {
-    // 面板可能跑在 http 上（clipboard API 只在安全上下文可用），
-    // 所以留一条 textarea + execCommand 的退路：复制不成功就等于这个按钮不存在。
-    if (navigator.clipboard && window.isSecureContext) {
-      await navigator.clipboard.writeText(text)
-    } else {
-      const ta = document.createElement('textarea')
-      ta.value = text
-      ta.style.position = 'fixed'
-      ta.style.opacity = '0'
-      document.body.appendChild(ta)
-      ta.select()
-      const ok = document.execCommand('copy')
-      document.body.removeChild(ta)
-      if (!ok) throw new Error('copy failed')
-    }
-    ElMessage.success(t('mroute.copied'))
-  } catch {
-    ElMessage.warning(t('mroute.copyFail'))
-  }
+  // http 页面、clipboard 被拒时都有退路（见 copyText），两条路都不通才提示手动复制。
+  if (await copyText(fullUrl(row))) ElMessage.success(t('mroute.copied'))
+  else ElMessage.warning(t('mroute.copyFail'))
 }
 
 async function openEditReceiver(row: WebhookReceiver) {

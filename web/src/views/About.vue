@@ -5,6 +5,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import PageCard from '@/components/PageCard.vue'
 import api from '@/api/client'
 import { actions } from '@/api/resources'
+import { copyText } from '@/composables/copyText'
 import { useAuthStore } from '@/stores/auth'
 import { useSystemStore } from '@/stores/system'
 
@@ -128,27 +129,10 @@ const runGuides = computed(() => [
 // 折叠块的展开项：空数组即默认收起。
 const runOpen = ref<string[]>([])
 
-// 复制命令。面板可能跑在 http 上（clipboard API 只在安全上下文可用），
-// 所以留一条 textarea + execCommand 的退路，与消息路由页同一处理。
+// 复制命令。http 页面、clipboard 被拒时都有退路（见 copyText），两条路都不通才提示手动选中。
 async function copyRunCmd(text: string) {
-  try {
-    if (navigator.clipboard && window.isSecureContext) {
-      await navigator.clipboard.writeText(text)
-    } else {
-      const ta = document.createElement('textarea')
-      ta.value = text
-      ta.style.position = 'fixed'
-      ta.style.opacity = '0'
-      document.body.appendChild(ta)
-      ta.select()
-      const ok = document.execCommand('copy')
-      document.body.removeChild(ta)
-      if (!ok) throw new Error('copy failed')
-    }
-    ElMessage.success(t('about.runCopied'))
-  } catch {
-    ElMessage.warning(t('about.runCopyFail'))
-  }
+  if (await copyText(text)) ElMessage.success(t('about.runCopied'))
+  else ElMessage.warning(t('about.runCopyFail'))
 }
 
 // 在线更新配置（manifestUrl / releaseUrl / githubRepo / signKey / allowUnsignedUpdate）。

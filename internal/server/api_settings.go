@@ -44,6 +44,7 @@ func (s *Server) handleExportConfig(c *gin.Context) {
 	if !s.reauthAllowed(c) {
 		return
 	}
+	defer s.reauthDone(c)
 	s.backupMu.Lock()
 	defer s.backupMu.Unlock()
 
@@ -182,6 +183,7 @@ func (s *Server) handleImportConfig(c *gin.Context) {
 	if !s.reauthAllowed(c) {
 		return
 	}
+	defer s.reauthDone(c)
 	s.backupMu.Lock()
 	defer s.backupMu.Unlock()
 

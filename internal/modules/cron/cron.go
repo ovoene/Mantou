@@ -69,10 +69,30 @@ func (m *Module) RegisterHandler(actionType string, fn ActionFunc) {
 //
 // 不对 spec 做任何整理（连首尾空格都不去）：交给校验的必须与交给 AddFunc 的是同一个字符串。
 // robfig 内部用 strings.Fields 切分，首尾空格本就无害；纯空白串两边都会报错。
+//
+// 在解析器之外只多卡一条：@every 的间隔不得短于 minEveryDelay。标准 5 段表达式最细就是
+// 每分钟一次，界面上最细的档位也是「每分钟」；而 robfig 的 @every 描述符一路收到 1 秒——
+// 一条 `@every 1s` 的 HTTP 动作就是每秒向外发一个请求，`cert.renew` 则会在续期失败时
+// 每秒重试一次、很快撞上签发方的失败次数限制。Reload 排班前也过这一道（见 Reload），
+// 校验与调度器仍是同一个判断。
 func ValidateSpec(spec string) error {
-	_, err := robfig.ParseStandard(spec)
-	return err
+	sched, err := robfig.ParseStandard(spec)
+	if err != nil {
+		return err
+	}
+	if every, ok := sched.(robfig.ConstantDelaySchedule); ok && every.Delay < minEveryDelay {
+		return fmt.Errorf("%w：至少 %s（当前 %s）", ErrEveryTooShort, minEveryDelay, every.Delay)
+	}
+	return nil
 }
+
+// minEveryDelay @every 描述符允许的最短间隔，理由见 ValidateSpec。
+const minEveryDelay = time.Minute
+
+// ErrEveryTooShort ValidateSpec 判出 @every 间隔过短时，返回的错误都包着它。
+// 调用方据此把"写法没错、只是太密"与"表达式解析不了"分开说——
+// 后者要提示 5 段写法，前者再提示一遍 5 段写法只会让人去改一个本来就对的格式。
+var ErrEveryTooShort = errors.New("@every 的间隔过短")
 
 // Reload 重建 cron 调度器并挂载所有启用的任务。
 func (m *Module) Reload(cfg *config.Config) error {
@@ -100,7 +120,12 @@ func (m *Module) Reload(cfg *config.Config) error {
 			continue
 		}
 		task := t // 捕获副本
-		_, err := c.AddFunc(task.Cron, func() { m.runTask(task) })
+		// 先过与保存接口同一道判定（见 ValidateSpec）：导入与手改的配置没经过保存校验，
+		// 解析器本身又会收下 @every 1s 这类过密的调度。
+		err := ValidateSpec(task.Cron)
+		if err == nil {
+			_, err = c.AddFunc(task.Cron, func() { m.runTask(task) })
+		}
 		if err != nil {
 			m.log.Error("计划任务表达式无效", "task", task.Name, "cron", task.Cron, "err", err.Error())
 			continue

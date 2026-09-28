@@ -474,6 +474,9 @@ func (s *Server) registerNotifyTargets(g *gin.RouterGroup) {
 			s.restoreTargetSecrets(t)
 		},
 		validate: func(cfg *config.Config, t config.NotifyTarget) error {
+			if err := checkMaskedAfterURLChange(cfg, t); err != nil {
+				return err
+			}
 			return validateNotifyTarget(t)
 		},
 	})
@@ -492,6 +495,12 @@ type targetRow struct {
 }
 
 // restoreTargetSecrets 把前端回传的脱敏占位还原成已存储的真实值。
+//
+// 只在**地址没变**时还原加签密钥与请求头。那两样是发往这个地址的凭证，而列表接口
+// 把它们脱敏正是为了"光有一条会话读不到它们"。原先不论地址改没改都还原，于是
+// 一条被盗的会话只要把地址改成自己的服务器、请求头原样留着占位符、再点一下「测试」，
+// 存着的 Authorization: Bearer … 就原样发到了对方手里——脱敏形同虚设。
+// 地址改了之后留着的占位符由 validate 那一步拦下，要求重新填写（见 checkMaskedAfterURLChange）。
 func (s *Server) restoreTargetSecrets(t *config.NotifyTarget) {
 	if t.ID == "" {
 		return
@@ -504,6 +513,9 @@ func (s *Server) restoreTargetSecrets(t *config.NotifyTarget) {
 		}
 		if t.URL == maskedSecret {
 			t.URL = old.URL
+		}
+		if t.URL != old.URL {
+			return
 		}
 		if t.Secret == maskedSecret {
 			t.Secret = old.Secret
@@ -638,6 +650,33 @@ func checkNotifyHeaders(h map[string]string) error {
 		}
 		if n := len(h[k]); n > config.MaxNotifyHeaderValueLen {
 			return fmt.Errorf("请求头「%s」的取值过长（上限 %d 字节，当前 %d 字节）", k, config.MaxNotifyHeaderValueLen, n)
+		}
+	}
+	return nil
+}
+
+// checkMaskedAfterURLChange 地址改了、加签密钥或请求头却还是脱敏占位符时，说清楚为什么没有沿用旧值。
+//
+// 这种组合一定会被后面的 checkNoMaskedLeftover 拦下，但那里的话说的是"改过请求头名称"，
+// 放在"改了地址"的场景里会把人指到错的地方去。旧值不跟着新地址走是刻意的：
+// 它们是发往原地址的凭证（见 restoreTargetSecrets）。
+func checkMaskedAfterURLChange(cfg *config.Config, t config.NotifyTarget) error {
+	if t.ID == "" || cfg == nil {
+		return nil
+	}
+	masked := t.Secret == maskedSecret
+	for _, v := range t.Headers {
+		if v == maskedSecret {
+			masked = true
+			break
+		}
+	}
+	if !masked {
+		return nil
+	}
+	for i := range cfg.NotifyTargets {
+		if cfg.NotifyTargets[i].ID == t.ID && cfg.NotifyTargets[i].URL != t.URL {
+			return fmt.Errorf("地址已修改：原来的加签密钥与附加请求头不会沿用到新地址上，请重新填写仍显示为 %s 的那几项", maskedSecret)
 		}
 	}
 	return nil

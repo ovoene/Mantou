@@ -3,6 +3,7 @@ package server
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -18,6 +19,7 @@ import (
 	"mantou/internal/config"
 	"mantou/internal/ipx"
 	"mantou/internal/modules/cron"
+	"mantou/internal/modules/ddns"
 	"mantou/internal/modules/wol"
 	"mantou/internal/runstats"
 )
@@ -1036,8 +1038,53 @@ func validateCronTask(_ *config.Config, task config.CronTask) error {
 		return nil
 	}
 	if err := cron.ValidateSpec(task.Cron); err != nil {
+		if errors.Is(err, cron.ErrEveryTooShort) {
+			return fmt.Errorf("%s；最密可设为每分钟一次（@every 1m 或 * * * * *）", err.Error())
+		}
 		return fmt.Errorf("cron 表达式无法解析（%s）：标准格式为 5 段「分 时 日 月 周」，"+
 			"例如 0 3 * * * 表示每天 03:00", err.Error())
+	}
+	return nil
+}
+
+// validateDDNS 校验动态域名规则保存请求。
+//
+// 原先这一类资源一项都不查：界面上的限制（间隔至少 30 秒、记录类型只有 A / AAAA、
+// 每个目标必须选凭证、填主域名、至少一条主机记录）绕过前端直接调接口就全部失效，
+// 而域名与主机记录会被原样拼进服务商 API 的请求路径。写法层面的判定在 ddns.ValidateRule
+// （运行期动手前也用它）；这里再补上要看整份配置的那一条——凭证得真的存在。
+//
+// **只在启用时校验**，与 validateCronTask 同口径：列表上的开关走的是整行 PUT，
+// 一份从备份导入或手改进来的坏规则若连"关掉"都被拦下，就成了走不出去的死角。
+// 停用中的规则不参与调度；手动「立即执行」时运行期那道 ValidateRule 仍然兜着。
+func validateDDNS(cfg *config.Config, r config.DDNSRule) error {
+	if !r.Enabled {
+		return nil
+	}
+	if len(r.Targets) == 0 {
+		return fmt.Errorf("至少需要一个更新目标")
+	}
+	if err := ddns.ValidateRule(r); err != nil {
+		return err
+	}
+	creds := make(map[string]bool, len(cfg.Credentials))
+	for i := range cfg.Credentials {
+		creds[cfg.Credentials[i].ID] = true
+	}
+	for i, t := range r.Targets {
+		if ref := strings.TrimSpace(t.CredentialRef); ref == "" || !creds[ref] {
+			return fmt.Errorf("第 %d 个更新目标：所选的域名服务商凭证不存在，请重新选择", i+1)
+		}
+		named := t.AllowRoot
+		for _, s := range t.Subdomains {
+			if s = strings.TrimSpace(s); s != "" && s != "@" {
+				named = true
+				break
+			}
+		}
+		if !named {
+			return fmt.Errorf("第 %d 个更新目标：既没有填主机记录，也没有允许更新根域名", i+1)
+		}
 	}
 	return nil
 }
@@ -1209,6 +1256,7 @@ func (s *Server) registerResourceRoutes(g *gin.RouterGroup) {
 		modLabel: "动态域名DDNS",
 		enabled:  func(t *config.DDNSRule) bool { return t.Enabled },
 		itemName: func(t *config.DDNSRule) string { return t.Name },
+		validate: validateDDNS,
 		// 条数上限：每条启用中的规则各占一条常驻协程，且每一拍都向外发请求（原因见 config.MaxDDNSRules）。
 		maxCount: config.MaxDDNSRules,
 		// 启用/禁用时一并记录所管理的域名，便于审计「启用 动态域名 下 规则（域名：…）」。

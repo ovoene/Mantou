@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { onActivated, ref, reactive } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Key, Upload } from '@element-plus/icons-vue'
 import PageCard from '@/components/PageCard.vue'
 import RowActions from '@/components/RowActions.vue'
@@ -11,9 +11,12 @@ import { usePolling } from '@/composables/usePolling'
 import { useResource } from '@/composables/useResource'
 import { useCloseOnLeave } from '@/composables/useCloseOnLeave'
 import { actions, credentialsApi } from '@/api/resources'
+import { ApiError } from '@/api/client'
+import { useAuthStore } from '@/stores/auth'
 import { currentLocale } from '@/i18n'
 
 const { t } = useI18n()
+const auth = useAuthStore()
 
 // 窄屏时操作列只剩一个「更多」按钮，列宽跟着收窄，省下的宽度留给前面几列。
 const narrow = useNarrow()
@@ -241,10 +244,31 @@ function download(name: string, text: string) {
 // 导出的 .pem / .key 原样贴回（或选文件）就能在另一台机器上还原同一张证书。
 // 分成两个文件而不是拼成一个：绝大多数服务端（nginx / 也包括本模块的导入）
 // 要的就是分开的证书链与私钥，拼在一起用户还得自己剪。
+//
+// 私钥要当场验一次当前密码（后端 handleExportCertWithKey）：一份带走的私钥能一直冒充这个域名，
+// 会话撤了、密码改了都收不回来。弹框里「只导出证书」直接走不带私钥的那条路；
+// 点右上角关闭或按 Esc 则什么都不导。
 async function exportCert(row: Cert) {
   const base = (row.name || 'certificate').replace(/[\\/:*?"<>|]/g, '_')
+  let password = ''
   try {
-    const result = await actions.exportCert(row.id!)
+    const r = await ElMessageBox.prompt(t('cert.exportKeyPwd'), t('cert.export'), {
+      inputType: 'password',
+      confirmButtonText: t('cert.exportWithKey'),
+      cancelButtonText: t('cert.exportCertOnly'),
+      distinguishCancelAndClose: true,
+      inputValidator: (v: string) => (v && v.length > 0) || t('common.required'),
+    })
+    password = r.value || ''
+  } catch (action) {
+    if (action !== 'cancel') return // 关闭 / Esc：用户不想导出了
+  }
+  if (!password) {
+    await exportCertOnly(row, base, 'cert.exportedCertOnly', 'success')
+    return
+  }
+  try {
+    const result = await actions.exportCertWithKey(row.id!, auth.username, password)
     download(`${base}.pem`, result.certPem)
     if (result.keyPem) {
       download(`${base}.key`, result.keyPem)
@@ -252,16 +276,28 @@ async function exportCert(row: Cert) {
     } else {
       ElMessage.warning(t('cert.exportedNoKey'))
     }
-  } catch {
-    // 带私钥读不出来时后端是整个请求报错（比如 path 方式只填了证书路径），
-    // 但只有半边也总比什么都拿不到好：退回去只导证书，并说清少了什么。
-    try {
-      const only = await actions.exportCert(row.id!, false)
-      download(`${base}.pem`, only.certPem)
-      ElMessage.warning(t('cert.exportedNoKey'))
-    } catch (e2: any) {
-      ElMessage.error(e2?.message || t('common.failed'))
+  } catch (e: any) {
+    // 密码不对（403）或验得太频繁（429）：照实说，不要悄悄退回只导证书——
+    // 那样用户会以为私钥读不出来，而真正的原因是他输错了密码。
+    if (e instanceof ApiError && (e.status === 403 || e.status === 429)) {
+      ElMessage.error(e.message || t('common.failed'))
+      return
     }
+    // 其余情况多半是私钥那半边读不出来（比如 path 方式只填了证书路径），
+    // 但只有半边也总比什么都拿不到好：退回去只导证书，并说清少了什么。
+    await exportCertOnly(row, base, 'cert.exportedNoKey', 'warning')
+  }
+}
+
+// exportCertOnly 只导出证书那一个文件；note / type 是导出成功后给用户的那句提示：
+// 用户自己选了只导证书是 success，想要私钥却没拿到是 warning。
+async function exportCertOnly(row: Cert, base: string, note: string, type: 'success' | 'warning') {
+  try {
+    const only = await actions.exportCert(row.id!)
+    download(`${base}.pem`, only.certPem)
+    ElMessage({ type, message: t(note) })
+  } catch (e2: any) {
+    ElMessage.error(e2?.message || t('common.failed'))
   }
 }
 

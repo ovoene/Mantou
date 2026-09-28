@@ -26,6 +26,9 @@ var specCases = []struct {
 	{"0 3 1 * *", true},       // monthly
 	{"0 3 * * 1,5", true},     // weekly 多选
 	{"@every 1h", true},       // 描述符：robfig 的标准解析器收它，所以我们也得收
+	{"@every 1m", true},       // @every 的下限正好是 1 分钟，与「每分钟」档位同一粒度
+	{"@every 1s", false},      // 但不许比那更密：每秒一次的 HTTP 动作 / 续期重试是在对外刷请求
+	{"@every 59s", false},     //
 	{"@daily", true},          //
 	{" 0 3 * * * ", true},     // 首尾空格无害（robfig 用 strings.Fields 切）
 	{"", false},               // 空串：「自定义」那一档没填就是这个

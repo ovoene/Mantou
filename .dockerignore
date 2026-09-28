@@ -41,8 +41,13 @@ master.key
 **/*.p12
 **/*.pfx
 
+# 面板「设置 → 导出配置」下载的备份：全部配置、凭据与证书私钥（加密封装），同 .gitignore
+**/Mantou-*.json
+
 # ---- 运行期数据 ----
+# 不限层级，理由同 .gitignore（默认数据目录是「当前目录下的 data」）
 data
+**/data
 .devrun
 **/*.log
 

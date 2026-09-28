@@ -127,9 +127,15 @@ type Server struct {
 	backupMu   sync.Mutex
 	restartMu  sync.Mutex
 	restarting bool
+	// selfUpdateMu 让自更新串行：同一时刻只处理一个更新包（见 handleSelfUpdate）。
+	// 验签与"改名覆盖"之间隔着冒烟测试与备份，这段时间里若另一个请求能碰到同一个
+	// 候选文件，验过签的就未必是最后装上去的那一份。
+	selfUpdateMu sync.Mutex
 	// bodyLimits 上传型路由的请求体上限，键是 gin 的完整路由（含访问路径前缀）。
 	// 由 registerUpload 在注册路由时填入；其余路由用 panelBodyLimit。
 	bodyLimits map[string]int64
+	// publicIP 总览页「外网 IP」卡片的缓存与检测调度（见 publicip.go）。零值可用。
+	publicIP publicIPWatch
 	// resourceCaps 各资源的条数上限，键是资源名（"ddns"、"certs"…）。
 	// 由 registerCRUD 在注册路由时填入，之后只读（注册跑在开始服务之前，没有并发写）。
 	//
@@ -285,6 +291,7 @@ func (s *Server) registerRoutes(r *gin.Engine) {
 
 			authed.GET("/overview", s.handleOverview)
 			authed.GET("/overview/series", s.handleSeries)
+			authed.POST("/overview/public-ip/refresh", s.handlePublicIPRefresh)
 			authed.GET("/logs", s.handleLogs)
 
 			authed.GET("/settings", s.handleGetSettings)

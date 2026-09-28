@@ -330,10 +330,15 @@ jobs:
           UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
         run: |
           if [ -n "$UPDATE_SIGNING_KEY" ]; then
-            printf '%s' "$UPDATE_SIGNING_KEY" > update-signing.key
+            # 私钥只落在 runner 的临时目录、权限 600，签完（或中途失败）立即删掉。
+            # 不写进工作区：那里是后面「打包」「上传产物」两步的起点，私钥不该和产物待在
+            # 同一个目录里——哪天有人把打包或上传的文件模式放宽一点，它就跟着出去了。
+            KEY_FILE="$RUNNER_TEMP/update-signing.key"
+            trap 'rm -f "$KEY_FILE"' EXIT
+            (umask 077 && printf '%s' "$UPDATE_SIGNING_KEY" > "$KEY_FILE")
             mkdir -p bin
             go build -trimpath -mod=readonly -o bin/updsign ./cmd/updsign
-            bin/updsign sign -key update-signing.key dist/mantou dist/mantou.sig
+            bin/updsign sign -key "$KEY_FILE" dist/mantou dist/mantou.sig
           else
             echo "未配置 UPDATE_SIGNING_KEY，生成未签名更新包（自更新验签将被跳过）"
           fi

@@ -266,6 +266,8 @@ export interface DryRunResult {
   // 既要知道"这条会被拦"，也要看到"不拦的话会发出什么"。
   blocked?: boolean
   blockedReason?: string
+  // rootTooDeep 这条载荷嵌套层数过深，root 没有下发（后端 maxRootDepth）；其余结果照常。
+  rootTooDeep?: boolean
 }
 
 // 元数据由后端下发：算子、模板函数、内置字段名、上限与默认值。
@@ -341,6 +343,8 @@ export interface TemplatePreviewResult {
   sniffed?: string
   // receiver 实际借用的接收器名；为空表示没挑接收器。
   receiver?: string
+  // rootTooDeep 样本嵌套层数过深，root 没有下发（后端 maxRootDepth）。
+  rootTooDeep?: boolean
 }
 
 export interface WebhookMeta {

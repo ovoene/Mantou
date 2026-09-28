@@ -33,6 +33,9 @@ func (s *Server) handleOverview(c *gin.Context) {
 		"info":     info,
 		"statuses": statuses,
 		"version":  version.Load().Version,
+		// 外网 IP 的检测也由这一次轮询顺带触发（只在有人看总览时才去取，见 publicip.go）。
+		// 它从不等检测结束：取的是缓存，到期了才在后台起一轮。
+		"publicIp": s.publicIP.view(),
 	}
 	if hasLatest {
 		resp["latest"] = latest
@@ -472,9 +475,34 @@ func (s *Server) handleUpdateSettings(c *gin.Context) {
 	// 用 before 判"当前有没有窗口"，与下面 Update 闭包里的记时判定是同一个口径；
 	// 两者之间的并发窗口不影响结论：并发的两次打开里至多一次会记起点，而两次都过了口令。
 	unsignedNow := time.Now()
-	if req.Update != nil && req.Update.AllowUnsignedUpdate != nil && *req.Update.AllowUnsignedUpdate &&
-		!before.Update.UnsignedUpdateAllowed(unsignedNow) {
-		// 这次校验与另外五处「已登录之后再验一次当前密码」共用一份失败计数（见 reauth.go）。
+	openingUnsigned := req.Update != nil && req.Update.AllowUnsignedUpdate != nil && *req.Update.AllowUnsignedUpdate &&
+		!before.Update.UnsignedUpdateAllowed(unsignedNow)
+
+	// 更换「自更新包签名公钥」同样要当场再验一次管理员口令。
+	//
+	// 配了公钥之后，上传更新包就不再问密码——签名本身即授权（见 handleSelfUpdate）。
+	// 于是"信任哪一把公钥"与上面那个开关是同一个量级：这一项原先只凭会话就能改，
+	// 一条被盗的会话先把公钥换成自己的，再拿自己的私钥签一个包上传，就能不问密码地
+	// 把面板二进制换掉——为未验签开关设的那道口令复核被整个绕了过去。
+	//
+	// 只在"换成一把新的非空公钥"时要求：清空是在收紧（之后要么再配一把、要么打开未验签
+	// 开关，两条路都要过口令）；原样回传同一把（设置页每次保存都会带上它）也不该打扰人。
+	// 格式在这里一并校验：一把解不开的公钥存下去，之后每一次上传都会以"签名公钥格式无效"
+	// 被拒，而用户要到那时才知道是这里填错了。
+	signKeyChanging := false
+	if req.Update != nil && req.Update.SignKey != nil {
+		if newKey := strings.TrimSpace(*req.Update.SignKey); newKey != "" &&
+			newKey != strings.TrimSpace(before.Update.SignKey) {
+			if verr := checkUpdateSignKey(newKey); verr != nil {
+				respondError(c, http.StatusBadRequest, verr.Error())
+				return
+			}
+			signKeyChanging = true
+		}
+	}
+
+	if openingUnsigned || signKeyChanging {
+		// 这次校验与另外几处「已登录之后再验一次当前密码」共用一份失败计数（见 reauth.go）。
 		//
 		// 闸只包住这一支、不放在处理器开头：这个接口保存的是整页设置，其中绝大多数改动
 		// 根本不问密码，把闸提到外面就变成"在别处猜错几次密码，连主题色都改不了"。
@@ -484,13 +512,23 @@ func (s *Server) handleUpdateSettings(c *gin.Context) {
 		if !s.reauthAllowed(c) {
 			return
 		}
+		defer s.reauthDone(c)
 		if !adminCredentialsOK(before.Auth, req.Update.Account, req.Update.Password) {
 			s.reauthFail(c)
 			// 403 而非 401：401 会让前端拦截器强制登出跳登录页，而这里只是这一项改动的
 			// 凭据没对上，应当停在设置页提示（与 handleExportConfig 同）。
-			s.deps.Log.Warn("设置：打开「允许未验签的更新包」的身份复核失败，已拒绝",
-				"operator", operator(c), "ip", c.ClientIP())
-			respondError(c, http.StatusForbidden, "账户或密码错误，「允许未验签的更新包」未打开")
+			logMsg, respMsg := "设置：打开「允许未验签的更新包」的身份复核失败，已拒绝",
+				"账户或密码错误，「允许未验签的更新包」未打开"
+			switch {
+			case signKeyChanging && openingUnsigned:
+				logMsg = "设置：更换更新包签名公钥并打开「允许未验签的更新包」的身份复核失败，已拒绝"
+				respMsg = "账户或密码错误，更新包签名公钥与「允许未验签的更新包」均未修改"
+			case signKeyChanging:
+				logMsg = "设置：更换更新包签名公钥的身份复核失败，已拒绝"
+				respMsg = "账户或密码错误，更新包签名公钥未修改"
+			}
+			s.deps.Log.Warn(logMsg, "operator", operator(c), "ip", c.ClientIP())
+			respondError(c, http.StatusForbidden, respMsg)
 			return
 		}
 		s.reauthOK(c)
@@ -679,6 +717,18 @@ func (s *Server) handleUpdateSettings(c *gin.Context) {
 	// 面板二进制换掉」，事后要查得到是谁在什么时候打开的、有效到几点。
 	// 打开用 Warn（这是一段主动放宽的时间），关闭用 Info。
 	//
+	// 签名公钥的更换同理：它决定"谁签的包可以不问密码就换掉面板二进制"。
+	// 只记指纹不记原文——公钥本身不是秘密，但一行定长的指纹更方便与 updsign 打印的那串比对。
+	if strings.TrimSpace(before.Update.SignKey) != strings.TrimSpace(after.Update.SignKey) {
+		if key := strings.TrimSpace(after.Update.SignKey); key != "" {
+			s.deps.Log.Warn("设置：已更换自更新包签名公钥",
+				"operator", operator(c), "ip", c.ClientIP(), "fingerprint", signKeyFingerprint(key))
+		} else {
+			s.deps.Log.Info("设置：已清空自更新包签名公钥",
+				"operator", operator(c), "ip", c.ClientIP())
+		}
+	}
+
 	// 判据同时看布尔值与起点：重新打开一段已过期的窗口时布尔值没变，只有起点在动。
 	if before.Update.AllowUnsignedUpdate != after.Update.AllowUnsignedUpdate ||
 		before.Update.AllowUnsignedSince != after.Update.AllowUnsignedSince {

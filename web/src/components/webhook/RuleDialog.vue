@@ -6,6 +6,7 @@ import ConditionEditor from './ConditionEditor.vue'
 import BranchEditor from './BranchEditor.vue'
 import FieldTree from './FieldTree.vue'
 import { buildFieldTree, collectPaths, parseSample } from '@/composables/fieldPaths'
+import { copyText } from '@/composables/copyText'
 import type {
   MessageTemplate,
   NotifyTarget,
@@ -138,13 +139,9 @@ function setBranches(v: RuleBranch[]) {
 }
 
 async function copy(text: string) {
-  try {
-    await navigator.clipboard.writeText(text)
-    ElMessage.success(t('mroute.copied'))
-  } catch {
-    // 非 HTTPS 页面下 clipboard 不可用，此时提示用户手动复制而不是静默失败。
-    ElMessage.warning(t('mroute.copyFail'))
-  }
+  // http 页面、clipboard 被拒时都有退路（见 copyText），两条路都不通才提示手动复制。
+  if (await copyText(text)) ElMessage.success(t('mroute.copied'))
+  else ElMessage.warning(t('mroute.copyFail'))
 }
 </script>
 

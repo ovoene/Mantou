@@ -12,7 +12,7 @@
 # ============================================================================
 
 APP        := mantou
-VERSION    ?= Ver 1.0.9
+VERSION    ?= Ver 1.0.10
 DATA_DIR   ?= ./data
 # 编译时间（默认本地时间），构建时写入 internal/version/gen.go，供「关于」页展示；
 # 可覆盖：make build BUILD_TIME="2026-08-13 12:00:00"
@@ -43,13 +43,27 @@ GOARCH     ?=
 # 输出目录
 BIN_DIR    := bin
 
-.PHONY: all web build build-go run dev tidy docker clean fmt vet check package
+# 更新包文件名里用的版本号：空格换成下划线（与 package.bat 的 ARCHIVE_VER 同一个做法）。
+# VERSION 是 "Ver 1.0.9"，原样拼进文件名会被 shell 拆成两个参数——tar 于是把包写进一个
+# 叫 mantou-Ver 的文件（没有扩展名，两个架构互相覆盖），而这个名字不在 .gitignore 里，
+# 下一次 release.sh 的 git add -A 就会把它提交上 GitHub。
+empty       :=
+space       := $(empty) $(empty)
+ARCHIVE_VER := $(subst $(space),_,$(VERSION))
+
+.PHONY: all web web-ci build build-go compile-go run dev tidy docker clean fmt vet check package
 
 all: build
 
 ## 构建前端产物（web/dist）
 web:
 	cd web && $(NPM) install && $(NPM) run build:only
+
+## 同上，但按 package-lock.json 原样安装（npm ci），不改写锁文件。打包走这一条：
+## npm install 可能顺手改写 package-lock.json，而 release.sh 是 git add -A 提交的，
+## 打一次包就可能把一份没人审过的依赖变更带上 GitHub。
+web-ci:
+	cd web && $(NPM) ci && $(NPM) run build:only
 
 ## 补全 Go 依赖与 go.sum
 tidy:
@@ -71,17 +85,25 @@ build: web tidy write-version
 	@echo "已生成 $(BIN_DIR)/$(APP)"
 
 ## 仅编译后端（复用已有 web/dist）；GOOS/GOARCH 留空则本机。
-build-go: tidy write-version
-	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -trimpath -ldflags "-s -w" -o $(BIN_DIR)/$(APP) ./cmd/mantou
+build-go: tidy compile-go
+
+## 编译后端本体，不碰 go.mod / go.sum：-mod=readonly 让清单不一致时直接报错，而不是被静默"修好"。
+## 打包走这一条（不经 tidy）：更新包必须由仓库里提交的那份依赖清单编出来，与 CI、Dockerfile 一致。
+compile-go: write-version
+	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -trimpath -mod=readonly -ldflags "-s -w" -o $(BIN_DIR)/$(APP) ./cmd/mantou
 	@rm -f internal/version/gen.go
 
 ## 打包为可被「上传更新包」消费的 tar.gz 更新包（默认双架构 amd64 + arm64）。
 ## 每个包内部仅含名为 mantou 的可执行文件（与 api_update.go 的 extractExecutable 约定一致）。
 ## 产物直接输出到当前目录（PKG_DIR，默认 .），bin/ 仅作中间二进制暂存。
 ## 一键执行：make package；单架构：make package PKG_GOARCH=arm64；指定输出目录：make package PKG_DIR=dist。
-package: web
+##
+## 打包全程不改写任何受版本管理的文件（npm ci、不 tidy、-mod=readonly），理由见 web-ci / compile-go。
+## 循环带 set -e：任何一步失败立刻停下。否则编译失败之后仍会接着签名、打包 bin/ 里上一次
+## 留下的旧二进制，而包名写的却是这一次的版本号。
+package: web-ci
 	@mkdir -p $(BIN_DIR)
-	@$(GO) build -trimpath -o $(BIN_DIR)/updsign ./cmd/updsign
+	@$(GO) build -trimpath -mod=readonly -o $(BIN_DIR)/updsign ./cmd/updsign
 	@if [ ! -f update-signing.key ]; then \
 		echo "== 生成自更新签名密钥对 =="; \
 		$(BIN_DIR)/updsign gen; \
@@ -91,11 +113,12 @@ package: web
 	else \
 		echo "使用已有签名私钥 update-signing.key"; \
 	fi
-	@for arch in $(PKG_ARCHS); do \
-		$(MAKE) --no-print-directory build-go GOOS=$(PKG_GOOS) GOARCH=$$arch; \
-		$(BIN_DIR)/updsign sign -key update-signing.key $(BIN_DIR)/$(APP) $(BIN_DIR)/$(APP).sig; \
-		tar -czf $(PKG_DIR)/$(APP)-$(VERSION)-$(PKG_GOOS)-$$arch.tar.gz -C $(BIN_DIR) $(APP) $(APP).sig; \
-		echo "已生成 $(PKG_DIR)/$(APP)-$(VERSION)-$(PKG_GOOS)-$$arch.tar.gz（可被「设置/关于 → 上传更新包」消费）"; \
+	@set -e; for arch in $(PKG_ARCHS); do \
+		$(MAKE) --no-print-directory compile-go GOOS=$(PKG_GOOS) GOARCH=$$arch; \
+		"$(BIN_DIR)/updsign" sign -key update-signing.key "$(BIN_DIR)/$(APP)" "$(BIN_DIR)/$(APP).sig"; \
+		out="$(PKG_DIR)/$(APP)-$(ARCHIVE_VER)-$(PKG_GOOS)-$$arch.tar.gz"; \
+		tar -czf "$$out" -C "$(BIN_DIR)" $(APP) $(APP).sig; \
+		echo "已生成 $$out（可被「设置/关于 → 上传更新包」消费）"; \
 	done
 
 ## 本地运行

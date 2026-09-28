@@ -12,13 +12,14 @@ import (
 
 // 本文件是「已经登录了，再把当前密码交一遍」这件事的共享失败计数。
 //
-// 六条路在做同一件事，理由也一样——光持有一条会话不够，动手之前得证明知道当前密码：
+// 这几条路在做同一件事，理由也一样——光持有一条会话不够，动手之前得证明知道当前密码：
 //   - 加密导出（handleExportConfig）
 //   - 导入备份前的本机管理员校验（handleImportConfig）
 //   - 敏感操作前的预检（handleVerifyIdentity）
 //   - 改账户名 / 改密码时的旧密码（handleChangeAccount）
-//   - 打开「允许未验签的更新包」那一次提交（handleUpdateSettings）
+//   - 打开「允许未验签的更新包」、或更换更新包签名公钥的那一次提交（handleUpdateSettings）
 //   - 未验签的更新包上传（handleSelfUpdate）
+//   - 连私钥一起导出证书（handleExportCertWithKey）
 //
 // 之前这几处都不计数，理由写在 handleVerifyIdentity 上：只给其中一条加限制，攻击者换另一条
 // 接着试，界面上却多出一处会把人锁住的地方。那句话的另一半是「真要限，得几处一起限」，
@@ -59,10 +60,21 @@ func (s *Server) reauth() *loginLimiter {
 	s.reauthOnce.Do(func() {
 		if s.reauthLimiter == nil {
 			s.reauthLimiter = newLoginLimiter(reauthMaxFails, reauthWindow, reauthLockFor)
+			// 导入与未验签上传是"先收完请求体、再验密码"的：名额从处理器开头一直占到验完为止，
+			// 而这两条路的请求截止时间放宽到了 30 分钟（见 extendRequestDeadlines 的调用处）。
+			// 安全网得比那更长，否则一次慢速上传的名额会在验密码之前就被当成漏还作废。
+			s.reauthLimiter.pendingTTL = reauthPendingTTL
 		}
 	})
 	return s.reauthLimiter
 }
+
+// reauthPendingTTL 复核名额的存活上限，见上面 reauth() 里那段说明与 defaultPendingTTL。
+const reauthPendingTTL = 45 * time.Minute
+
+// ctxReauthHeld 标记"这个请求占着一个复核名额、还没出结论"。
+// reauthAllowed 放行时写上，reauthFail / reauthOK 收尾时清掉，reauthDone 据它决定要不要归还。
+const ctxReauthHeld = "reauthHeld"
 
 // reauthKey 取这次请求的计数键：会话令牌的哈希，取不到令牌时退回来源 IP。
 //
@@ -83,11 +95,18 @@ func (s *Server) reauthKey(c *gin.Context) string {
 // reauthAllowed 在跑 bcrypt 之前问一次：这条会话还能不能再试。
 // 不能就地回 429（带 Retry-After）并返回 false，调用方直接 return。
 //
+// 能试的话**同时占下一个名额**（见 loginLimiter.Acquire）：原先这里只问不占，
+// 放行与记账之间隔着一次 bcrypt，一条被盗的会话把几百个请求同时打进来，
+// 它们全在第一条失败落账之前通过了检查——「15 次就锁」约束不了一次并发突发。
+// 放行之后调用方必须 `defer s.reauthDone(c)`，名额由 reauthFail / reauthOK 收尾，
+// 提前 return 的那些支路则由 reauthDone 归还。
+//
 // 429 而不是 401/403：401 会被前端拦截器当成会话失效、把人强制登出，而这里的会话是好的；
 // 403 会被读成"密码又错了"，于是用户一直重试，把锁定时间白白耗过去。
 func (s *Server) reauthAllowed(c *gin.Context) bool {
-	ok, retry := s.reauth().Allowed(s.reauthKey(c))
+	ok, retry := s.reauth().Acquire(s.reauthKey(c))
 	if ok {
+		c.Set(ctxReauthHeld, true)
 		return true
 	}
 	c.Header("Retry-After", strconv.Itoa(retry))
@@ -95,14 +114,25 @@ func (s *Server) reauthAllowed(c *gin.Context) bool {
 	return false
 }
 
+// reauthDone 归还一个还没出结论的复核名额（请求在验密码之前就结束了：参数不对、
+// 上传读失败……）。已经由 reauthFail / reauthOK 收过尾的请求，这里什么都不做。
+func (s *Server) reauthDone(c *gin.Context) {
+	if held, _ := c.Get(ctxReauthHeld); held == true {
+		c.Set(ctxReauthHeld, false)
+		s.reauth().Release(s.reauthKey(c))
+	}
+}
+
 // reauthFail 记一次失败。各处的调用都贴在各自「密码不对」那一支里，
 // 只加计数，不改任何一处原有的状态码与文案。
 func (s *Server) reauthFail(c *gin.Context) {
+	c.Set(ctxReauthHeld, false)
 	s.reauth().Fail(s.reauthKey(c))
 }
 
 // reauthOK 密码验对了就把这条会话的失败史清掉：一次正确的密码说明持有者是本人，
 // 前面那几次多半是打错字。攻击者猜中时当然也会清，但那一刻计数已经不重要了。
 func (s *Server) reauthOK(c *gin.Context) {
+	c.Set(ctxReauthHeld, false)
 	s.reauth().Reset(s.reauthKey(c))
 }

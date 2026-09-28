@@ -82,6 +82,15 @@ func (m *Module) worker() {
 func (m *Module) run(t *task) {
 	defer m.depth.Add(-1)
 
+	if reason := m.refresh(t); reason != "" {
+		// 目标已经投不了了：这条链到此为止，记一条最终失败，不再重试。
+		m.release(t)
+		r := failedResult(t.req, t.target.cfg.ID, t.target.cfg.Name, t.target.cfg.Type, reason)
+		r.Attempt = t.attempt
+		m.report(r)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), timeoutOf(t.target.cfg))
 	res := m.deliver(ctx, t)
 	cancel()
@@ -96,6 +105,44 @@ func (m *Module) run(t *task) {
 	res.Retrying = true
 	m.report(res)
 	m.scheduleRetry(t)
+}
+
+// refresh 投递前把任务换成当前的目标配置；目标已经投不了时返回放弃的原因。
+//
+// 任务里那份目标是入队时的快照，而从入队到真正投出去之间隔着排队，重试更是隔着最长
+// 一分钟的退避——这期间用户可能改了地址、禁用或删掉了这个目标，或者打开了「禁止访问
+// 内网」。照着快照投，就是删掉的目标还在收消息、刚改对的地址用不上、刚打开的内网防护
+// 管不到这几条。所以每一次投递前都按 ID 重新取一次。
+//
+// 自定义 HTTP 的请求体是唯一换不过来的：它在入队时就按当时的模板渲染好了，事件数据
+// 随即释放（见 prepareQueued），没法按新模板重渲。模板被改过的，这条按旧模板准备的
+// 消息只能放弃——把旧模板的产物发给按新模板等着的接收端，比明确放弃更糟。
+func (m *Module) refresh(t *task) string {
+	m.mu.RLock()
+	cur, ok := m.targets[t.target.cfg.ID]
+	blockPrivate := m.blockPrivate
+	m.mu.RUnlock()
+	switch {
+	case !ok:
+		return "目标不存在（可能已被删除）"
+	case !cur.cfg.Enabled:
+		return "目标已禁用"
+	}
+	t.blockPrivate = blockPrivate
+	if cur == t.target {
+		return ""
+	}
+	old := t.target.cfg
+	if cur.cfg.Type == "http" && cur.cfg.BodyTemplate != "" &&
+		(old.Type != "http" || old.BodyTemplate != cur.cfg.BodyTemplate) {
+		return "目标的请求体模板在排队期间被修改，这条按旧模板准备的消息已放弃"
+	}
+	if cur.cfg.Type != "http" || cur.cfg.BodyTemplate == "" {
+		// 新配置用不上预渲染的请求体（改成了默认请求体，或者压根不是自定义 HTTP 了）。
+		t.body = nil
+	}
+	t.target = cur
+	return ""
 }
 
 // timeoutOf 单次投递的超时。配置里的 0 已由 normalizeNotifyTarget 兜成默认值，

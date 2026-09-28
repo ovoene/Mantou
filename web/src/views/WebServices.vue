@@ -1027,7 +1027,7 @@ useCloseOnLeave(logsVisible)
 
     <!-- 连接日志对话框 -->
     <el-dialog v-model="logsVisible" :title="t('webservice.logsTitle')" width="min(1000px, 94vw)" append-to-body :close-on-click-modal="false">
-      <p class="mt-subtle hint-block">{{ logsTitle }}</p>
+      <p class="mt-subtle hint-block logs-sub">{{ logsTitle }}</p>
       <el-table :data="logsData" v-loading="logsLoading" size="small" :empty-text="t('webservice.noLogs')">
         <el-table-column :label="t('webservice.logTime')" width="170">
           <template #default="{ row }">{{ fmtLogTime(row.time) }}</template>
@@ -1175,6 +1175,15 @@ useCloseOnLeave(logsVisible)
 .hint-block {
   font-size: 12px;
   margin: -4px 0 10px;
+}
+/* 连接日志弹窗的副标题（父项 / 子项）用的是同一套说明文字样式，但必须去掉那 -4px。
+ * hint-block 的负上边距是为了让说明贴住它上面的那个控件，前提是上面真有东西可贴；
+ * 这个 p 是 .el-dialog__body 的第一个子元素，上面什么都没有，-4px 只会把它顶到
+ * body 的上边界之外——而 body 是 overflow: auto，露到外面的那 4px 直接被裁掉，
+ * 15px 的行盒少了 4px，字的顶端就被削掉一截。
+ * 写成 .hint-block.logs-sub 是为了不依赖两条单类选择器的先后顺序。 */
+.hint-block.logs-sub {
+  margin-top: 0;
 }
 /* 连接日志：来源列 IP 淡蓝（与总览程序日志一致），请求列仅事件类型；被 IP 规则拒绝的行整格标红。 */
 .ws-log-ip {

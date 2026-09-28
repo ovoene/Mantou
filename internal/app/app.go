@@ -156,16 +156,15 @@ func Build(log *logx.Logger, cfgMgr *config.Manager, dataDir string) *App {
 }
 
 // ReloadAll 用当前配置重载全部模块。
+//
+// 配置在重载锁**之内**现取（见 module.Manager.ReloadLatest）：接口层每次保存都会同步调到这里，
+// 并发的两次保存若各自先取配置再排队，后排上的那次可能带着更旧的配置，把模块改回去。
+//
+// 拿不到配置副本（Get 返回 nil）就**不重载**：模块继续按上一份已知良好的配置跑。
+// 这里没有比"什么都不做"更安全的选择——把空配置交给重载会让每个模块
+// 都按"用户什么都没配"重建，等于一次配置读取失败把所有对外服务停掉。
 func (a *App) ReloadAll() {
-	cfg := a.CfgMgr.Get()
-	if cfg == nil {
-		// 拿不到配置副本就**不重载**：模块继续按上一份已知良好的配置跑。
-		// 这里没有比"什么都不做"更安全的选择——把空配置交给 ReloadAll 会让每个模块
-		// 都按"用户什么都没配"重建，等于一次配置读取失败把所有对外服务停掉。
-		logx.L().Error("读取配置失败，跳过模块重载")
-		return
-	}
-	a.Modules.ReloadAll(cfg)
+	a.Modules.ReloadLatest(a.CfgMgr.Get)
 }
 
 // CloseAll 关闭全部模块。

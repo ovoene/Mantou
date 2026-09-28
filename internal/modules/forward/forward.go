@@ -356,6 +356,8 @@ type runner struct {
 
 	tcpLn   net.Listener
 	udpConn *net.UDPConn
+	// udpIdle UDP 会话的空闲超时，取 udpIdleTimeout；做成字段只为让测试能把它调短。
+	udpIdle time.Duration
 
 	failed         atomic.Bool
 	activeConns    atomic.Int64 // 当前活跃 TCP 连接数，用于并发上限判定
@@ -375,6 +377,7 @@ func newRunner(rule config.ForwardRule, log *logx.Logger, conns *connGate) *runn
 		conns:     conns,
 		ctx:       ctx,
 		cancel:    cancel,
+		udpIdle:   udpIdleTimeout,
 	}
 }
 
@@ -615,7 +618,25 @@ func (r *runner) startUDP() error {
 // udpSession 记录一个客户端地址到后端连接的映射。
 type udpSession struct {
 	upstream *net.UDPConn
-	lastSeen time.Time
+	// lastSeen 最近一次有数据报经过这条会话的时间（UnixNano），**两个方向都算**。
+	//
+	// 只算客户端发来的那一侧是不够的：客户端发一个请求、之后由后端持续往回推的用法
+	// （订阅一类的推送、单向的媒体流），客户端那一侧一安静，会话就会在推送途中被当成
+	// 空闲摘掉；反过来只往后端送、后端从不回话的用法（日志、指标上报），会话则每隔一个
+	// 空闲周期被拆掉重建一次，后端看到的来源端口随之跳变。与常见 NAT 的会话表同一个口径：
+	// 任一方向有数据就算活着。
+	//
+	// 用原子量而不是锁：它由 serveUDP 的读循环与 udpReturn 两个协程各自刷新，
+	// 回包方向为此每个数据报去抢一次会话表的锁并不值得。
+	lastSeen atomic.Int64
+}
+
+// touch 记一次数据报经过。
+func (s *udpSession) touch() { s.lastSeen.Store(time.Now().UnixNano()) }
+
+// idleFor 距离最近一次数据报经过有多久了。
+func (s *udpSession) idleFor() time.Duration {
+	return time.Since(time.Unix(0, s.lastSeen.Load()))
 }
 
 // udpBufPool 复用 UDP 数据报缓冲。64 KiB 是单个数据报的理论上限，不能取更小值，
@@ -669,7 +690,7 @@ func (r *runner) serveUDP(conn *net.UDPConn) {
 	// 而 stop() 的语义是"返回之后这条规则不再动任何共享状态"。不挂的话 wg.Wait 早早返回，
 	// 而它还在后面跑一小会儿——Close() 之后仍有人往总闸上还名额，这类竞态在测试里
 	// 表现为"名额数偶尔不对"，在线上则是查不出来的偶发。
-	ticker := time.NewTicker(udpIdleTimeout)
+	ticker := time.NewTicker(r.udpIdle)
 	defer ticker.Stop()
 	r.wg.Add(1)
 	go func() {
@@ -681,7 +702,7 @@ func (r *runner) serveUDP(conn *net.UDPConn) {
 			case <-ticker.C:
 				smu.Lock()
 				for k, s := range sessions {
-					if time.Since(s.lastSeen) > udpIdleTimeout {
+					if s.idleFor() > r.udpIdle {
 						dropLocked(k, s)
 					}
 				}
@@ -735,14 +756,14 @@ func (r *runner) serveUDP(conn *net.UDPConn) {
 				smu.Unlock()
 				continue
 			}
-			now := time.Now()
-			s = &udpSession{upstream: udpUp, lastSeen: now}
+			s = &udpSession{upstream: udpUp}
+			s.touch()
 			sessions[key] = s
 			r.logConnEstablished("udp", key, &r.firstUDPLogged)
 			r.wg.Add(1)
-			go r.udpReturn(conn, udpUp, clientAddr, key, drop)
+			go r.udpReturn(conn, s, clientAddr, key, drop)
 		}
-		s.lastSeen = time.Now()
+		s.touch()
 		up := s.upstream
 		smu.Unlock()
 
@@ -750,14 +771,15 @@ func (r *runner) serveUDP(conn *net.UDPConn) {
 	}
 }
 
-// udpReturn 把后端回包写回客户端，直到后端读出错或超时。
+// udpReturn 把后端回包写回客户端，直到后端读出错，或会话两个方向都空闲了一个周期。
 //
 // drop 由 serveUDP 提供：它是唯一会摘掉会话的入口，也是唯一归还模块级名额的地方。
-func (r *runner) udpReturn(client *net.UDPConn, upstream *net.UDPConn, clientAddr *net.UDPAddr, key string, drop func(string, *net.UDPConn)) {
+func (r *runner) udpReturn(client *net.UDPConn, s *udpSession, clientAddr *net.UDPAddr, key string, drop func(string, *net.UDPConn)) {
 	defer r.wg.Done()
 	defer func() {
 		r.log.Debug("转发连接关闭", "rule", r.rule.Name, "remote", key, "target", r.targetAddr(), "proto", "udp")
 	}()
+	upstream := s.upstream
 	bufp := udpBufPool.Get().(*[]byte)
 	defer udpBufPool.Put(bufp)
 	buf := *bufp
@@ -767,14 +789,21 @@ func (r *runner) udpReturn(client *net.UDPConn, upstream *net.UDPConn, clientAdd
 			return
 		default:
 		}
-		_ = upstream.SetReadDeadline(time.Now().Add(udpIdleTimeout))
+		_ = upstream.SetReadDeadline(time.Now().Add(r.udpIdle))
 		n, err := upstream.Read(buf)
 		if err != nil {
+			// 读超时只说明后端这一个周期没回话；客户端那一侧若还在发（只上报、不等回话的用法），
+			// 会话就还活着，接着等。见 udpSession.lastSeen。
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() && s.idleFor() < r.udpIdle {
+				continue
+			}
 			// 传 upstream 是那个身份判断：这条会话可能已经被空闲清理摘掉、
 			// 同一个客户端地址又建了新的一条，不能把新的那条删掉。
 			drop(key, upstream)
 			return
 		}
+		s.touch()
 		_, _ = client.WriteToUDP(buf[:n], clientAddr)
 	}
 }

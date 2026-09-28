@@ -358,11 +358,18 @@ async function run() {
           <el-collapse class="more">
             <el-collapse-item :title="t('mroute.dry.rootFields')" name="root">
               <!-- 正文被截断的那一份不带字段树（后端 RootDropped）：字段树是按整段正文
-                   解出来的，留着它等于没截。这里要把原因说清楚，而不是显示一棵空树。 -->
+                   解出来的，留着它等于没截。嵌套过深的那一份也不带（result.rootTooDeep，
+                   它序列化不进接口响应）。两种都要把原因说清楚，而不是显示一棵空树。 -->
               <div class="tip">
-                {{ current?.rootDropped ? t('mroute.dry.rootDropped') : t('mroute.dry.rootHint') }}
+                {{
+                  result?.rootTooDeep
+                    ? t('mroute.dry.rootTooDeep')
+                    : current?.rootDropped
+                      ? t('mroute.dry.rootDropped')
+                      : t('mroute.dry.rootHint')
+                }}
               </div>
-              <FieldTree v-if="!current?.rootDropped" :nodes="rootNodes" />
+              <FieldTree v-if="!current?.rootDropped && !result?.rootTooDeep" :nodes="rootNodes" />
             </el-collapse-item>
           </el-collapse>
         </template>

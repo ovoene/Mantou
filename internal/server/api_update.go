@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
@@ -155,14 +156,45 @@ func (s *Server) handleSelfUpdate(c *gin.Context) {
 		return
 	}
 
+	// 同一时刻只处理一个更新包。
+	//
+	// 这条链路是"先验签、再冒烟测试、再备份、最后改名覆盖"，验签与覆盖之间隔着好几秒。
+	// 原先候选文件名只到秒级（.mantou.update-20060102150405），且以 O_TRUNC 打开：同一秒里的
+	// 两个上传写的是**同一个文件**——第一个上传一个验签能过的正式包，第二个在它验完签之后
+	// 把内容换成任意二进制，第一个请求随后冒烟测试、覆盖的就是被换过的那份。
+	// 签名这道闸因此可以被一条会话绕过，而它存在的意义正是"光有会话换不掉二进制"。
+	//
+	// 这里用 TryLock 直接拒而不是排队：排队会让第二个请求在锁外把几十 MB 传完再等，
+	// 而"同时传两个包"本身就不是正常操作。候选文件名另外带了随机后缀并以 O_EXCL 创建
+	// （见 writeFile），两道各自都足以挡住上面那种串改。
+	//
+	// 排在读请求体与密码复核之前：被拒的请求不该先上传完、也不该占一次复核名额。
+	if !s.selfUpdateMu.TryLock() {
+		respondError(c, http.StatusConflict, "已有一个更新包正在处理，请等它结束后再试")
+		return
+	}
+	// 换上去之后**不再放锁**：新二进制要等下面那个协程 1.5 秒后才接管进程，这段时间里
+	// 再换一次包，第二次的进程替换请求会因为通道里已有一个而失败，转而走 os.Exit(0)——
+	// 把正在进行的平滑替换打断，没有外部守护的机器上程序就此退出。进程马上就要被替换，
+	// 锁随旧进程一起消失；失败的各条路径上照常释放。
+	applied := false
+	defer func() {
+		if !applied {
+			s.selfUpdateMu.Unlock()
+		}
+	}()
+
 	// 未验签这条路下面要再验一次当前密码，那次校验与导出/导入/改账户共用一份失败计数
 	//（见 reauth.go）：都是"拿一条已有会话反复猜当前密码"，只限其中几条等于没限。
 	//
 	// 只在 signKey == "" 时取这道闸：配了公钥的上传根本不问密码，不该被别处的密码失败连坐。
 	//
 	// 位置与上面那一判同侧、都在读请求体之前：一条已经被锁住的会话不该先把 32 MB 传完再被拒。
-	if signKey == "" && !s.reauthAllowed(c) {
-		return
+	if signKey == "" {
+		if !s.reauthAllowed(c) {
+			return
+		}
+		defer s.reauthDone(c)
 	}
 
 	// 先按 Content-Length 早退，避免把明显超限的请求体读进来才拒绝。
@@ -182,7 +214,12 @@ func (s *Server) handleSelfUpdate(c *gin.Context) {
 		respondError(c, http.StatusInternalServerError, "无法定位当前可执行文件")
 		return
 	}
-	exePath, _ = filepath.EvalSymlinks(exePath)
+	// 解析失败时 EvalSymlinks 返回的是空串：原先丢掉 err 照用，exeDir 会变成当前目录、
+	// exeName 变成 "."，后面的解包与改名就落在一个与程序毫无关系的位置上。
+	if exePath, err = filepath.EvalSymlinks(exePath); err != nil || exePath == "" {
+		respondError(c, http.StatusInternalServerError, "无法定位当前可执行文件")
+		return
+	}
 	exeDir := filepath.Dir(exePath)
 	exeName := filepath.Base(exePath)
 
@@ -224,7 +261,15 @@ func (s *Server) handleSelfUpdate(c *gin.Context) {
 		"operator", operator(c), "ip", c.ClientIP())
 
 	// 解包到与目标同目录的临时文件（保证 rename 为同一文件系统上的原子操作）。
-	tmpPath := filepath.Join(exeDir, "."+exeName+".update-"+time.Now().Format("20060102150405"))
+	//
+	// 文件名带随机后缀，且由 writeFile 以 O_EXCL 独占创建：不会与别的请求共用同一个文件，
+	// 也不会写进一个事先放在那里的文件或符号链接（见 selfUpdateMu 上方的说明）。
+	suffix, err := randomSuffix()
+	if err != nil {
+		respondError(c, http.StatusInternalServerError, "生成临时文件名失败")
+		return
+	}
+	tmpPath := filepath.Join(exeDir, "."+exeName+".update-"+time.Now().Format("20060102150405")+"-"+suffix)
 	// 仅在配置了签名公钥时才提取 .sig：未配置时不需要它，且可让解包在取到二进制后立即停止。
 	sigPath := ""
 	if signKey != "" {
@@ -340,6 +385,7 @@ func (s *Server) handleSelfUpdate(c *gin.Context) {
 
 	s.deps.Log.Info("自更新：可执行文件已替换，更新前版本已备份",
 		"exe", exeName, "backup", backupPath, "operator", operator(c), "ip", c.ClientIP())
+	applied = true // 见 selfUpdateMu 那一段：从这里起直到进程被替换，不再接收新的更新包
 	respondOK(c, gin.H{"ok": true, "restarting": true, "backup": backupPath})
 
 	// 延时：给响应留出回写时间，随后用新二进制替换当前进程映像，
@@ -482,6 +528,22 @@ func extractExecutable(r io.Reader, wantName, binDst, sigDst string) error {
 		return fmt.Errorf("更新包中未找到名为 %q 的可执行文件", wantName)
 	}
 	return nil
+}
+
+// checkUpdateSignKey 校验「自更新包签名公钥」的写法：base64 编码的 32 字节 Ed25519 公钥。
+// 解析口径与 verifyUpdateSignature 完全一致，保存时通过的公钥，上传时就不会再以格式为由被拒。
+func checkUpdateSignKey(key string) error {
+	pub, err := base64.StdEncoding.DecodeString(key)
+	if err != nil || len(pub) != ed25519.PublicKeySize {
+		return fmt.Errorf("签名公钥格式无效：应为 base64 编码的 32 字节 Ed25519 公钥（即 go run ./cmd/updsign gen 打印的那一串）")
+	}
+	return nil
+}
+
+// signKeyFingerprint 签名公钥的短指纹（SHA-256 前 8 字节的 hex），只用于审计日志。
+func signKeyFingerprint(key string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(key)))
+	return hex.EncodeToString(sum[:8])
 }
 
 // verifyUpdateSignature 校验更新包二进制的 Ed25519 签名。pubKeyB64 为 base64 编码的 32 字节公钥；
@@ -628,9 +690,16 @@ func detectBinaryArch(path string) (string, error) {
 	return "", fmt.Errorf("无法识别的 CPU 架构（e_machine=0x%04x，%s）", machine, endian)
 }
 
-// writeFile 将 r 的内容写入 path（覆盖），单文件体积上限为 limit 字节。
+// writeFile 将 r 的内容写入一个**新建**的文件 path，单文件体积上限为 limit 字节。
+//
+// O_EXCL：path 已存在（哪怕是个符号链接）就失败，绝不写进别人的文件。原先是 O_TRUNC 覆盖，
+// 配上秒级的候选文件名，同一秒里的两个上传会写同一个文件，验过签的那份可以在覆盖之前被换掉
+// （见 handleSelfUpdate 里 selfUpdateMu 的说明）。
+//
+// 权限只给属主：候选二进制在验签与冒烟测试通过之前不该被任何人执行，
+// 之后由调用方 Chmod 成与原程序一致的权限。
 func writeFile(path string, r io.Reader, limit int64) error {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o700)
 	if err != nil {
 		return err
 	}
@@ -639,6 +708,16 @@ func writeFile(path string, r io.Reader, limit int64) error {
 		return err
 	}
 	return f.Close()
+}
+
+// randomSuffix 候选文件名的随机后缀（8 字节 hex）。取不到随机数就报错，
+// 不退回可预测的形式——可预测的文件名正是这里要消灭的东西。
+func randomSuffix() (string, error) {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }
 
 // cappedReader 在读取超过 limit 字节时返回 errUpdateTooLarge，而不是像 io.LimitReader

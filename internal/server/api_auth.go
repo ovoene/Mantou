@@ -191,12 +191,18 @@ func (s *Server) handleLogin(c *gin.Context) {
 	// 账户名那一份，因此永远不会先于 ipKey 触发。别把它当成"按账户限流"来读。
 	userKey := "ip:" + ip + ":user:" + userForKey
 	// 两个键都要过：ipKey 挡同一来源的爆破（不分账户名），userKey 挡上面那一件事。
-	if ok, retry := s.limiter.Allowed(ipKey); !ok {
+	//
+	// 用 Acquire 而不是 Allowed：放行与记账之间隔着一次 bcrypt（约百毫秒），只问不占的话，
+	// 同一时刻打进来的一批请求全在第一条失败落账之前通过检查，「N 次失败即锁定」
+	// 约束不了一次并发突发——并发多少就能猜多少次。Acquire 把进行中的尝试也算进阈值，
+	// 占下的名额在下面每一条出口上都要还（Fail / Reset / Release）。
+	if ok, retry := s.limiter.Acquire(ipKey); !ok {
 		c.Header("Retry-After", strconv.Itoa(retry))
 		respondError(c, http.StatusTooManyRequests, "登录尝试过于频繁，请稍后再试")
 		return
 	}
-	if ok, retry := s.limiter.Allowed(userKey); !ok {
+	if ok, retry := s.limiter.Acquire(userKey); !ok {
+		s.limiter.Release(ipKey)
 		c.Header("Retry-After", strconv.Itoa(retry))
 		respondError(c, http.StatusTooManyRequests, "该账户登录尝试过于频繁，请稍后再试")
 		return
@@ -204,6 +210,8 @@ func (s *Server) handleLogin(c *gin.Context) {
 
 	cfg := s.deps.Config.Snapshot()
 	if !cfg.Auth.Initialized {
+		s.limiter.Release(ipKey)
+		s.limiter.Release(userKey)
 		respondError(c, http.StatusConflict, "面板尚未初始化")
 		return
 	}

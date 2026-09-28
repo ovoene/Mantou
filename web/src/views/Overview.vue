@@ -9,8 +9,11 @@ import {
   LegendComponent,
 } from 'echarts/components'
 import { CanvasRenderer } from 'echarts/renderers'
+import { ElMessage } from 'element-plus'
+import { Bottom, Top, Refresh } from '@element-plus/icons-vue'
 import api from '@/api/client'
 import { usePolling } from '@/composables/usePolling'
+import { copyText } from '@/composables/copyText'
 import { useAppearanceStore } from '@/stores/appearance'
 import { currentLocale } from '@/i18n'
 
@@ -55,10 +58,24 @@ interface ModStatus {
   active: number
   healthy: boolean
 }
+// 外网 IP 一族的检测结果（后端 publicIPFamily）。取不到时后端保留上一次的地址，
+// error 另外说明最近一次为什么失败；时刻都是 Unix 毫秒。
+interface PublicIPFamily {
+  ip?: string
+  okAt?: number
+  error?: string
+  triedAt?: number
+}
+interface PublicIP {
+  v4: PublicIPFamily
+  v6: PublicIPFamily
+  checking: boolean
+}
 
 const info = ref<Info | null>(null)
 const latest = ref<Sample | null>(null)
 const statuses = ref<ModStatus[]>([])
+const publicIp = ref<PublicIP | null>(null)
 type LogEntry = {
   time: string
   level: string
@@ -106,6 +123,20 @@ function fmtBytes(n: number): string {
 function fmtRate(n: number): string {
   return `${fmtBytes(n)}/s`
 }
+
+// 下行 / 上行的配色。卡片上的箭头与「网络吞吐」图里的两条线用同一对颜色，
+// 看卡片的人不用读图例就知道哪条线是哪张卡——所以只在这里定义一次。
+const DOWN_COLOR = '#2fb37f'
+const UP_COLOR = '#e6a23c'
+
+// splitRate 把速率拆成「数」与「单位」两段：数字用大字、单位用小字，与其它指标卡同一排版。
+function splitRate(n?: number): { num: string; unit: string } {
+  if (n === undefined) return { num: '—', unit: '' }
+  const [num, unit] = fmtBytes(n).split(' ')
+  return { num, unit: `${unit}/s` }
+}
+const downRate = computed(() => splitRate(latest.value?.downRate))
+const upRate = computed(() => splitRate(latest.value?.upRate))
 function fmtUptime(startedMs: number): string {
   const s = Math.max(0, Math.floor((Date.now() - startedMs) / 1000))
   const d = Math.floor(s / 86400)
@@ -296,8 +327,8 @@ function renderCharts() {
     xAxis: { type: 'category', data: times, axisLine: { lineStyle: { color: axisColor } }, axisLabel: { color: axisColor, hideOverlap: true } },
     yAxis: { type: 'value', splitLine: { lineStyle: { color: 'rgba(140,150,170,0.14)' } }, axisLabel: { color: axisColor, formatter: (v: number) => fmtBytes(v) } },
     series: [
-      { name: t('overview.down'), type: 'line', smooth: true, showSymbol: false, data: cols.down.slice(), lineStyle: { width: 2, color: '#2fb37f' }, areaStyle: { color: '#2fb37f', opacity: 0.1 } },
-      { name: t('overview.up'), type: 'line', smooth: true, showSymbol: false, data: cols.up.slice(), lineStyle: { width: 2, color: '#e6a23c' } },
+      { name: t('overview.down'), type: 'line', smooth: true, showSymbol: false, data: cols.down.slice(), lineStyle: { width: 2, color: DOWN_COLOR }, areaStyle: { color: DOWN_COLOR, opacity: 0.1 } },
+      { name: t('overview.up'), type: 'line', smooth: true, showSymbol: false, data: cols.up.slice(), lineStyle: { width: 2, color: UP_COLOR } },
     ],
   })
 }
@@ -341,13 +372,14 @@ async function load(silent = false) {
   // 带上游标只取新采样点：全量约 18 KB，增量（3 秒内 1–2 个点）约 200 B。
   const seriesParams = lastSampleTime > 0 ? { since: String(lastSampleTime) } : undefined
   const [ov, sr, lg] = await Promise.all([
-    api.get<{ info: Info; latest?: Sample; statuses: ModStatus[] }>('/overview', undefined, opts),
+    api.get<{ info: Info; latest?: Sample; statuses: ModStatus[]; publicIp?: PublicIP }>('/overview', undefined, opts),
     api.get<{ series: Sample[]; full?: boolean }>('/overview/series', seriesParams, opts),
     api.get<{ logs: LogEntry[]; showOnHome?: boolean }>('/logs', { home: '1' }, opts),
   ])
   info.value = ov.info
   latest.value = ov.latest || null
   statuses.value = ov.statuses || []
+  publicIp.value = ov.publicIp || null
   showLogs.value = lg.showOnHome !== false
   logRows.value = buildLogRows(lg.logs || [])
   // full 缺省按全量处理，兼容不返回该字段的旧后端。
@@ -660,6 +692,82 @@ const memScopeText = computed(() => {
     ? t('overview.memScopeContainer')
     : t('overview.memScopeProcess')
 })
+
+// ---- 外网 IP 卡片 ----
+//
+// 数据随 /overview 的轮询一起来（后端只在有人看总览时才去检测，结果缓存几分钟，
+// 见 internal/server/publicip.go），这里不另起轮询。
+
+// fmtClock 卡片上的时刻只到分钟：检测几分钟一轮，秒数没有意义。
+function fmtClock(ms?: number): string {
+  if (!ms) return ''
+  const d = new Date(ms)
+  const p = (n: number) => (n < 10 ? '0' + n : '' + n)
+  return `${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
+type IpRow = { fam: string; text: string; ok: boolean; stale: boolean; title: string }
+
+// ipRow 一族地址的呈现。三种情形：
+//   - 有地址：照常显示，点击复制。最近一次检测失败时仍显示它（后端保留了上一次的结果），
+//     但标成"旧的"并在提示里说明是几点取到的——一次端点抖动不该让地址突然消失；
+//   - 没取到过、也还没有结论：「检测中」；
+//   - 没取到过、且检测失败了：「未获取到」，失败原因放进提示。重试期间也保持这句，
+//     不在它和「检测中」之间来回跳（没有公网 IPv6 的机器上 IPv6 那一行每两分钟就重试一次）。
+function ipRow(fam: string, f: PublicIPFamily | undefined): IpRow {
+  if (f?.ip) {
+    const stale = !!f.error
+    return {
+      fam,
+      text: f.ip,
+      ok: true,
+      stale,
+      title: stale ? t('overview.ipStale', { time: fmtClock(f.okAt), err: f.error }) : t('overview.ipCopyHint'),
+    }
+  }
+  if (f?.error) return { fam, text: t('overview.ipUnavailable'), ok: false, stale: false, title: f.error }
+  return { fam, text: t('overview.ipDetecting'), ok: false, stale: false, title: '' }
+}
+const ipRows = computed<IpRow[]>(() => [ipRow('IPv4', publicIp.value?.v4), ipRow('IPv6', publicIp.value?.v6)])
+
+// ipSegments 把地址切成「每段之后都可以折行」的小段（模板在段与段之间插 <wbr>）。
+// IPv6 一行放不下时只在冒号后面断开，不把一组十六进制数字从中间劈成两半——
+// 那样折出来的「9a」「bc」读着像两个值。切法不用后行断言：老版本 Safari 解析不了，
+// 而解析失败会让整个页面的脚本都加载不起来。
+function ipSegments(ip: string): string[] {
+  const parts = ip.split(':')
+  return parts.map((p, i) => (i < parts.length - 1 ? p + ':' : p))
+}
+
+// 最下面那行说明最近一次检测是几点结束的（两族取较晚的那个）。
+const ipCheckedText = computed(() => {
+  const at = Math.max(publicIp.value?.v4.triedAt || 0, publicIp.value?.v6.triedAt || 0)
+  return at ? t('overview.ipCheckedAt', { time: fmtClock(at) }) : ''
+})
+
+const ipRefreshing = ref(false)
+const ipBusy = computed(() => ipRefreshing.value || !!publicIp.value?.checking)
+
+// refreshPublicIp 立即重新检测。检测在后台进行，新结果随后由轮询带回；
+// 后端对连点有最小间隔，这里不必再防。
+async function refreshPublicIp() {
+  ipRefreshing.value = true
+  try {
+    publicIp.value = await api.post<PublicIP>('/overview/public-ip/refresh')
+  } catch {
+    /* 失败交给下一轮轮询，卡片上保持原样 */
+  } finally {
+    ipRefreshing.value = false
+  }
+}
+
+async function copyIp(ip: string) {
+  if (await copyText(ip)) {
+    ElMessage.success(t('overview.ipCopied'))
+  } else {
+    ElMessage.warning(t('overview.ipCopyFail'))
+  }
+}
 </script>
 
 <template>
@@ -671,40 +779,88 @@ const memScopeText = computed(() => {
       </div>
     </div>
 
-    <!-- 关键指标卡片 -->
+    <!-- 关键指标卡片：第一排是本机，第二排是网络（摆放见样式里的 grid-template-areas） -->
     <div class="stat-grid">
-      <div class="mt-glass stat">
+      <div class="mt-glass stat area-cpu">
         <span class="stat-label">{{ t('overview.sysCpu') }}</span>
         <span class="stat-val">{{ latest ? latest.sysCpu.toFixed(1) : '—' }}<i>%</i></span>
       </div>
-      <div class="mt-glass stat">
+      <div class="mt-glass stat area-mem">
         <span class="stat-label">{{ t('overview.sysMem') }}</span>
         <span class="stat-val">{{ latest ? latest.sysMem.toFixed(1) : '—' }}<i>%</i></span>
         <span class="stat-sub">{{ sysMemPair }}</span>
         <span class="stat-sub">{{ sysMemScopeText }}</span>
       </div>
-      <div class="mt-glass stat">
+      <div class="mt-glass stat area-used">
         <span class="stat-label">{{ t('overview.memUsed') }}</span>
         <span class="stat-val">{{ info ? info.memUsedMB.toFixed(0) : '—' }}<i>MB</i></span>
         <span class="stat-sub">{{ memScopeText }}</span>
       </div>
-      <div class="mt-glass stat">
+      <div class="mt-glass stat area-start">
         <span class="stat-label">{{ t('overview.startedAt') }}</span>
         <span class="stat-val small">
           <span class="date-main">{{ info ? fmtDate(info.startedAt) : '—' }}</span>
           <span class="date-time">{{ info ? fmtTime(info.startedAt) : '' }}</span>
         </span>
       </div>
-      <div class="mt-glass stat uptime-mini">
+      <div class="mt-glass stat uptime-mini area-uptime">
         <span class="stat-label">{{ t('overview.uptime') }}</span>
         <span class="stat-val small">{{ info ? fmtUptime(info.startedAt) : '—' }}</span>
       </div>
-      <div class="mt-glass stat wide">
-        <span class="stat-label">{{ t('overview.down') }} / {{ t('overview.up') }}</span>
-        <span class="stat-val small">
-          {{ latest ? fmtRate(latest.downRate) : '—' }}
-          <em>/ {{ latest ? fmtRate(latest.upRate) : '—' }}</em>
+      <!-- 下行 / 上行各一张：大字是此刻的速率，副行是本次运行以来的累计量。
+           箭头的颜色与下面「网络吞吐」图里对应那条线相同。 -->
+      <div class="mt-glass stat area-down">
+        <span class="stat-label net-label">
+          <el-icon class="net-dir down"><Bottom /></el-icon>{{ t('overview.down') }}
         </span>
+        <span class="stat-val">{{ downRate.num }}<i>{{ downRate.unit }}</i></span>
+        <span class="stat-sub">
+          {{ t('overview.recvTotal') }} <span class="nowrap">{{ info ? fmtBytes(info.recvTotal) : '—' }}</span>
+        </span>
+      </div>
+      <div class="mt-glass stat area-up">
+        <span class="stat-label net-label">
+          <el-icon class="net-dir up"><Top /></el-icon>{{ t('overview.up') }}
+        </span>
+        <span class="stat-val">{{ upRate.num }}<i>{{ upRate.unit }}</i></span>
+        <span class="stat-sub">
+          {{ t('overview.sentTotal') }} <span class="nowrap">{{ info ? fmtBytes(info.sentTotal) : '—' }}</span>
+        </span>
+      </div>
+      <div class="mt-glass stat ip-card area-ip">
+        <div class="ip-head">
+          <span class="stat-label">{{ t('overview.publicIp') }}</span>
+          <span class="ip-meta">
+            <span class="ip-checked">{{ ipCheckedText }}</span>
+            <el-button
+              link
+              size="small"
+              class="ip-refresh"
+              :icon="Refresh"
+              :loading="ipBusy"
+              :title="t('overview.ipRefresh')"
+              :aria-label="t('overview.ipRefresh')"
+              @click="refreshPublicIp"
+            />
+          </span>
+        </div>
+        <div class="ip-rows">
+          <div v-for="row in ipRows" :key="row.fam" class="ip-row">
+            <span class="ip-fam">{{ row.fam }}</span>
+            <span
+              v-if="row.ok"
+              class="ip-addr"
+              :class="{ stale: row.stale }"
+              :title="row.title"
+              role="button"
+              tabindex="0"
+              @click="copyIp(row.text)"
+              @keydown.enter="copyIp(row.text)"
+              ><template v-for="(seg, i) in ipSegments(row.text)" :key="i">{{ seg }}<wbr /></template></span
+            >
+            <span v-else class="ip-none" :title="row.title">{{ row.text }}</span>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -781,8 +937,40 @@ const memScopeText = computed(() => {
 }
 .stat-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  /* 两排：第一排本机五张，第二排网络三张（外网 IP 跨三列）。
+   *
+   * 用命名区域而不是 auto-fit 自动排：网络那一排里下行、上行要挨着，外网 IP 要宽到放得下
+   * 一整条 IPv6 地址（39 个字符），自动排在某些宽度下会把它们拆散、在行尾留空洞。
+   * 三个断点各写一份区域图（见文末两个媒体查询），每一份都正好铺满、没有空格子。 */
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-areas:
+    'cpu mem used start uptime'
+    'down up ip ip ip';
   gap: 12px;
+}
+.area-cpu {
+  grid-area: cpu;
+}
+.area-mem {
+  grid-area: mem;
+}
+.area-used {
+  grid-area: used;
+}
+.area-start {
+  grid-area: start;
+}
+.area-uptime {
+  grid-area: uptime;
+}
+.area-down {
+  grid-area: down;
+}
+.area-up {
+  grid-area: up;
+}
+.area-ip {
+  grid-area: ip;
 }
 .stat {
   padding: 16px 16px 14px;
@@ -827,12 +1015,103 @@ const memScopeText = computed(() => {
   font-weight: 600;
   color: var(--mt-text-soft);
 }
-/* 上行/下行卡片加宽，避免实时速率换行 */
-.stat.wide {
-  grid-column: span 2;
-}
-.stat.wide .stat-val {
+/* 累计量的数字与单位不拆开：放不下时整段挪到下一行，而不是折成「941」「KB」两截
+ * （英文界面的「Total received」在手机两列布局里就放不下一行）。 */
+.nowrap {
   white-space: nowrap;
+}
+/* 下行 / 上行：标签前的箭头取吞吐图里对应那条线的颜色（DOWN_COLOR / UP_COLOR）。 */
+.net-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.net-dir {
+  font-size: 13px;
+}
+.net-dir.down {
+  color: v-bind(DOWN_COLOR);
+}
+.net-dir.up {
+  color: v-bind(UP_COLOR);
+}
+/* 外网 IP：标题行右侧是检测时刻与「重新检测」，下面两行 IPv4 / IPv6。
+ * 检测时刻放在标题行而不是另起一行：这张卡与下行、上行同排，多一行它就比邻居高出一截。 */
+.ip-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  /* 与其它卡片的标签行同高：图标按钮比 12.5px 的标签文字高，不压一下这一行会整体下沉。 */
+  height: 16px;
+}
+.ip-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.ip-checked {
+  font-size: 12px;
+  color: var(--mt-text-soft);
+  white-space: nowrap;
+}
+.ip-refresh {
+  padding: 0;
+  font-size: 14px;
+}
+/* 上下的 auto 外边距吃掉多出来的高度：中屏上这张卡跨两排，地址在标题下方的空间里居中，
+ * 而不是贴着标题、底下空一大块。同排的卡比它高时也是这样。 */
+.ip-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: auto 0;
+}
+.ip-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+.ip-fam {
+  flex: 0 0 34px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--mt-text-soft);
+}
+.ip-addr,
+.ip-none {
+  min-width: 0;
+  font-family: 'SFMono-Regular', ui-monospace, Menlo, Consolas, monospace;
+  line-height: 1.3;
+}
+/* 地址：放不下时在冒号后折行（模板插了 <wbr>，见 ipSegments），anywhere 只是最后的兜底；
+ * 单击整条选中，点击复制。 */
+.ip-addr {
+  font-size: 16px;
+  font-weight: 650;
+  overflow-wrap: anywhere;
+  user-select: all;
+  cursor: pointer;
+  border-radius: 4px;
+}
+.ip-addr:hover {
+  color: var(--mt-primary);
+}
+.ip-addr:focus-visible {
+  outline: 2px solid var(--mt-primary);
+  outline-offset: 2px;
+}
+/* 最近一次检测失败、显示的是上一次取到的地址：颜色压淡，原因在悬停提示里。 */
+.ip-addr.stale {
+  color: var(--mt-text-soft);
+  text-decoration: underline dotted var(--mt-warning);
+  text-underline-offset: 3px;
+}
+.ip-none {
+  font-size: 14px;
+  color: var(--mt-text-soft);
 }
 /* 运行时长卡片更紧凑 */
 .stat.uptime-mini {
@@ -847,11 +1126,6 @@ const memScopeText = computed(() => {
   font-style: normal;
   color: var(--mt-text-soft);
   margin-left: 3px;
-}
-.stat-val em {
-  font-style: normal;
-  color: var(--mt-text-soft);
-  font-weight: 500;
 }
 .chart-grid {
   display: grid;
@@ -1013,9 +1287,17 @@ const memScopeText = computed(() => {
   color: var(--mt-text-soft);
   margin-left: 6px;
 }
+/* 中屏：三列。本机五张排成「3 + 2」，运行时长跨两列补齐那一排；
+ * 网络那三张摆成一块：下行、上行上下叠在左列，外网 IP 占右边两列、跨两排——
+ * 两列宽正好放得下一整条 IPv6 地址。 */
 @media (max-width: 1100px) {
   .stat-grid {
     grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-areas:
+      'cpu mem used'
+      'start uptime uptime'
+      'down ip ip'
+      'up ip ip';
   }
   .chart-grid,
   .bottom-grid {
@@ -1023,15 +1305,17 @@ const memScopeText = computed(() => {
   }
 }
 
-/* 手机：指标卡固定两列。
- *
- * 原先是 auto-fit + minmax(150px, 1fr)：窄屏只排得下一列，而「下行 / 上行」那张卡
- * 跨两列，网格便自己长出一条隐式列——隐式列按内容取宽，于是整排卡片被顶到页面右边去。
- * 固定两列后跨列依然成立，且两列都是 minmax(0, 1fr)，不会再被内容撑宽。
- * 「运行时长」一并跨两列，是为了不在最后留一格空洞（五张单列卡 + 一张跨列卡凑不满两列）。 */
+/* 手机：指标卡固定两列，两列都是 minmax(0, 1fr)，不会被内容撑宽。
+ * 「运行时长」跨两列补齐本机那一组（五张凑不满两列），下行、上行并排，外网 IP 独占一排。 */
 @media (max-width: 480px) {
   .stat-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-areas:
+      'cpu mem'
+      'used start'
+      'uptime uptime'
+      'down up'
+      'ip ip';
   }
   .stat {
     padding: 13px 12px 12px;
@@ -1041,9 +1325,6 @@ const memScopeText = computed(() => {
    * 不用 nowrap：宁可折行也不能让文字顶出卡片。 */
   .stat-sub {
     font-size: 11px;
-  }
-  .stat.uptime-mini {
-    grid-column: span 2;
   }
 }
 </style>
