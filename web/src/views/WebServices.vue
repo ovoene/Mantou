@@ -177,6 +177,10 @@ const probeIntervalOptions = computed<number[]>(() => {
 const stats = ref<Record<string, number>>({})
 // 各子项链接状态（最近成功 / 失败时间 + 失败状态码）。
 const childStatus = ref<Record<string, { lastOK: number; lastErr: number; lastStatus: number }>>({})
+// childStatusLoaded 子项访问状态是否已经拉回来过一次（成功失败都算）。
+// 列表与状态是两个并发请求，列表先到时状态还是空的：不等它的话，后端连不通的子项
+// 会先显示绿色「正常」、再翻成红色「无法连接」——先给出一个错误的好结论。
+const childStatusLoaded = ref(false)
 
 async function refreshStats(silent = false) {
   try {
@@ -191,6 +195,8 @@ async function refreshChildStatus(silent = false) {
     childStatus.value = await actions.webChildStatus(silent ? { silent: true } : undefined)
   } catch {
     /* 忽略瞬时错误 */
+  } finally {
+    childStatusLoaded.value = true
   }
 }
 
@@ -219,6 +225,8 @@ function linkInfo(row: Child): { text: string; type: 'success' | 'danger' | 'inf
     return { text, type: 'danger', blink: true }
   }
   if (row.enabled && hasConfiguredLink(row)) {
+    // 状态还没拉回来：只说"检测中"，不先下「正常」的结论（见 childStatusLoaded）。
+    if (!childStatusLoaded.value) return { text: t('webservice.linkChecking'), type: 'info', blink: false }
     return { text: t('webservice.linkNormal'), type: 'success', blink: false }
   }
   return { text: t('webservice.linkIdle'), type: 'info', blink: false }
@@ -586,7 +594,8 @@ useCloseOnLeave(logsVisible)
     <GfwStatusChip />
 
     <div v-loading="r.loading.value">
-      <el-empty v-if="!r.list.value.length" :description="t('common.empty')" />
+      <!-- 等第一次加载结束再判空：数据还没到时显示的应该是加载中，而不是「暂无数据」。 -->
+      <el-empty v-if="r.loaded.value && !r.list.value.length" :description="t('common.empty')" />
 
       <!-- 一级：父项（端口 + 地址族） -->
       <div v-for="p in (r.list.value as Parent[])" :key="p.id" class="parent-block mt-glass">

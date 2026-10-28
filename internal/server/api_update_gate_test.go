@@ -26,7 +26,8 @@ import (
 // 打开「允许未验签的更新包」（见 5-H）。
 //
 // 那个开关本身又是三道限制：打开要当场验密码、只在一段窗口内有效（过期自动失效）、
-// 窗口内每次上传未验签的包还要再验一次密码；三件事各自都留了审计记录。
+// 窗口内上传未验签的包还要再验一次密码（当场带凭据，或同一条会话上传前刚验过、拿到的
+// 一次性授权，后者见 api_update_auth_test.go）；三件事各自都留了审计记录。
 // 下面这组测试把这四样逐条钉住。
 
 const (
@@ -463,7 +464,8 @@ func TestSelfUpdateRefusedAfterWindowExpired(t *testing.T) {
 	}
 }
 
-// TestSelfUpdateUnsignedRequiresPassword 窗口开着也不够：每次上传未验签的包都要当场再验一次密码。
+// TestSelfUpdateUnsignedRequiresPassword 窗口开着也不够：手上没有一次性授权的会话上传未验签的包，
+// 都要当场再验一次密码。
 //
 // 少了这一道，窗口期内一条被盗的会话照样能把面板二进制换掉——那次打开开关时验的密码
 // 只证明了"打开它的人是本人"，证明不了此刻上传这个包的人是谁。
@@ -480,8 +482,9 @@ func TestSelfUpdateUnsignedRequiresPassword(t *testing.T) {
 		if code != http.StatusForbidden {
 			t.Fatalf("没给凭据就该拒收，实际 %d：%s", code, body)
 		}
-		if !strings.Contains(body, "账户或密码错误") {
-			t.Fatalf("拒绝原因应指向凭据，实际：%s", body)
+		// 一个凭据都没带，多半是授权已经用过或过期了：文案要让人知道去重新验证，而不是去怀疑密码。
+		if !strings.Contains(body, "授权已失效") {
+			t.Fatalf("拒绝原因应指向重新验证密码，实际：%s", body)
 		}
 		// 401 会让前端拦截器强制登出跳登录页，而这里只是这一次操作的凭据没对上。
 		if code == http.StatusUnauthorized {
@@ -500,6 +503,9 @@ func TestSelfUpdateUnsignedRequiresPassword(t *testing.T) {
 			updateUploadField{"account", updateTestUser}, updateUploadField{"password", "wrong-pass"})
 		if code != http.StatusForbidden {
 			t.Fatalf("密码不对就该拒收，实际 %d：%s", code, body)
+		}
+		if !strings.Contains(body, "账户或密码错误") {
+			t.Fatalf("带了凭据却没对上，拒绝原因应指向凭据，实际：%s", body)
 		}
 	})
 
@@ -522,6 +528,9 @@ func TestSelfUpdateUnsignedRequiresPassword(t *testing.T) {
 		}
 		if !strings.Contains(body, "更新包解析失败") {
 			t.Fatalf("应当已经走到解包那一步，实际：%s", body)
+		}
+		if v, _ := logFieldStr(mustLogEntry(t, s.deps.Log, "收到自更新请求", "INFO"), "auth"); v != "password" {
+			t.Fatalf("当场验密码放行的上传，日志里 auth 是 %q，期望 password", v)
 		}
 	})
 }

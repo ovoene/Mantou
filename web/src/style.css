@@ -189,6 +189,36 @@ body {
   background: transparent;
 }
 
+/* 表格正在加载（盖着 v-loading 遮罩）时，不显示它的空状态文字。
+ *
+ * 遮罩是半透明的，底下那句「暂无数据」会透出来——第一次打开页面时数据还没到，
+ * 用户先看到"没有数据"、紧接着数据又出来了，像是闪了一下。加载中就该只是加载中。
+ * 判据是"表格里挂着遮罩"：遮罩是 v-loading 直接插进宿主的子节点，收起后移除。
+ * 不能只靠 Element 加在宿主上的 el-loading-parent--relative 类——el-table 重新渲染时
+ * （例如布局算完补上 el-table--scrollable-x）会整体重写自己根元素的 class，把它冲掉，
+ * 于是加载中途"暂无数据"又露了出来（计划任务页实测如此）。那个类的写法留作兜底；
+ * 两条规则分开写：不支持 :has 的浏览器会丢弃整条含它的规则，合在一起会连兜底一起丢。
+ * 各页自定义的 #empty 插槽内容也渲染在 .el-table__empty-text 里，一并生效。 */
+.el-table:has(> .el-loading-mask) .el-table__empty-text {
+  visibility: hidden;
+}
+.el-loading-parent--relative .el-table__empty-text {
+  visibility: hidden;
+}
+
+/* 加载遮罩延迟 0.3 秒才开始淡入。
+ *
+ * 数据在 0.3 秒内就回来时（本机、局域网、大多数情况），遮罩从出现到收起始终是透明的，
+ * 画面直接从"还没有内容"变成内容，中间不再闪一层白；真慢的时候才看得到转圈，
+ * 免得以为页面卡住了。这是"延迟加载指示"的常规做法：短于人能察觉的等待不提示。
+ *
+ * 实现上借的是 Element 遮罩自带的淡入过渡（.el-loading-mask 上的 opacity transition）：
+ * 只在进场阶段（el-loading-fade-enter-active）加 transition-delay，延迟期间不透明度仍是 0。
+ * 进场中途就收起时，退场把不透明度送回 0，本来就是 0，看不到任何东西。 */
+.el-loading-mask.el-loading-fade-enter-active {
+  transition-delay: 0.3s;
+}
+
 /* 让 Element 弹层文字继承主题文本色。 */
 .el-overlay-dialog .el-dialog {
   border-radius: var(--mt-card-radius);

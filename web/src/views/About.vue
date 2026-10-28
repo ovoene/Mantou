@@ -6,6 +6,7 @@ import PageCard from '@/components/PageCard.vue'
 import api from '@/api/client'
 import { actions } from '@/api/resources'
 import { copyText } from '@/composables/copyText'
+import { useCloseOnLeave } from '@/composables/useCloseOnLeave'
 import { useAuthStore } from '@/stores/auth'
 import { useSystemStore } from '@/stores/system'
 
@@ -175,9 +176,106 @@ async function checkUpdate(force = false) {
   }
 }
 
-// 上传 tar.gz 更新包并执行自更新（非 Windows 生效）。
-async function doSelfUpdate(opt: any) {
-  const file = opt.file as File
+// ---- 上传前的密码验证 ----
+// 每次上传都要先验一次当前密码：点「上传更新包」→ 密码框 → 验对了才去选文件 → 确认 → 上传。
+// 验对之后后端给这条会话发一份一次性授权（见 api_update_auth.go），紧接着的那一次上传用掉它，
+// 不论上传成败都不能再用；没用掉的也只在短时间内有效。前端不留密码，只记这份授权的截止时刻，
+// 用来判断选文件、看确认框的工夫里它是不是已经过期了。
+//
+// 提示一律用页面内的对话框与 ElMessage：不用浏览器自带的 alert / prompt，
+// 密码为空也不靠 required 属性的原生气泡，错误写在输入框下面。
+let grantUntil = 0 // 一次性授权的截止时刻（本机毫秒时间戳），0 表示手上没有
+
+const authVisible = ref(false)
+const authPassword = ref('')
+const authError = ref('')
+const authChecking = ref(false)
+const authInputRef = ref<{ focus: () => void } | null>(null)
+const fileInput = ref<HTMLInputElement | null>(null)
+// 验证通过之后接着做什么：没选文件时去选文件；已经选好了（选文件、看确认框那会儿授权
+// 刚好过期）就直接上传那一个，不让人再选一遍。
+let pendingFile: File | null = null
+
+// 切页时收起密码框：keep-alive 下弹窗不随页面卸载，回来时还挂着一个半填的密码框。
+useCloseOnLeave(authVisible)
+
+// 授权还能不能用。留几秒余量：从这里到请求抵达后端之间还隔着网络，
+// 卡在最后一秒发出去的上传会在后端那侧刚好过期。
+function grantValid() {
+  return grantUntil - Date.now() > 5000
+}
+
+function openFilePicker() {
+  const el = fileInput.value
+  if (!el) return
+  el.value = '' // 同一个文件连选两次也要触发 change
+  el.click()
+}
+
+function openAuthDialog(file: File | null) {
+  pendingFile = file
+  authPassword.value = ''
+  authError.value = ''
+  authVisible.value = true
+}
+
+// 「上传更新包」按钮：每次都先验密码。
+//
+// 上一次验过、却没上传（选文件时取消了）留下的授权也不拿来用：一次授权对应「这一次点击」，
+// 再点一次就是新的一次上传，重新验。后端那份没用掉的旧授权会被这次验证覆盖。
+function onUploadClick() {
+  if (selfUpdating.value || updateBlocked.value) return
+  openAuthDialog(null)
+}
+
+async function confirmAuth() {
+  // 弹窗关闭动画期间（已验过、正在关）再按一次回车或确认，不该再发一次验证、再开一次选文件框。
+  if (authChecking.value || !authVisible.value) return
+  const password = authPassword.value
+  if (!password) {
+    authError.value = t('about.uploadAuthEmpty')
+    return
+  }
+  authChecking.value = true
+  authError.value = ''
+  try {
+    const s = await actions.selfUpdateAuth(auth.username, password)
+    grantUntil = Date.now() + s.expiresIn * 1000
+  } catch (e: any) {
+    // 403 就是密码不对，用本地文案（后端那句只有中文）；429 是错太多次被锁了一阵，照后端原话说。
+    authError.value = e?.status === 403 ? t('about.uploadAuthWrong') : e?.message || t('common.failed')
+    authPassword.value = ''
+    return
+  } finally {
+    authChecking.value = false
+  }
+  const file = pendingFile
+  pendingFile = null
+  authVisible.value = false
+  // 已经选好文件的那一支直接开始上传，紧接着会有「正在上传」的提示，这里就不再多弹一条。
+  if (file) {
+    await uploadPackage(file)
+    return
+  }
+  ElMessage.success(t('about.uploadAuthOk'))
+  // 选文件框要在用户这次点击（或回车）之后几秒内打开，浏览器才认；验密码只是一次很快的请求，赶得上。
+  // 万一没打开，再点一次按钮重新验证即可。
+  openFilePicker()
+}
+
+// 弹窗关掉（确认、取消、✕、Esc、切页）就把密码清掉，待传的文件也一并放弃。
+function onAuthClosed() {
+  authPassword.value = ''
+  authError.value = ''
+  pendingFile = null
+}
+
+// 选好文件：校验后缀 → 确认 → 上传。
+async function onFileChosen(e: Event) {
+  const input = e.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (!file) return
   const name = (file.name || '').toLowerCase()
   if (!name.endsWith('.tar.gz') && !name.endsWith('.tgz')) {
     ElMessage.warning(t('about.uploadBadFile'))
@@ -192,33 +290,23 @@ async function doSelfUpdate(opt: any) {
   } catch {
     return
   }
-  // 没配公钥这条路要当场再验一次密码：后端在这一支上要求凭据（见 handleSelfUpdate），
-  // 这里先问，免得白传一次几十 MB 才收一个 403。配了公钥则不问——签名本身就是授权。
-  let password = ''
-  if (!update.signKey) {
-    try {
-      const r = await ElMessageBox.prompt(t('about.uploadUnsignedPwd'), t('about.uploadTitle'), {
-        inputType: 'password',
-        confirmButtonText: t('common.confirm'),
-        cancelButtonText: t('common.cancel'),
-        inputValidator: (v: string) => (v && v.length > 0) || t('common.required'),
-      })
-      password = r.value || ''
-    } catch {
-      return
-    }
-    if (!password) return
+  // 选文件、看确认框的这段时间里授权可能已经过期：再验一次，验过直接传这个文件。
+  if (!grantValid()) {
+    openAuthDialog(file)
+    return
   }
+  await uploadPackage(file)
+}
+
+// 上传 tar.gz 更新包并执行自更新（非 Windows 生效）。走到这里时手上一定有一份没过期的授权，
+// 请求里不带账户与密码（后端凭这份授权放行，见 handleSelfUpdate）。
+async function uploadPackage(file: File) {
+  // 这一次上传会用掉授权，不论成败：后端在收包之前就把它作废了。
+  grantUntil = 0
   selfUpdating.value = true
   ElMessage.info(t('about.uploading'))
   try {
     const fd = new FormData()
-    // 凭据必须排在 file **之前**：后端是流式消费 multipart 的（不把整个包收进内存），
-    // 取到 file 那一部分就开始解包，排在它后面的字段读不到（见 multipartFilePartFields）。
-    if (password) {
-      fd.append('account', auth.username)
-      fd.append('password', password)
-    }
     fd.append('file', file)
     const resp = await actions.selfUpdate(fd)
     // 后端 respondOK 把 {ok,restarting} 包在 data 字段下：{ data: { ok, restarting } }
@@ -293,17 +381,51 @@ onActivated(() => {
         show-icon
         style="margin: 8px 0"
       />
-      <el-upload
-        :show-file-list="false"
-        :http-request="doSelfUpdate"
+      <!-- 不用 el-upload：它一点就开选文件框，中间插不进「先验密码」这一步。
+           改成按钮 + 隐藏的文件输入，由 onUploadClick 决定先弹密码框还是直接选文件。 -->
+      <el-button type="warning" :loading="selfUpdating" :disabled="updateBlocked" @click="onUploadClick">
+        {{ t('about.uploadBtn') }}
+      </el-button>
+      <input
+        ref="fileInput"
+        type="file"
         accept=".tar.gz,.tgz,application/gzip"
-        :disabled="selfUpdating || updateBlocked"
-      >
-        <el-button type="warning" :loading="selfUpdating" :disabled="updateBlocked">
-          {{ t('about.uploadBtn') }}
-        </el-button>
-      </el-upload>
+        class="upload-input"
+        @change="onFileChosen"
+      />
     </section>
+
+    <!-- 上传前的密码验证（与设置页那几个认证弹窗同款：append-to-body、点遮罩不关） -->
+    <el-dialog
+      v-model="authVisible"
+      :title="t('about.uploadAuthTitle')"
+      width="min(420px, 94vw)"
+      append-to-body
+      :close-on-click-modal="false"
+      @opened="authInputRef?.focus()"
+      @closed="onAuthClosed"
+    >
+      <p class="auth-desc">{{ t('about.uploadAuthDesc', { user: auth.username }) }}</p>
+      <!-- 表单里只有这一个输入框，回车会触发 submit：由它来提交，不另挂 keyup.enter，免得一次回车提交两遍 -->
+      <el-form label-position="top" @submit.prevent="confirmAuth">
+        <el-form-item :label="t('about.uploadAuthPassword')" :error="authError">
+          <el-input
+            ref="authInputRef"
+            v-model="authPassword"
+            type="password"
+            show-password
+            autocomplete="off"
+            @input="authError = ''"
+          />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="authVisible = false">{{ t('common.cancel') }}</el-button>
+        <el-button type="primary" :loading="authChecking" @click="confirmAuth">
+          {{ t('common.confirm') }}
+        </el-button>
+      </template>
+    </el-dialog>
 
     <!-- 版本信息：当前版本 / 当前架构 / 编译时间 一行三列（标签在上值在下），
          最新版本 独占一行在下方，在线更新检测尚未启用 置于最新版本下方；检查更新按钮淡蓝色填充。 -->
@@ -633,6 +755,15 @@ a.ver-latest.is-new:hover {
 .hint-block {
   font-size: 12px;
   margin: 6px 0 12px;
+}
+.upload-input {
+  display: none;
+}
+.auth-desc {
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--mt-text);
+  margin: 0 0 12px;
 }
 /* 版本信息区：前三字段一行三列（标签在上值在下），最新版本独占一行 */
 .ver-block {

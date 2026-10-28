@@ -31,6 +31,16 @@ const http: AxiosInstance = axios.create({
   withCredentials: true,
 })
 
+// 上传类请求（背景图 / 备份导入 / 自更新包）的超时。
+//
+// 上面那个 20 秒是给常规接口的，而 axios 的 timeout 管的是**整个请求**——包体上传加服务端处理。
+// 一个 30 MB 的更新包在 10 Mbps 的上行上光传就要 25 秒，传完服务端还要解包、跑两次冒烟测试
+//（每次上限 20 秒）。原先这几处沿用 20 秒：慢链路上前端先报「超时」，而包体已经传完的话
+// 服务端照样把更新装上、重启——界面说失败，实际成功了。
+// 取 30 分钟，与服务端为这几条路放宽的截止时间（extendRequestDeadlines）对齐：
+// 前端不该比服务端先放弃。
+export const UPLOAD_TIMEOUT_MS = 30 * 60 * 1000
+
 // 401 时跳转登录页（由路由守卫兜底，这里只清理状态）。
 let onUnauthorized: (() => void) | null = null
 export function setUnauthorizedHandler(fn: () => void) {

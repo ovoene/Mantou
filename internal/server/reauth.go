@@ -18,7 +18,7 @@ import (
 //   - 敏感操作前的预检（handleVerifyIdentity）
 //   - 改账户名 / 改密码时的旧密码（handleChangeAccount）
 //   - 打开「允许未验签的更新包」、或更换更新包签名公钥的那一次提交（handleUpdateSettings）
-//   - 未验签的更新包上传（handleSelfUpdate）
+//   - 未验签的更新包上传（handleSelfUpdate），以及上传前的密码验证（handleSelfUpdateAuth）
 //   - 连私钥一起导出证书（handleExportCertWithKey）
 //
 // 之前这几处都不计数，理由写在 handleVerifyIdentity 上：只给其中一条加限制，攻击者换另一条

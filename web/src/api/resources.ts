@@ -1,4 +1,4 @@
-import api, { type RequestOpts } from './client'
+import api, { type RequestOpts, UPLOAD_TIMEOUT_MS } from './client'
 
 // 通用资源 CRUD 客户端，对应后端 /api/<name> 的 list/create/update/delete。
 // create 的返回可能携带后端透传的非致命告警（如 DDNS 首次同步失败提示），供前端 toast。
@@ -201,6 +201,12 @@ export interface UpdateCheck {
 	description?: string
 }
 
+// 上传更新包前的密码验证结果（见后端 api_update_auth.go）。
+export interface SelfUpdateAuth {
+  // 这份一次性授权还剩几秒可用；紧接着的那一次上传会用掉它。
+  expiresIn: number
+}
+
 // Web 服务子项访问（连接）日志一条。
 export interface WebAccessLog {
   time: number
@@ -274,9 +280,15 @@ export const actions = {
   // 用于「检查更新」按钮：确保断网/限流等瞬态不可达状态不被缓存挡住，点按钮立即重连检测。
   updateCheck: (force?: boolean) =>
     api.get<UpdateCheck>(`/meta/update-check${force ? '?force=1' : ''}`),
+  // 上传更新包前验一次当前密码；通过后这条会话拿到一份一次性授权，供紧接着的那一次上传用。
+  selfUpdateAuth: (account: string, password: string) =>
+    api.post<SelfUpdateAuth>(`/meta/self-update/auth`, { account, password }),
   // 上传 tar.gz 更新包执行自更新（非 Windows 生效）。
   selfUpdate: (form: FormData) =>
-    api.raw.post(`/meta/self-update`, form, { headers: { 'Content-Type': 'multipart/form-data' } }),
+    api.raw.post(`/meta/self-update`, form, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: UPLOAD_TIMEOUT_MS,
+    }),
   // 修改账户：可选改用户名 + 改密码（改密码需验旧密码）。
   changeAccount: (payload: { username?: string; oldPassword: string; newPassword?: string }) =>
     api.post<{ ok: boolean; usernameChanged: boolean; passwordChanged: boolean }>(`/auth/account`, payload),

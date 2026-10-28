@@ -22,7 +22,8 @@ import (
 // 本文件钉住 reauth.go 那份共享失败计数的五条性质：
 //
 //  1. **是共享的**：每一条「已登录后再验一次当前密码」的路（改账户、加密导出、导入前的身份
-//     校验、敏感操作预检、打开「允许未验签的更新包」、上传未验签的更新包、连私钥导出证书）失败次数记在一起。
+//     校验、敏感操作预检、打开「允许未验签的更新包」、上传前的密码验证、上传未验签的更新包、
+//     连私钥导出证书）失败次数记在一起。
 //     每条各自失败两三次、没有一条自己够 15 次，照样会锁——如果哪天有谁把计数改成按路由
 //     分开，这一条立刻失败，而那种改法的效果是攻击者换个接口接着猜（reauth.go 文件头的
 //     那句「要么一起限，要么都不限」）。
@@ -194,6 +195,10 @@ func reauthRoutes() []reauthRoute {
 		}},
 		{name: "导出证书私钥", wantFail: http.StatusForbidden, send: func(t *testing.T, s *Server, token string) *httptest.ResponseRecorder {
 			return callWithSession(t, s.handleExportCertWithKey, "/api/certs/c1/export", "application/json",
+				`{"account":"不是这台面板的账户","password":"随便"}`, token)
+		}},
+		{name: "上传前验证", wantFail: http.StatusForbidden, send: func(t *testing.T, s *Server, token string) *httptest.ResponseRecorder {
+			return callWithSession(t, s.handleSelfUpdateAuth, "/api/meta/self-update/auth", "application/json",
 				`{"account":"不是这台面板的账户","password":"随便"}`, token)
 		}},
 	}

@@ -537,7 +537,7 @@ useCloseOnLeave(importVisible, acmeManageVisible)
             </el-select>
           </el-form-item>
           <el-alert
-            v-if="!acme.list.value.length"
+            v-if="acme.loaded.value && !acme.list.value.length"
             :title="t('cert.noAccount')"
             type="warning"
             :closable="false"

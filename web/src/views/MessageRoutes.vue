@@ -54,11 +54,24 @@ interface CertOption {
 
 const tab = ref('receivers')
 const meta = ref<WebhookMeta | null>(null)
+
+// ready 第一次进入本页时，那一批并发请求是否已经全部回来。
+//
+// 没回来之前页面上的状态都是初值：模块「未创建、未启用」、运行状态为空、模板和目标列表为空。
+// 这些初值长得和"真的出了问题"一模一样，而六个请求谁先回来不一定——实测第一次打开时，
+// 会先后闪过「未启用」「模块还没创建」的提示，以及每个接收器下一行「引用的模板或目标缺失」
+// 红字，约 0.3 秒后（远程访问时更久）才换成真实状态。所以第一批数据到齐之前，
+// 结论性的内容一律不露面，只显示加载中；之后再进本页时数据是上一次的，不会再有这个问题。
+//
+// 内容区用 v-show 而不是 v-if 藏起来：里面的子组件（服务防护状态条等）靠 onActivated 拉数据，
+// 而晚于本页激活才创建的子组件，第一次进入时它的 onActivated 根本不会被调用。
+const ready = ref(false)
 const status = ref<WebhookStatus>({})
 const history = ref<HistoryEntry[]>([])
 const historyFilter = ref('')
 const historyEvent = ref('')
 const historyLoading = ref(false)
+let historyLoaded = false
 
 // 执行历史分页。默认只摆 20 条：这张表最常见的用法是"刚推了一条，看看它去哪了"，
 // 一屏 200 行反而要往下翻。想看更多就改「每页显示条数」。
@@ -414,9 +427,12 @@ async function loadStatus() {
 // 每次发起自增，回来时对不上号就丢掉——不是超时，是这份结果已经过期了。
 let histSeq = 0
 
-async function loadHistory() {
+// quiet：画面上已经有历史记录时原地刷新、不显示加载中——切回本页时用。
+// 改筛选条件则照常显示（内容要整个换掉，得让人知道在加载；遮罩本身延迟 0.3 秒，快的看不到）。
+async function loadHistory(opts?: { quiet?: boolean }) {
   const seq = ++histSeq
-  historyLoading.value = true
+  const mask = !(opts?.quiet && historyLoaded)
+  if (mask) historyLoading.value = true
   try {
     const list = await webhookActions.history({
       receiverId: historyFilter.value || undefined,
@@ -425,11 +441,17 @@ async function loadHistory() {
     })
     if (seq !== histSeq) return
     history.value = list
-    historyPage.value = 1
+    historyLoaded = true
+    // 原地刷新时保留当前页码（页数变少了才回到最后一页）：切回本页不该把人弹回第一页。
+    if (!opts?.quiet) historyPage.value = 1
+    else historyPage.value = Math.min(historyPage.value, Math.max(1, Math.ceil(list.length / historyPageSize.value)))
   } catch (e: any) {
     if (seq !== histSeq) return
     ElMessage.error(e?.message || t('common.loadFailed'))
   } finally {
+    // 只看是不是最新那一次，不看它自己有没有开遮罩：开遮罩的那次可能已被后发的 quiet 请求顶掉
+    //（改完筛选马上切走再切回），被顶掉的那次不收尾，收尾就落在这个 quiet 请求身上，
+    // 它若也不收，遮罩就一直盖着。没开过遮罩时置 false 是空操作。
     if (seq === histSeq) historyLoading.value = false
   }
 }
@@ -753,6 +775,9 @@ const EVENT_OPTIONS = Object.keys(EVENT_TAG)
 // 不参与运行（见 config.WebhookRule.Branches）。只查规则本体的话，一条分支引用了
 // 已删除模板的规则会显示"一切正常"，而它上线后每条消息都会失败。
 function missingRefs(row: WebhookReceiver): string[] {
+  // 模板、目标两张列表都加载完之前不下结论：列表还没到时"找不到"不等于"不存在"，
+  // 否则每条引用都会先被报成缺失、几百毫秒后再全部消失。
+  if (!tmpl.loaded.value || !targ.loaded.value) return []
   const out: string[] = []
   for (const ru of row.rules || []) {
     const label = ru.name || ru.id
@@ -785,15 +810,20 @@ function missingRefs(row: WebhookReceiver): string[] {
 // 列表顺序（接收器物理序 → 优先级）由后端排好，直接照着渲染即可。
 const rules = ref<WebhookRuleItem[]>([])
 const rulesLoading = ref(false)
+let rulesLoaded = false
 async function loadRules(opts?: { silent?: boolean }) {
   const silent = opts?.silent === true
-  if (!silent) rulesLoading.value = true
+  // 与 useResource 同口径：只有第一次（手里还没有规则）才显示加载中，
+  // 之后切回本页、改完重拉都原地刷新，不再每次盖一层遮罩闪一下。
+  const mask = !rulesLoaded
+  if (mask) rulesLoading.value = true
   try {
     rules.value = await rulesApi.list(silent)
   } catch (e: any) {
     if (!silent) ElMessage.error(e?.message || t('common.loadFailed'))
   } finally {
-    if (!silent) rulesLoading.value = false
+    if (mask) rulesLoading.value = false
+    rulesLoaded = true
   }
 }
 
@@ -921,21 +951,28 @@ onActivated(async () => {
       /* ignore */
     }
   }
-  await Promise.all([
-    recv.load(),
-    targ.load(),
-    tmpl.load(),
-    loadRules(),
-    loadStatus(),
-    webhookActions
-      .getServer()
-      .then(applyServer)
-      .catch(() => undefined),
-  ])
-  // 全新安装（模块没开、也还没有接收器）直接落在「模块设置」上：
-  // 那一页没配好之前，别的页配得再对也一条都收不到。有接收器之后就不再抢用户的页签。
-  if (!server.enabled && recv.list.value.length === 0) tab.value = 'module'
-  if (tab.value === 'history') await loadHistory()
+  try {
+    await Promise.all([
+      recv.load(),
+      targ.load(),
+      tmpl.load(),
+      loadRules(),
+      loadStatus(),
+      webhookActions
+        .getServer()
+        .then(applyServer)
+        .catch(() => undefined),
+    ])
+  } finally {
+    // 全新安装（模块没开、也还没有接收器）直接落在「模块设置」上：
+    // 那一页没配好之前，别的页配得再对也一条都收不到。有接收器之后就不再抢用户的页签。
+    // 放在 ready 之前：页签先切好再露面，第一次打开时不会看到它跳一下。
+    if (!server.enabled && recv.list.value.length === 0) tab.value = 'module'
+    // finally 里置位：哪一个请求失败了也要露出页面（失败的那一块各自有报错提示），
+    // 不能让整页卡在加载中。
+    ready.value = true
+  }
+  if (tab.value === 'history') await loadHistory({ quiet: true })
   await refreshTestRuns()
 })
 
@@ -954,10 +991,15 @@ useCloseOnLeave(serverVisible, sourceVisible, dryVisible, testVisible, ruleVisib
   <PageCard :title="t('mroute.title')" :subtitle="t('mroute.subtitle')">
     <template #actions>
       <div class="stat-row">
-        <el-tag :type="server.enabled ? (status.healthy ? 'success' : 'danger') : 'info'" disable-transitions>
-          {{ server.enabled ? (status.healthy ? t('mroute.running') : t('mroute.abnormal')) : t('mroute.stopped') }}
-        </el-tag>
-        <span v-if="statusText(status)" class="mt-subtle msg">{{ statusText(status) }}</span>
+        <!-- 第一批数据到齐前只说"加载中"：模块配置先到、运行状态还没到时，
+             healthy 是空的，按原写法会先闪一个红色的「异常」。 -->
+        <el-tag v-if="!ready" type="info" disable-transitions>{{ t('common.loading') }}</el-tag>
+        <template v-else>
+          <el-tag :type="server.enabled ? (status.healthy ? 'success' : 'danger') : 'info'" disable-transitions>
+            {{ server.enabled ? (status.healthy ? t('mroute.running') : t('mroute.abnormal')) : t('mroute.stopped') }}
+          </el-tag>
+          <span v-if="statusText(status)" class="mt-subtle msg">{{ statusText(status) }}</span>
+        </template>
       </div>
     </template>
 
@@ -965,6 +1007,10 @@ useCloseOnLeave(serverVisible, sourceVisible, dryVisible, testVisible, ruleVisib
          才连得上；服务防护状态条讲的是另一个模块的开关，是补充信息，压在下面。
          注意这里是 v-if / v-else 一对，中间不能插入别的节点（插了就是编译错误），
          所以停用时显示的那条提示要跟着一起搬。 -->
+    <!-- 第一批数据到齐前：内容照常排版、只是看不见，上面盖一层加载中（理由见脚本里 ready 的说明）。
+         用 visibility 而不是 v-show（display:none）：标签页在不可见的状态下创建时测不到尺寸，
+         显示出来后选中项的下划线宽度是 0、位置也对不上；visibility 隐藏时尺寸照常计算。 -->
+    <div v-loading="!ready" class="mr-body" :class="{ preparing: !ready }">
     <div v-if="server.enabled" class="metrics">
       <span>{{ t('mroute.mReceived') }} <b>{{ status.received ?? 0 }}</b></span>
       <span>{{ t('mroute.mRejected') }} <b>{{ status.rejected ?? 0 }}</b></span>
@@ -1445,6 +1491,7 @@ useCloseOnLeave(serverVisible, sourceVisible, dryVisible, testVisible, ruleVisib
         </div>
       </el-tab-pane>
     </el-tabs>
+    </div>
 
     <!-- 入站原文 -->
     <el-dialog
@@ -1710,6 +1757,18 @@ useCloseOnLeave(serverVisible, sourceVisible, dryVisible, testVisible, ruleVisib
     text-align: right;
     line-height: 1.5;
   }
+}
+/* 第一批数据到齐前：内容不可见但照常占位、照常算尺寸；加载遮罩不在模板里、
+ * 没有作用域属性，选择器碰不到它，于是只有它露在外面转圈。
+ * min-height 给遮罩一块转圈的地方，免得内容很短时整页只剩一个标题。 */
+.mr-body {
+  position: relative;
+}
+.mr-body.preparing {
+  min-height: 220px;
+}
+.mr-body.preparing > * {
+  visibility: hidden;
 }
 .metrics {
   display: flex;

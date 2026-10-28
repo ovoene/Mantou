@@ -14,7 +14,7 @@ import {
 import { useI18n } from 'vue-i18n'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import PageCard from '@/components/PageCard.vue'
-import api from '@/api/client'
+import api, { UPLOAD_TIMEOUT_MS } from '@/api/client'
 import { actions, type StorageItem, type FirewallBan } from '@/api/resources'
 import { fmtTime, fmtTimeMs, fmtBytes } from '@/composables/useResource'
 import { useCloseOnLeave } from '@/composables/useCloseOnLeave'
@@ -763,7 +763,7 @@ async function uploadBg(opt: any) {
   const fd = new FormData()
   fd.append('file', opt.file)
   try {
-    const resp = await api.raw.post('/settings/background', fd)
+    const resp = await api.raw.post('/settings/background', fd, { timeout: UPLOAD_TIMEOUT_MS })
     const url = resp.data?.data?.url || resp.data?.url
     if (url) {
       local.background.type = 'image'
@@ -1108,7 +1108,7 @@ async function doImport(file: File, account: string, password: string) {
     if (authPassword) fd.append('authPassword', authPassword)
     // 全选时也照样带上：接口把"字段缺失"当作全选，显式提交能让请求自己说明范围。
     if (importModules.value.length > 0) fd.append('modules', importModules.value.join(','))
-    const resp = await api.raw.post('/settings/import', fd)
+    const resp = await api.raw.post('/settings/import', fd, { timeout: UPLOAD_TIMEOUT_MS })
     const res = (resp.data && resp.data.data) || resp.data
     ElMessage.success(t('msg.configImported'))
     if (res?.restartRequired) ElMessage.warning(t('msg.restartRequired'))

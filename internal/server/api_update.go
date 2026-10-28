@@ -184,13 +184,25 @@ func (s *Server) handleSelfUpdate(c *gin.Context) {
 		}
 	}()
 
-	// 未验签这条路下面要再验一次当前密码，那次校验与导出/导入/改账户共用一份失败计数
+	// 未验签这条路要求上传的人当场证明知道当前密码（理由见下面验密码那一段）。
+	// 这条会话刚在「上传前验证密码」那里验过、手上有一份一次性授权（见 handleSelfUpdateAuth），
+	// 就凭它放行，请求里不必再带凭据；否则照旧从表单字段里取一对来验。
+	//
+	// 授权在这里就取走作废，不论这次上传后面成不成：一次验证只换一次上传。
+	// 配了公钥的上传不需要它，但手上有的话也一并取走，不让它留着等别的请求来用。
+	// 位置在 TryLock 之后、读请求体之前：被「已有一个更新包正在处理」拒掉的请求不该白白
+	// 用掉授权，而拒收的结论也不该等包体传完才给。
+	granted := s.updateAuth.consume(s.reauthKey(c), time.Now())
+	needPassword := signKey == "" && !granted
+
+	// 要验密码的话，那次校验与导出/导入/改账户共用一份失败计数
 	//（见 reauth.go）：都是"拿一条已有会话反复猜当前密码"，只限其中几条等于没限。
 	//
-	// 只在 signKey == "" 时取这道闸：配了公钥的上传根本不问密码，不该被别处的密码失败连坐。
+	// 只在真要验密码时取这道闸：配了公钥的上传根本不问密码、凭授权放行的上传这一次也不验，
+	// 都不该被别处的密码失败连坐。
 	//
 	// 位置与上面那一判同侧、都在读请求体之前：一条已经被锁住的会话不该先把 32 MB 传完再被拒。
-	if signKey == "" {
+	if needPassword {
 		if !s.reauthAllowed(c) {
 			return
 		}
@@ -223,8 +235,9 @@ func (s *Server) handleSelfUpdate(c *gin.Context) {
 	exeDir := filepath.Dir(exePath)
 	exeName := filepath.Base(exePath)
 
-	// 未验签这条路上顺带收下 account / password 两个表单字段，用于下面的二次认证。
-	// 它们必须排在 file 之前（见 multipartFilePartFields），前端按这个顺序 append。
+	// 未验签又没有授权时，顺带收下 account / password 两个表单字段，用于下面的二次认证。
+	// 它们必须排在 file 之前（见 multipartFilePartFields）。面板前端现在先走
+	// handleSelfUpdateAuth 拿一次性授权、不再在上传里带凭据；这两个字段留给直接调接口的人。
 	var acct, pwd string
 	want := map[string]*string{"account": &acct, "password": &pwd}
 	part, err := multipartFilePartFields(c.Request, want)
@@ -243,22 +256,40 @@ func (s *Server) handleSelfUpdate(c *gin.Context) {
 	//
 	// 它也不与设置页那次验证重复：那一次证明的是"打开这个开关的人是本人"，
 	// 这一次证明的是"此刻上传这个包的人是本人"。开关一开就有一整段窗口，
-	// 窗口里的每一次上传都得自己过这一关，否则窗口期内一条被盗的会话照样能换掉二进制。
-	if signKey == "" {
+	// 窗口里的上传都得自己过这一关，否则窗口期内一条被盗的会话照样能换掉二进制。
+	// 「这一关」也可以是同一条会话在上传前刚验过的那一次（needPassword 为假）：
+	// 那份授权只认这条会话、只够这一次上传，与当场带凭据等价。
+	if needPassword {
 		if !adminCredentialsOK(cfg.Auth, acct, pwd) {
 			s.reauthFail(c)
 			// 403 而非 401：前端响应拦截器收到 401 会强制登出跳登录页，
 			// 而这里只是本次操作的凭据没对上，应当停在当前页提示。
 			s.deps.Log.Warn("自更新：未验签上传的身份复核失败，已拒绝",
 				"exe", exeName, "operator", operator(c), "ip", c.ClientIP())
-			respondError(c, http.StatusForbidden, "账户或密码错误，未验签的更新包已拒绝")
+			msg := "账户或密码错误，未验签的更新包已拒绝"
+			if acct == "" && pwd == "" {
+				// 一个凭据都没带：从界面来的多半是授权已经用过或过期了（面板重启过也会这样，
+				// 授权只存在内存里），直接调接口的则是根本没验过。都告诉人该做什么，
+				// 而不是让他去怀疑自己的密码。
+				msg = "密码未验证或授权已失效，请重新点击「上传更新包」验证密码"
+			}
+			respondError(c, http.StatusForbidden, msg)
 			return
 		}
 		s.reauthOK(c)
 	}
 
+	// auth 记下这次凭什么放行：签名、当场带的密码，还是上传前那次验证换来的一次性授权。
+	// 事后排查"这个包是不是本人传的"时，日志里要分得清是哪一种。
+	authMode := "signature"
+	switch {
+	case needPassword:
+		authMode = "password"
+	case signKey == "":
+		authMode = "grant"
+	}
 	s.deps.Log.Info("收到自更新请求", "exe", exeName, "declaredSize", c.Request.ContentLength,
-		"operator", operator(c), "ip", c.ClientIP())
+		"operator", operator(c), "ip", c.ClientIP(), "auth", authMode)
 
 	// 解包到与目标同目录的临时文件（保证 rename 为同一文件系统上的原子操作）。
 	//
@@ -300,7 +331,7 @@ func (s *Server) handleSelfUpdate(c *gin.Context) {
 	// 完整性 / 真实性校验：若配置了更新签名公钥（Update.SignKey），则要求更新包内附同名
 	// .sig 签名文件，验签通过才允许覆盖，避免程序二进制被未授权替换。
 	// 走到 else 分支说明用户在设置里显式打开了「允许未验签的更新包」且窗口未过期
-	//（否则前面已经拒了），并且刚刚过了一次密码复核。
+	//（否则前面已经拒了），并且过了密码复核（当场带的凭据，或这条会话上传前刚验过的那一次）。
 	sigState := updateSigUnsigned
 	if signKey != "" {
 		if err := verifyUpdateSignature(signKey, tmpPath, sigPath); err != nil {

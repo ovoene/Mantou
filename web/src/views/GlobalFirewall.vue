@@ -177,7 +177,9 @@ const banTotal = ref(0)
 const bansLoading = ref(false)
 
 async function load() {
-  loaded.value = false
+  // 不在这里把 loaded 置回 false：loaded 管的是「首屏」——第一次拿到配置之前用一层加载中盖住。
+  // 之后每次进页面、保存后重拉，画面上已经是上一份配置，原地换成新的即可；
+  // 原先每次都置回 false，于是每次点进本页都整页盖一层遮罩、闪一下。
   try {
     const res = await actions.globalFirewall()
     const c = res.config

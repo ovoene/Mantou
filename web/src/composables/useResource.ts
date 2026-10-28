@@ -13,7 +13,17 @@ export function useResource<T extends { id?: string }>(
 ) {
   const repo = resourceApi<T>(name)
   const list = ref<T[]>([])
-  const loading = ref(false)
+  // loading 只在第一次加载时为真（见 load）：初值是 true 而不是 false——页面第一次画出来时
+  // 数据还没到，这时不该先出一张「暂无数据」的空表、再被真实数据换掉。每个用到它的页面都在
+  // onActivated 里 load()，初值的 true 在第一次加载结束时收起。
+  // 遮罩本身还会延迟 0.3 秒才显现（见 style.css），数据回得快时连遮罩都看不到。
+  const loading = ref(true)
+  // loaded 第一次加载是否已经结束（成功、失败都算）。
+  //
+  // 依赖本列表下结论的地方必须等它为真：列表还没到时，"在列表里找不到"不等于"不存在"。
+  // 消息路由页的「引用的模板或目标缺失」红字就是这样闪出来的——接收器先到、模板和目标
+  // 还没到，每条引用都被判成缺失，几百毫秒后又全部消失。
+  const loaded = ref(false)
   const dialogVisible = ref(false)
   const editing = ref<Partial<T>>(emptyFactory())
   const isNew = ref(true)
@@ -32,13 +42,19 @@ export function useResource<T extends { id?: string }>(
     // 跟着列表一起拉，且只在整个前端里拉一次（同时挂载的多个页面共用一次请求）。
     // 不 await：上限只影响那句说明，让它挡住列表渲染没有道理。
     void loadResourceCaps()
-    if (!silent) loading.value = true
+    // 只有第一次加载（手里还没有任何数据）才显示加载中。之后的每一次——切回本页、
+    // 保存后刷新——画面上已经是上一份数据，原地换成新的即可：数据多半没变，画面纹丝不动；
+    // 变了也只是那几格就地更新。原先每次进页面都盖一层遮罩，实测每次约 0.45 秒，
+    // 除了让页面闪一下不提供任何信息。silent 只管出错时要不要弹提示，与遮罩无关。
+    const mask = !loaded.value
+    if (mask) loading.value = true
     try {
       list.value = (await repo.list(silent ? { silent: true } : undefined)) as any
     } catch (e: any) {
       if (!silent) ElMessage.error(e?.message || '加载失败')
     } finally {
-      if (!silent) loading.value = false
+      if (mask) loading.value = false
+      loaded.value = true
     }
   }
 
@@ -159,6 +175,7 @@ export function useResource<T extends { id?: string }>(
   return {
     list,
     loading,
+    loaded,
     dialogVisible,
     editing,
     isNew,

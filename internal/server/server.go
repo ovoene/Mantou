@@ -131,6 +131,8 @@ type Server struct {
 	// 验签与"改名覆盖"之间隔着冒烟测试与备份，这段时间里若另一个请求能碰到同一个
 	// 候选文件，验过签的就未必是最后装上去的那一份。
 	selfUpdateMu sync.Mutex
+	// updateAuth 上传更新包前验过密码、手上有一次性授权的会话（见 api_update_auth.go）。零值可用。
+	updateAuth updateAuthGrants
 	// bodyLimits 上传型路由的请求体上限，键是 gin 的完整路由（含访问路径前缀）。
 	// 由 registerUpload 在注册路由时填入；其余路由用 panelBodyLimit。
 	bodyLimits map[string]int64
@@ -326,6 +328,8 @@ func (s *Server) registerRoutes(r *gin.Engine) {
 			authed.POST("/settings/restart-now", s.handleRestartNow)
 
 			authed.GET("/meta/update-check", s.handleUpdateCheck)
+			// 上传更新包前的密码验证：验对了给这条会话发一份一次性授权（见 api_update_auth.go）。
+			authed.POST("/meta/self-update/auth", s.handleSelfUpdateAuth)
 			s.registerUpload(authed, "/meta/self-update", maxUpdatePackageBytes+maxUpdateSignatureBytes+bodyLimitSlack, s.handleSelfUpdate)
 
 			s.registerResourceRoutes(authed)
