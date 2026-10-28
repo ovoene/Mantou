@@ -39,6 +39,13 @@ export interface FirewallBan {
   bannedAt: number
   until: number
   rounds: number
+  // 以下四项只有服务防护的封禁带（面板入站防护的封禁没有）：
+  // reason 行为信号（目前只有 tls-handshake），trigger 越过的是哪个窗口（burst / window），
+  // triggerSeconds / triggerLimit 是触发那一刻该窗口的时长与阈值。
+  reason?: string
+  trigger?: string
+  triggerSeconds?: number
+  triggerLimit?: number
 }
 
 // 服务防护（连接层）的配置。
@@ -51,6 +58,9 @@ export interface GfwConfig {
   level: string
   allowIps: string[]
   denyIps: string[]
+  // 表格用的整行（地址 + 备注 + 加入时间 + 来源）。allowIps / denyIps 仍在：业务页状态条只要条数。
+  allowEntries?: GfwListEntry[]
+  denyEntries?: GfwListEntry[]
   autoBan: boolean
   windowSeconds: number
   windowLimit: number
@@ -76,10 +86,13 @@ export interface GfwPreset {
 // GET /global-firewall 的完整返回。业务页只取 config，模块页取全量（含 limits 渲染表单）。
 export interface GfwResp {
   config: GfwConfig
-  bans: { items: FirewallBan[]; total: number; limit: number }
+  bans: { items: FirewallBan[]; total: number; limit: number; now?: number }
   memory: { usedBytes: number; limitMB: number }
   limits: {
     maxIps: number
+    // 名单添加对话框的两道上限：一次最多贴多少条、备注最多几个字。
+    maxBatch: number
+    maxNoteRunes: number
     maxMemoryMB: number
     maxBanMinutes: number
     minWindowSeconds: number
@@ -123,6 +136,37 @@ export interface GfwDenyResp {
   // 顺带解除的临时封禁条数：加入拒绝名单后那条封禁已无意义（判定顺序里拒绝名单在前）。
   unbanned: number
   denyIps: string[]
+  denyEntries?: GfwListEntry[]
+}
+
+// 服务防护名单里的一行。addedAt 为 0 表示不详（这一列上线之前就在名单里的条目）；
+// source 为 autoban 表示是从「自动封禁」一键升级进来的，legacy 表示升级到新格式之前就已在名单里
+// （加入时间是升级那一刻补的），空串为手工添加。
+export interface GfwListEntry {
+  ip: string
+  note: string
+  addedAt: number
+  source: string
+}
+
+export type GfwListName = 'allow' | 'deny'
+
+// 一次添加的分拣结果，每个地址只会落进其中一类。dryRun 时 added 是"将新增"。
+export interface GfwAddPlan {
+  added: string[]
+  existing: string[]
+  duplicate: string[]
+  invalid: string[]
+  capped: string[]
+}
+
+export interface GfwListAddResp {
+  ok: boolean
+  list: GfwListName
+  dryRun: boolean
+  maxIps: number
+  plan: GfwAddPlan
+  entries: GfwListEntry[]
 }
 
 // DNS 服务商元信息（供前端动态渲染凭证表单）。
@@ -291,8 +335,9 @@ export const actions = {
   updateGlobalFirewall: (payload: GfwUpdateReq) =>
     api.put<GfwConfig>(`/global-firewall`, payload),
   // 当前生效的自动封禁（只读内存，不落盘）。
+  // now 是服务端当前时间（Unix 秒），用来校正「剩余」一列与浏览器时钟的偏差。
   globalFirewallBans: () =>
-    api.get<{ items: FirewallBan[]; total: number; limit: number }>(`/global-firewall/bans`),
+    api.get<{ items: FirewallBan[]; total: number; limit: number; now?: number }>(`/global-firewall/bans`),
   // 解除服务防护的封禁：带 ip 解除单个，不带则全部解除。
   clearGlobalFirewallBans: (ip?: string) =>
     api.post<{ ok: boolean; cleared: number }>(`/global-firewall/bans/clear`, ip ? { ip } : {}),
@@ -303,4 +348,17 @@ export const actions = {
   // 这条口子的读—改—写在服务端配置写锁内完成，并在同一次请求里解除对应的临时封禁。
   denyGlobalFirewallBans: (target: { ip?: string; all?: boolean }) =>
     api.post<GfwDenyResp>(`/global-firewall/bans/deny`, target),
+  // 往白名单 / 黑名单批量添加。dryRun=true 只分拣不落盘，供添加对话框做实时预览——
+  // 预览与真添加在服务端走同一个分拣函数，因此"预览说加 3 条"与实际结果不会对不上。
+  addGlobalFirewallList: (req: {
+    list: GfwListName
+    items: { ip: string; note?: string }[]
+    dryRun?: boolean
+  }) => api.post<GfwListAddResp>(`/global-firewall/lists/add`, req),
+  // 从白名单 / 黑名单删除：带 ips 删这几条，all=true 清空整张名单。
+  removeGlobalFirewallList: (req: { list: GfwListName; ips?: string[]; all?: boolean }) =>
+    api.post<{ ok: boolean; list: GfwListName; removed: number; entries: GfwListEntry[] }>(
+      `/global-firewall/lists/remove`,
+      req,
+    ),
 }

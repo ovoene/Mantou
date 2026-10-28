@@ -94,9 +94,9 @@ jobs:
           # 输出不合规文件清单再失败，便于直接看到要格式化哪些文件。
           #
           # 排除 internal/version/gen.go：它是构建脚本在编译前临时写入、编译后立刻删除的
-          # 版本注入文件（Makefile 的 write-version / package.bat / release.yml 各写一份），
+          # 版本注入文件（Makefile 的 write-version / package.sh / release.yml 各写一份），
           # 已被 .gitignore 忽略，因此正常 checkout 里根本不存在，这里只是兜底。
-          # 之所以要兜底：构建被中途打断时它会残留在盘上，而 package.bat 用 `echo x > file`
+          # 之所以要兜底：构建被中途打断时它会残留在盘上，而以前的 package.bat 用 `echo x > file`
           # 生成，行尾必然带一个空格、缩进也是空格而非制表符——gofmt 必报。那种情况下门禁
           # 会指着一个开发者从未编辑过、也不该提交的文件报错，极易让人以为是自己改坏了。
           unformatted="$(gofmt -l ./cmd ./internal | grep -vE 'internal[\\/]version[\\/]gen\.go$' || true)"

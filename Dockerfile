@@ -53,7 +53,7 @@ ARG NPM_REGISTRY=
 #
 # digest 是 node:24-alpine 这个**移动标签**在钉的那一刻指向的那份多架构清单（amd64/arm64 都在里面）。
 # 标签留着只为可读性，真正生效的是 @sha256。升级见文件头。
-FROM --platform=$BUILDPLATFORM ${MIRROR}node:24-alpine@sha256:e67514e5d0f6c46656005e1b693b2ec9d52e80b641307de684d4a015ba7a4eaf AS web-builder
+FROM --platform=$BUILDPLATFORM ${MIRROR}node:24-alpine@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c934d3ecec86c33918b53 AS web-builder
 WORKDIR /web
 
 # 重新声明以便在本阶段 RUN 中使用传入的构建参数（全局 ARG 仅在 FROM 行可见）
@@ -75,14 +75,14 @@ RUN npm run build:only
 # golang:1.27-alpine：Go 官方只支持最近两个大版本，用已结束维护的版本构建意味着二进制里
 # 静态链接的是一个不再接收安全补丁的标准库——net/http、crypto/tls 的漏洞修复都拿不到。
 #
-# 这里取**当前稳定线**而不是刚好满足 go.mod 的那一版：go 指令（1.26.0，由 x/crypto v0.56.0
+# 这里取**当前稳定线**而不是刚好满足 go.mod 的那一版：go 指令（1.26.0，由 x/crypto v0.58.0
 # 的下限决定）是**编译器版本下限**，不是上限，用更新的工具链构建完全合法，且能拿到最新的
 # 标准库补丁；而 go.mod 仍停在 1.26.0，意味着手里只有 Go 1.26 的人照样能自行构建——
 # 抬高构建镜像不等于抬高对使用者的要求，这两件事刻意分开。
 #
 # 同样按 digest 钉死（升级办法见文件头）：浮动的 1.27-alpine 标签意味着同一个提交在两天里
 # 可能被两个不同的补丁版编译，出了问题连"用哪个工具链编的"都说不清。
-FROM --platform=$BUILDPLATFORM ${MIRROR}golang:1.27-alpine@sha256:cf6fca6641884b8433441b2b0652976f975e1d0fdd26d177eaaf8596087f3125 AS go-builder
+FROM --platform=$BUILDPLATFORM ${MIRROR}golang:1.27-alpine@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb AS go-builder
 WORKDIR /src
 
 # 构建缓存加速（可选）
@@ -149,7 +149,7 @@ RUN go build -trimpath -mod=readonly \
 # digest 钉的是清单列表（amd64/arm64 都在其中），因此这一行对两个目标架构都成立。
 # 注意：apk add 拉的包不在 digest 覆盖范围内（那是构建时从 alpine 仓库取的当天版本），
 # 这也是要的效果——证书库和时区数据本来就该是构建当天的最新版。
-FROM ${MIRROR}alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b AS runtime
+FROM ${MIRROR}alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a AS runtime
 
 # 实际用过的镜像源记进标签：官方镜像这三项都是空的（release.yml 不传这几个参数）。
 # `docker image inspect` 一看就知道手里这个镜像是不是自建的、依赖从哪来。

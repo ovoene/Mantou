@@ -29,6 +29,7 @@ package inboundfw
 import (
 	"io"
 	"log"
+	"math"
 	"net"
 	"sort"
 	"strings"
@@ -99,7 +100,35 @@ type entry struct {
 	// 封禁状态。until 零值表示只在计数、尚未封禁。
 	until    time.Time
 	bannedAt time.Time // 本次封禁起点，供界面展示
-	banRound int       // 累计被封次数，供界面判断"惯犯"
+	banRound int32     // 累计被封次数，供界面判断"惯犯"
+	// 本次封禁由哪个窗口触发、那个窗口当时的阈值与时长，供界面的「触发原因」一列。
+	//
+	// 存触发那一刻的数值而不是展示时现读配置：封禁期间档位可能已经换过，现读的话
+	// 界面上写的就不是这个来源当初真正越过的那道线。只用于展示，判定从不读它们。
+	// 字段宽度是挑过的：与 banRound 合起来正好两个 8 字节槽，整条记录只比原先多 8 字节
+	// （内存折算见 config.BanEntryBytes）。窗口时长上限 3600 秒，uint16 装得下。
+	trigLimit int32
+	trigSecs  uint16
+	trigger   banTrigger
+}
+
+// banTrigger 一次封禁是哪个窗口触发的。
+type banTrigger uint8
+
+const (
+	triggerNone   banTrigger = iota
+	triggerBurst             // 突发窗口：短时间内的密集异常
+	triggerWindow            // 常规窗口：较长时间里的累计异常
+)
+
+func (t banTrigger) String() string {
+	switch t {
+	case triggerBurst:
+		return "burst"
+	case triggerWindow:
+		return "window"
+	}
+	return ""
 }
 
 // Firewall 服务防护（连接层）的运行态。
@@ -311,6 +340,7 @@ func (f *Firewall) note(l *gfLists, ip net.IP, now time.Time) bool {
 	e.burst++
 	if e.burst >= l.gf.BurstLimit {
 		banLocked(e, now, l.gf.BanMinutes)
+		e.markTrigger(triggerBurst, l.gf.BurstSeconds, l.gf.BurstLimit)
 		return true
 	}
 	// 常规窗口
@@ -321,6 +351,7 @@ func (f *Firewall) note(l *gfLists, ip net.IP, now time.Time) bool {
 	e.strikes++
 	if e.strikes >= l.gf.WindowLimit {
 		banLocked(e, now, l.gf.BanMinutes)
+		e.markTrigger(triggerWindow, l.gf.WindowSeconds, l.gf.WindowLimit)
 		return true
 	}
 	return false
@@ -338,6 +369,15 @@ func banLocked(e *entry, now time.Time, minutes int) {
 	e.bannedAt = now
 	e.until = now.Add(time.Duration(minutes) * time.Minute)
 	e.banRound++
+}
+
+// markTrigger 记下这次封禁是哪个窗口、按什么阈值触发的（只供展示）。调用方须持有 f.mu。
+// 数值已由配置规范化夹在窗口 ≤3600 秒、阈值 ≤100000 之内，这里的收窄不会截断；
+// 仍按上限夹一次，免得哪天边界放宽后悄悄溢出成一个看不懂的数。
+func (e *entry) markTrigger(t banTrigger, secs, limit int) {
+	e.trigger = t
+	e.trigSecs = uint16(min(max(secs, 0), math.MaxUint16))
+	e.trigLimit = int32(min(max(limit, 0), math.MaxInt32))
 }
 
 // sweepLocked 清掉既没在封禁、计数窗口也早已过去的条目；调用方须持有 f.mu。
@@ -373,7 +413,18 @@ type BanView struct {
 	BannedAt int64  `json:"bannedAt"` // Unix 秒
 	Until    int64  `json:"until"`    // Unix 秒
 	Rounds   int    `json:"rounds"`   // 累计被封次数
+	// 触发原因。行为信号目前只有 TLS 握手失败一种，所以 Reason 恒为 "tls-handshake"；
+	// 仍单列一个字段，是为了日后加别的信号时界面不必再猜。
+	// Trigger 是越过的那个窗口（burst / window），TriggerSeconds / TriggerLimit 是触发当时
+	// 那个窗口的时长与阈值——"3 秒内 4 次"比"突发"两个字更能说明这个来源干了什么。
+	Reason         string `json:"reason"`
+	Trigger        string `json:"trigger,omitempty"`
+	TriggerSeconds int    `json:"triggerSeconds,omitempty"`
+	TriggerLimit   int    `json:"triggerLimit,omitempty"`
 }
+
+// banReasonTLSHandshake 目前唯一的行为信号：TLS 握手失败（见 errorTap）。
+const banReasonTLSHandshake = "tls-handshake"
 
 // BanList 快照当前**仍在生效**的封禁，按到期时间倒序（最近封的在前）。limit<=0 表示不限条数。
 func (f *Firewall) BanList(limit int) []BanView {
@@ -400,10 +451,14 @@ func (f *Firewall) BanSnapshot(limit int) (items []BanView, total int) {
 			continue // 只在计数、尚未封禁，或封禁已过期
 		}
 		out = append(out, BanView{
-			IP:       e.ip,
-			BannedAt: e.bannedAt.Unix(),
-			Until:    e.until.Unix(),
-			Rounds:   e.banRound,
+			IP:             e.ip,
+			BannedAt:       e.bannedAt.Unix(),
+			Until:          e.until.Unix(),
+			Rounds:         int(e.banRound),
+			Reason:         banReasonTLSHandshake,
+			Trigger:        e.trigger.String(),
+			TriggerSeconds: int(e.trigSecs),
+			TriggerLimit:   int(e.trigLimit),
 		})
 	}
 	f.mu.Unlock()
@@ -574,7 +629,7 @@ type errorTap struct {
 // 打得够快而数不满阈值。宁可让这条链路串行一会儿。
 func (t *errorTap) Write(p []byte) (int, error) {
 	if ip := parseHandshakeIP(string(p)); ip != nil {
-		t.fw.Note(ip, "tls-handshake")
+		t.fw.Note(ip, banReasonTLSHandshake)
 	}
 	return t.w.Write(p)
 }

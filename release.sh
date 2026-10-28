@@ -7,11 +7,11 @@
 # 用法：
 #   bash release.sh 1.2.0    指定版本号
 #   bash release.sh          不带参数，交互式输入版本号
-#   （Windows 用 release.bat，它会自动调用本脚本）
+#   （Windows 用「发布到GitHub.bat」，它会自动调用本脚本）
 #
 # 版本号约定：
 #   输入 "1.2.0" / "v1.2.0" / "Ver 1.2.0" 均可，统一规范化为：
-#     app 版本 "Ver 1.2.0"（自动同步写入 package.bat / Makefile）
+#     app 版本 "Ver 1.2.0"（自动同步写入 package.sh 的默认版本号 / Makefile）
 #     git tag  "v1.2.0"（推送到远程，CI 从 tag 提取出 "Ver 1.2.0"）
 #
 # 关键交互点（脚本会停下来等你确认/输入）：
@@ -24,7 +24,8 @@
 #
 # 说明：本脚本只负责「提交 + 打 tag + 推送」，真正的打包（Docker 多架构镜像、
 #       多平台二进制、GitHub Release）由 GitHub Actions 在 tag 推送后自动完成。
-#       如需本地生成 tar.gz 自更新包，请另跑 `package.bat`（Windows）或 `make package`。
+#       如需本地生成 tar.gz 自更新包，请另跑「本地打包更新包.bat」（Windows）
+#       或 `bash package.sh` / `make package`。两边互不调用。
 # ============================================================================
 set -euo pipefail
 
@@ -67,7 +68,7 @@ info "git tag ：${TAG}"
 info "远程仓库：${REPO_URL}"
 
 # ---------- 2. 提交信息（先写好，存成 UTF-8 文件） ----------
-# 放在最前面，而不是等到临提交那一步，是因为下面第 8 步会改写 package.bat / Makefile
+# 放在最前面，而不是等到临提交那一步，是因为下面第 8 步会改写 package.sh / Makefile
 # 的版本号——那时工作区必然是脏的，"有没有东西要提交"这个判断就没了参考价值。
 # 先把信息准备好，后面无论走"新建提交"还是"改写上一个提交"都直接拿来用。
 #
@@ -195,19 +196,18 @@ if git ls-remote --tags origin "refs/tags/$TAG" 2>/dev/null | grep -q .; then
 fi
 
 # ---------- 8. 同步 app 版本号到本地打包脚本（保持本地打包与 CI 一致） ----------
-# 只在版本号确实不一致时才动文件。原因：这个 sed 是 MSYS2 版的，读文件时会把 \r 全吃掉，
-# 写回来只有 \n——哪怕替换前后内容一字不差，package.bat 也会从 CRLF 变成 LF，
-# 于是 git status 报出一个只差行尾的假改动（第一次运行就是被这个假改动带崩的）。
-if [ -f package.bat ]; then
-  CUR_VER="$(sed -n 's/^set VERSION=//p' package.bat | head -1 | tr -d '\r')"
+# 写进 package.sh 的 DEFAULT_VERSION：之后跑「本地打包更新包.bat」时直接回车，
+# 打出来的就是刚发布的这一版。
+# 只在版本号确实不一致时才动文件：sed -i 会整份重写，没必要就别碰，免得 git status
+# 里多出一个假改动（打包脚本还是 package.bat 的时候，就被 MSYS2 sed 吃掉 \r 造成的
+# 只差行尾的假改动带崩过一次；package.sh 是 LF，没有这个问题，但原则照旧）。
+if [ -f package.sh ]; then
+  CUR_VER="$(sed -n 's/^DEFAULT_VERSION="\(.*\)"$/\1/p' package.sh | head -1)"
   if [ "$CUR_VER" = "$APP_VER" ]; then
-    info "package.bat 版本号已是 ${APP_VER}"
+    info "package.sh 默认版本号已是 ${APP_VER}"
   else
-    sed -i "s/^set VERSION=.*/set VERSION=${APP_VER}/" package.bat
-    # 把上面被 sed 吃掉的 \r 补回来：.gitattributes 里 *.bat 声明的是 eol=crlf，
-    # 而 cmd.exe 跑纯 LF 的批处理在 goto / 多行块上有已知的踩坑。
-    sed -i 's/\r*$/\r/' package.bat
-    info "已同步 package.bat 版本号为 ${APP_VER}"
+    sed -i "s/^DEFAULT_VERSION=\".*\"$/DEFAULT_VERSION=\"${APP_VER}\"/" package.sh
+    info "已同步 package.sh 默认版本号为 ${APP_VER}"
   fi
 fi
 if [ -f Makefile ]; then
@@ -223,7 +223,7 @@ fi
 # ---------- 9. 提交（用第 2 步写好的那份信息） ----------
 # 先把改动全部入暂存区，再判断"到底有没有真改动"，这个顺序不能颠倒。
 # 反面教材（第一次运行就死在这）：判断用的是 `git status --porcelain` 非空，
-# 它把上一步那个只差行尾的 package.bat 算成改动，于是走了"新建提交"这条路；
+# 它把上一步那个只差行尾的 package.bat（当时的打包脚本）算成改动，于是走了"新建提交"这条路；
 # 可 git add 会按 .gitattributes 归一化行尾，入库内容与 HEAD 一模一样，
 # 紧接着的 git commit 判定 "nothing to commit" 并退出 1 —— set -e 当场把脚本掐掉，
 # 后面的 push 与打 tag 根本没跑到。

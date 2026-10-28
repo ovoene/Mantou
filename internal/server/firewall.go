@@ -170,9 +170,6 @@ func (f *panelFirewall) current() *fwLists {
 	return n
 }
 
-// enabled 报告防火墙此刻是否生效。
-func (f *panelFirewall) enabled() bool { return f.current().fw.Enabled }
-
 // decide 对来源 IP 做**不含限速**的判定。监听器与中间件共用这一个函数，
 // 于是两层的语义不可能走偏。
 //

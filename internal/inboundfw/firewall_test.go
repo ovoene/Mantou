@@ -77,7 +77,7 @@ func banNow(f *Firewall, raw string, until time.Time, rounds int) {
 	defer f.mu.Unlock()
 	f.bans[ipx.Key(p)] = &entry{
 		ip: p.String(), firstHit: time.Now(), burstAt: time.Now(),
-		bannedAt: until.Add(-time.Minute), until: until, banRound: rounds,
+		bannedAt: until.Add(-time.Minute), until: until, banRound: int32(rounds),
 	}
 	f.size.Store(int32(len(f.bans)))
 }
@@ -977,5 +977,29 @@ func TestNoteConcurrent(t *testing.T) {
 	// 八个来源各踩 50 次、阈值 3，应当全部被封。
 	if n := f.BanCount(); n != 8 {
 		t.Fatalf("生效封禁数 = %d，应为 8", n)
+	}
+}
+
+// TestBanViewCarriesTrigger 界面的「触发原因」一列：要能看出是哪个窗口、按什么阈值越线的，
+// 且记的是**触发那一刻**的数值——之后改档位不该改写已经发生的封禁的原因。
+func TestBanViewCarriesTrigger(t *testing.T) {
+	gf := policy()
+	gf.BurstSeconds, gf.BurstLimit = 3, 2
+	f, m := newTestFW(t, gf)
+	src := ip("203.0.113.50")
+	f.Note(src, banReasonTLSHandshake)
+	if !f.Note(src, banReasonTLSHandshake) {
+		t.Fatal("第二次异常应越过突发阈值，测试前提不成立")
+	}
+	if err := m.Update(func(c *config.Config) { c.GlobalFirewall.BurstLimit = 50 }); err != nil {
+		t.Fatal(err)
+	}
+	items, _ := f.BanSnapshot(0)
+	if len(items) != 1 {
+		t.Fatalf("应有 1 条封禁，实际 %d", len(items))
+	}
+	b := items[0]
+	if b.Reason != "tls-handshake" || b.Trigger != "burst" || b.TriggerSeconds != 3 || b.TriggerLimit != 2 {
+		t.Fatalf("触发原因应为 tls-handshake / burst / 3 秒 / 2 次，实际 %+v", b)
 	}
 }

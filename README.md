@@ -172,7 +172,7 @@ docker manifest inspect ghcr.io/ovoene/mantou:latest
 
 - **Linux**（Debian/Ubuntu）：`sudo apt install golang-go nodejs npm make`；Docker 用官方脚本或发行版仓库安装。
 - **macOS**：`brew install go node`（`make` 随 Xcode 命令行工具自带）；Docker 安装 Docker Desktop。
-- **Windows 10**：安装 [Go](https://go.dev/dl/)、[Node.js](https://nodejs.org/)（含 npm）、[Git for Windows](https://git-scm.com/)（自带 bash 与 tar）。Win10 已内置 `tar`（bsdtar）。打包用 `package.bat`（等价于 `make package`）；Docker 可选装 Docker Desktop。
+- **Windows 10**：安装 [Go](https://go.dev/dl/)、[Node.js](https://nodejs.org/)（含 npm）、[Git for Windows](https://git-scm.com/)（自带 bash 与 tar）。Win10 已内置 `tar`（bsdtar）。打包用 `本地打包更新包.bat`（等价于 `make package`，需要 Git for Windows 提供的 bash）；Docker 可选装 Docker Desktop。
 
 > 项目是「Go 后端 + Vue 前端」单仓库，最终产出是内嵌前端的**单一静态二进制**；`node_modules` 仅构建期需要，不随产物下发。
 
@@ -181,7 +181,7 @@ docker manifest inspect ghcr.io/ovoene/mantou:latest
 mantou 的自更新包使用 **Ed25519** 签名，防止更新包被投毒。首次打包会自动生成密钥对，也可手动生成：
 
 ```bash
-# 手动生成（或直接跑 make package / package.bat 自动生成）
+# 手动生成（或直接跑 make package / 本地打包更新包.bat 自动生成）
 go run ./cmd/updsign gen
 # 输出：私钥保存到 update-signing.key；公钥（base64）打印在终端
 ```
@@ -221,18 +221,33 @@ mantou-Ver 1.0.0-linux-arm64.tar.gz
 
 > 版本号 / 编译时间在构建期注入；首次运行会生成签名密钥并提示配置公钥。
 
-### 4. 用 package.bat 打包（Windows）
+### 4. 用「本地打包更新包.bat」打包（Windows）
 
-在项目根目录打开 CMD 或 PowerShell：
+> **Windows 上有两个脚本，各管一件事，互不调用：**
+>
+> | 脚本 | 做什么 | 会不会碰 GitHub |
+> |---|---|---|
+> | `本地打包更新包.bat` | 输入版本号 → 在本机编译、签名，生成 Linux 自更新包 `mantou-Ver_x.y.z-linux-<架构>.tar.gz` | 不会 |
+> | `发布到GitHub.bat` | 输入版本号 → 提交、打 tag、推送到 GitHub，由 Actions 自动构建镜像 / 二进制 / Release | 会 |
+>
+> 两个 bat 都只是外壳：负责找到 Git Bash，再分别执行 `package.sh` / `release.sh`（真正的逻辑和中文提示都在这两个 .sh 里）。
+> 这样做是因为 cmd 读含中文的批处理不可靠，会把行切错；bash 没有这个问题。所以两个 bat 的内容保持纯英文、纯 ASCII，不要往里面写中文。
+
+**双击 `本地打包更新包.bat`** 即可，或在项目根目录的 CMD / PowerShell 里运行：
 
 ```bat
-package.bat            :: 打包 linux/amd64 + linux/arm64
-package.bat arm64      :: 只打指定架构（如 "amd64" 或 "arm64"）
+本地打包更新包.bat                 :: 先提示输入版本号（直接回车沿用默认），再打 linux/amd64 + linux/arm64
+本地打包更新包.bat 1.2.0           :: 指定版本号，不再询问
+本地打包更新包.bat 1.2.0 arm64     :: 指定版本号，只打 arm64
+本地打包更新包.bat arm64           :: 只打 arm64，版本号按提示输入
 ```
 
-产物与 `make package` 一致（Windows 版把版本号里的空格转成下划线，如 `mantou-Ver_1.0.0-linux-amd64.tar.gz`）。首次运行同样会生成密钥对并打印公钥。
+- **版本号**：写 `1.2.0` / `v1.2.0` / `Ver 1.2.0` 都行，统一成 `Ver 1.2.0`（规则与发布脚本相同）。默认值是最近一次用「发布到GitHub.bat」发布的版本号，所以打与发布同一版时直接回车即可；输入的版本号与默认值不同时，脚本会提醒你发布时用同一个。
+- 开始编译前会打印一份汇总：版本号、架构、**实际使用的 Go 版本**、产物文件名，方便确认没用错工具链。
+- 产物与 `make package` 一致，文件名里的空格换成下划线，如 `mantou-Ver_1.0.0-linux-amd64.tar.gz`；包内 `mantou` 的权限为 0755，解压即可运行。首次运行同样会生成密钥对并打印公钥。
+- 双击运行时，结束后窗口会停下来等你按键，不会一闪而过；在终端里运行则不会多这一下。
 
-前置：`go`、`npm`、`tar`（Win10+ 自带）需在 PATH 中；脚本默认使用国内 Go 模块代理 `goproxy.cn`。
+前置：`go`、`npm` 在 PATH 中，并安装 Git for Windows（提供 bash 与 tar）；脚本默认使用国内 Go 模块代理 `goproxy.cn`，并强制使用本机安装的 Go（不自动下载别的工具链）。在 Git Bash / Linux 上也可以直接 `bash package.sh`。
 
 ### 5. 用 Docker 构建
 
@@ -318,16 +333,16 @@ GitHub 仓库 → **Settings → Secrets and variables → Actions** → 点 **N
 
 推荐使用一键发布脚本（自动完成「提交 → 打 tag → 推送」，并智能处理同名 tag 冲突）。按你的环境选择对应命令：
 
-**① Windows 命令提示符（cmd）或 PowerShell** —— 用 `release.bat`：
+**① Windows 命令提示符（cmd）或 PowerShell** —— 用 `发布到GitHub.bat`（双击也能跑，但结束后窗口会直接关闭、看不到最后的输出，建议在终端里运行）：
 
 ```bat
 cd /d F:\你的项目目录\mantou
-release.bat 1.2.0
+发布到GitHub.bat 1.2.0
 rem 或不带参数，交互式输入版本号：
-release.bat
+发布到GitHub.bat
 ```
 
-> 注意：在 Windows 的 cmd / PowerShell 里**不要**直接敲 `bash release.sh`——cmd 的 `bash` 会指向 WSL，未装 WSL 发行版时会报 `/bin/bash` 找不到。`release.bat` 内部会自动定位 Git Bash 并执行 `release.sh`，推荐用它。
+> 注意：在 Windows 的 cmd / PowerShell 里**不要**直接敲 `bash release.sh`——cmd 的 `bash` 会指向 WSL，未装 WSL 发行版时会报 `/bin/bash` 找不到。`发布到GitHub.bat` 内部会自动定位 Git Bash 并执行 `release.sh`，推荐用它。它只负责发布，**不会**在本机打包；要本机打包请用「本地打包更新包.bat」（见上文第 4 节）。
 
 **② Windows Git Bash / Linux / macOS** —— 用 `release.sh`：
 
@@ -344,7 +359,7 @@ bash release.sh             # 不带参数，交互式输入版本号
 
 **版本号说明**：输入 `1.2.0`、`v1.2.0`、`Ver 1.2.0` 均可，脚本统一规范化为 app 版本 `Ver 1.2.0` 与 git tag `v1.2.0`。
 
-**脚本做的事**：校验版本号格式 → 自动 `git init`（若尚未初始化）→ 配置远程仓库 origin → 检测本地与远程同名 tag（存在则提示是否删除）→ 同步 app 版本号到 `package.bat` / `Makefile` → 提交并推送分支与 tag。
+**脚本做的事**：校验版本号格式 → 自动 `git init`（若尚未初始化）→ 配置远程仓库 origin → 检测本地与远程同名 tag（存在则提示是否删除）→ 同步 app 版本号到 `package.sh`（本地打包的默认版本号）/ `Makefile` → 提交并推送分支与 tag。
 
 方式二：手动执行（不用脚本）：
 

@@ -76,8 +76,9 @@ web/*.timestamp-*.mjs
 
 # ---- 本地脚本与工作文件（构建镜像用不到） ----
 Makefile
-package.bat
-release.bat
+# Windows 的两个 bat（本地打包更新包.bat / 发布到GitHub.bat）与它们调用的 .sh
+*.bat
+package.sh
 release.sh
 docker-compose.yml
 # release.sh 的提交信息草稿，中断时会留在盘上

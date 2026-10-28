@@ -318,3 +318,46 @@ func TestCompileRejectsBrokenSyntax(t *testing.T) {
 		}
 	}
 }
+
+// replace 对照标准库：不超限时逐字节一致（含 old 为空、old 不出现、多字节字符）。
+func TestReplaceMatchesStdlib(t *testing.T) {
+	cases := [][3]string{
+		{"a\nb\nc", "\n", "<br/>"},
+		{"abc", "", "-"},
+		{"", "", "x"},
+		{"中文中文", "中", "汉字"},
+		{"no hit", "zzz", "y"},
+		{"aaaa", "aa", "b"},
+	}
+	for _, c := range cases {
+		if got, want := replaceCapped(c[0], c[1], c[2], MaxRenderBytes), strings.ReplaceAll(c[0], c[1], c[2]); got != want {
+			t.Errorf("replace(%q,%q,%q) = %q，标准库 %q", c[1], c[2], c[0], got, want)
+		}
+	}
+}
+
+// replace / join 的结果体积由外部载荷决定（命中次数 × 新串长度、条数 × 分隔符），
+// 必须在上限附近停下，而不是先把几百 MB 拼完再交给 capWriter 截断。
+func TestReplaceAndJoinStopAtCap(t *testing.T) {
+	text := strings.Repeat("\n", 1<<20) // 1 MB 换行符
+	long := strings.Repeat("x", 500)
+	for _, old := range []string{"\n", ""} {
+		got := replaceCapped(text, old, long, MaxRenderBytes)
+		if len(got) > MaxRenderBytes+len(long)+8 {
+			t.Fatalf("replace(old=%q) 应在上限附近停下，实际 %d 字节", old, len(got))
+		}
+		if len(got) <= MaxRenderBytes {
+			t.Fatalf("replace(old=%q) 停下时应略超上限，好让 capWriter 判出截断，实际 %d", old, len(got))
+		}
+	}
+	items := make([]any, 200000)
+	for i := range items {
+		items[i] = "a"
+	}
+	if got := tplJoin(long, items); len(got) > MaxRenderBytes+2*len(long) {
+		t.Fatalf("join 应在上限附近停下，实际 %d 字节", len(got))
+	}
+	if got := tplJoin("、", []any{"甲", "乙", 3}); got != "甲、乙、3" {
+		t.Fatalf("join 常规结果不对：%q", got)
+	}
+}

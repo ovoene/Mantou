@@ -12,7 +12,7 @@
 # ============================================================================
 
 APP        := mantou
-VERSION    ?= Ver 1.0.10
+VERSION    ?= Ver 1.0.11
 DATA_DIR   ?= ./data
 # 编译时间（默认本地时间），构建时写入 internal/version/gen.go，供「关于」页展示；
 # 可覆盖：make build BUILD_TIME="2026-08-13 12:00:00"
@@ -43,7 +43,7 @@ GOARCH     ?=
 # 输出目录
 BIN_DIR    := bin
 
-# 更新包文件名里用的版本号：空格换成下划线（与 package.bat 的 ARCHIVE_VER 同一个做法）。
+# 更新包文件名里用的版本号：空格换成下划线（与 package.sh 的 ARCHIVE_VER 同一个做法）。
 # VERSION 是 "Ver 1.0.9"，原样拼进文件名会被 shell 拆成两个参数——tar 于是把包写进一个
 # 叫 mantou-Ver 的文件（没有扩展名，两个架构互相覆盖），而这个名字不在 .gitignore 里，
 # 下一次 release.sh 的 git add -A 就会把它提交上 GitHub。
@@ -144,7 +144,7 @@ check:
 	@echo "== gofmt =="
 	@# 排除 internal/version/gen.go：构建脚本在编译前临时写入、编译后立刻删除的版本注入
 	@# 文件（见 write-version），已被 .gitignore 忽略，正常情况下不存在。构建被中途打断时
-	@# 它会残留在盘上，而 package.bat 用 `echo x > file` 生成——行尾必然带一个空格、缩进
+	@# 它会残留在盘上，而以前的 package.bat 用 `echo x > file` 生成——行尾必然带一个空格、缩进
 	@# 也是空格而非制表符，gofmt 必报。不排除的话，门禁会指着一个你从未编辑过、也不该
 	@# 提交的文件失败，非常容易误判成自己改坏了源码。
 	@unformatted="$$(gofmt -l ./cmd ./internal | grep -vE 'internal[\\/]version[\\/]gen\.go$$' || true)"; \

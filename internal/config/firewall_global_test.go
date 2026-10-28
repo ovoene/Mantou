@@ -2,7 +2,13 @@ package config
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
+	"time"
+	"unicode/utf8"
 )
 
 // 服务防护（连接层）的数据层规则。这一层是唯一的兜底：配置有三条写入路径
@@ -397,5 +403,175 @@ func TestMigrateKeepsExistingGlobalFirewall(t *testing.T) {
 	Migrate(c) // 跑两次：加载期会反复调用
 	if got := fmt.Sprintf("%+v", c.GlobalFirewall); got != want {
 		t.Fatalf("迁移改动了已有设置：\n%s\n→ %s", want, got)
+	}
+}
+
+// 名单附属信息（备注 / 加入时间 / 来源）跟着名单走：名单里删掉的条目，附属信息也要一起消失，
+// 否则同一个地址日后被重新加进来，会"继承"一条早已作废的备注与时间。
+func TestNormalizeGlobalFirewallPrunesListMeta(t *testing.T) {
+	g := defaultGlobalFirewall()
+	g.AllowIPs = []string{" 10.0.0.0/8 ", "bad-entry"}
+	g.AllowMeta = map[string]IPListMeta{
+		"10.0.0.0/8": {Note: "内网", AddedAt: 100},
+		"bad-entry":  {Note: "写错的条目", AddedAt: 100}, // 条目本身会被规范化丢掉
+		"1.2.3.4":    {Note: "早已删除", AddedAt: 100},  // 名单里根本没有
+	}
+	g.DenyIPs = []string{"203.0.113.7"}
+	g.DenyMeta = map[string]IPListMeta{"203.0.113.7": {Source: "something-else"}}
+	normalizeGlobalFirewall(&g)
+
+	if len(g.AllowMeta) != 1 || g.AllowMeta["10.0.0.0/8"].Note != "内网" {
+		t.Fatalf("附属信息应只剩名单里那一条（键为去空白后的原文），实际 %+v", g.AllowMeta)
+	}
+	// 认不出的来源清空后整条全零，不应留下一条空记录。
+	if g.DenyMeta != nil {
+		t.Fatalf("全零的附属信息应收成 nil（clone 走 JSON 往返，空 map 会变 nil），实际 %+v", g.DenyMeta)
+	}
+}
+
+// 附属信息的规范化必须幂等，且返回新表、不改入参（入参可能就是正在被并发读的配置快照）。
+func TestNormalizeIPListMetaIdempotentAndCopies(t *testing.T) {
+	// 换行与从右到左覆盖符（RLO）都写成码点：源码里不该出现原始的双向控制符（Trojan Source）。
+	nl, rlo := string(rune(0x0a)), string(rune(0x202e))
+	raw := "  a" + nl + "b" + rlo + "c  "
+	src := map[string]IPListMeta{"10.0.0.1": {Note: raw, AddedAt: -5}}
+	list := []string{"10.0.0.1"}
+	once := normalizeIPListMeta(src, list)
+	twice := normalizeIPListMeta(once, list)
+	if !reflect.DeepEqual(once, twice) {
+		t.Fatalf("不幂等：%+v → %+v", once, twice)
+	}
+	if got := once["10.0.0.1"]; got.Note != "abc" || got.AddedAt != 0 {
+		t.Fatalf("备注应去掉控制符与双向控制符、负时间应归零，实际 %+v", got)
+	}
+	if src["10.0.0.1"].Note != raw {
+		t.Fatal("normalizeIPListMeta 改了入参")
+	}
+}
+
+// 备注按字符而不是字节截断：中文备注不该在第 21 个字处被切出半个字。
+func TestCleanIPListNoteTruncatesByRune(t *testing.T) {
+	long := strings.Repeat("网", MaxIPListNoteRunes+10)
+	got := CleanIPListNote(long)
+	if n := len([]rune(got)); n != MaxIPListNoteRunes {
+		t.Fatalf("应截到 %d 个字，实际 %d", MaxIPListNoteRunes, n)
+	}
+	if !utf8.ValidString(got) {
+		t.Fatal("截断后出现了非法 UTF-8")
+	}
+	if CleanIPListNote("   ") != "" {
+		t.Fatal("全空白的备注应为空")
+	}
+}
+
+// 带附属信息的配置克隆后必须与原件相等：clone 走 JSON 往返，map 字段最容易在这里走样。
+func TestCloneKeepsGlobalFirewallListMeta(t *testing.T) {
+	src := Default()
+	src.GlobalFirewall.DenyIPs = []string{"203.0.113.7"}
+	src.GlobalFirewall.DenyMeta = map[string]IPListMeta{
+		"203.0.113.7": {Note: "扫描器", AddedAt: 1700000000, Source: IPListSourceAutoBan},
+	}
+	normalizeGlobalFirewall(&src.GlobalFirewall)
+	dst, err := src.clone()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !configEqual(src, dst) {
+		t.Fatalf("克隆后附属信息走样：%+v vs %+v", src.GlobalFirewall.DenyMeta, dst.GlobalFirewall.DenyMeta)
+	}
+	dst.GlobalFirewall.DenyMeta["203.0.113.7"] = IPListMeta{Note: "改了副本"}
+	if src.GlobalFirewall.DenyMeta["203.0.113.7"].Note != "扫描器" {
+		t.Fatal("clone 返回的附属信息与原件共用同一张 map")
+	}
+}
+
+// v13 迁移：升级前的名单只有地址。升级后每条都要整理进新格式（补加入时间、标为"升级前已有"），
+// 名单本身一字不改；写法无效的条目照旧被规范化丢掉，不会因为补了记录就留下来。
+func TestMigrateV13FillsLegacyListMeta(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	data := `{"version":12,"panel":{"listen":"127.0.0.1","port":25666},` +
+		`"globalFirewall":{"enabled":true,"level":"balanced","autoBan":true,` +
+		`"allowIps":["10.0.0.0/8"," 192.168.1.0/24 ","not-an-ip"],"denyIps":["203.0.113.7","1.2.3.4-1.2.3.9"]}}`
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before := time.Now().Unix()
+	m := NewManager(path)
+	if err := m.Load(); err != nil {
+		t.Fatal(err)
+	}
+	g := m.Snapshot().GlobalFirewall
+	if fmt.Sprint(g.AllowIPs) != "[10.0.0.0/8 192.168.1.0/24]" || fmt.Sprint(g.DenyIPs) != "[203.0.113.7 1.2.3.4-1.2.3.9]" {
+		t.Fatalf("名单本身不该被迁移改动（只去空白、丢无效），实际 %v / %v", g.AllowIPs, g.DenyIPs)
+	}
+	for _, c := range []struct {
+		meta map[string]IPListMeta
+		list []string
+	}{{g.AllowMeta, g.AllowIPs}, {g.DenyMeta, g.DenyIPs}} {
+		if len(c.meta) != len(c.list) {
+			t.Fatalf("每条都应有附属信息：名单 %v，附属 %+v", c.list, c.meta)
+		}
+		for _, ip := range c.list {
+			mt := c.meta[ip]
+			if mt.Source != IPListSourceLegacy || mt.AddedAt < before {
+				t.Fatalf("%s 应标为升级前已有并补上加入时间，实际 %+v", ip, mt)
+			}
+		}
+	}
+	if _, ok := g.AllowMeta["not-an-ip"]; ok {
+		t.Fatal("被规范化丢掉的无效条目不该留下附属信息")
+	}
+}
+
+// 迁移结果必须落盘：否则每次重启都会补一个新的"现在"，加入时间跟着重启时间漂。
+// 落盘之后再加载就是 v13 的配置，不会再迁移，时间保持不变。
+func TestMigrateV13PersistsTimestamps(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	data := `{"version":12,"panel":{"listen":"127.0.0.1","port":25666},` +
+		`"globalFirewall":{"enabled":false,"level":"balanced","autoBan":true,"denyIps":["203.0.113.7"]}}`
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	first := NewManager(path)
+	if err := first.Load(); err != nil {
+		t.Fatal(err)
+	}
+	t1 := first.Snapshot().GlobalFirewall.DenyMeta["203.0.113.7"].AddedAt
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"denyMeta"`) || !strings.Contains(string(raw), fmt.Sprintf(`"version": %d`, CurrentVersion)) &&
+		!strings.Contains(string(raw), fmt.Sprintf(`"version":%d`, CurrentVersion)) {
+		t.Fatalf("升级迁移的结果应已回写到磁盘，实际文件：%s", raw)
+	}
+
+	time.Sleep(1100 * time.Millisecond) // 让"现在"至少走过一秒，重新迁移的话时间必然不同
+	second := NewManager(path)
+	if err := second.Load(); err != nil {
+		t.Fatal(err)
+	}
+	if t2 := second.Snapshot().GlobalFirewall.DenyMeta["203.0.113.7"].AddedAt; t2 != t1 {
+		t.Fatalf("重启后加入时间不该变：第一次 %d，第二次 %d", t1, t2)
+	}
+}
+
+// 已经有附属信息的条目不被迁移改写（含备注与原有时间）；迁移块对同一份配置再跑一遍也不改任何值。
+func TestFillLegacyIPListMetaKeepsExisting(t *testing.T) {
+	meta := map[string]IPListMeta{"10.0.0.1": {Note: "原有", AddedAt: 100}}
+	out := fillLegacyIPListMeta([]string{"10.0.0.1", "10.0.0.2"}, meta, 999)
+	if out["10.0.0.1"] != (IPListMeta{Note: "原有", AddedAt: 100}) {
+		t.Fatalf("已有记录不该被改写，实际 %+v", out["10.0.0.1"])
+	}
+	if out["10.0.0.2"] != (IPListMeta{AddedAt: 999, Source: IPListSourceLegacy}) {
+		t.Fatalf("缺记录的条目应补上 legacy 记录，实际 %+v", out["10.0.0.2"])
+	}
+	again := fillLegacyIPListMeta([]string{"10.0.0.1", "10.0.0.2"}, out, 12345)
+	if !reflect.DeepEqual(again, out) {
+		t.Fatalf("再跑一遍不该改任何值：%+v → %+v", out, again)
+	}
+	if len(meta) != 1 {
+		t.Fatal("fillLegacyIPListMeta 改了入参")
 	}
 }

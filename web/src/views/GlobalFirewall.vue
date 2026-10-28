@@ -1,19 +1,26 @@
 <script setup lang="ts">
-import { ref, reactive, computed, onActivated, watch, h } from 'vue'
+import { ref, reactive, computed, onActivated, onDeactivated, onBeforeUnmount, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { Plus } from '@element-plus/icons-vue'
 import PageCard from '@/components/PageCard.vue'
+import RichText from '@/components/RichText.vue'
+import RowActions from '@/components/RowActions.vue'
 import {
   actions,
   type GfwConfig,
   type GfwPreset,
   type GfwUpdateReq,
   type GfwDenyResp,
+  type GfwListEntry,
+  type GfwListName,
+  type GfwAddPlan,
   type FirewallBan,
 } from '@/api/resources'
 import { fmtTime, fmtBytes } from '@/composables/useResource'
 import { useNarrow } from '@/composables/useNarrow'
 import { gfwLevelLabel } from '@/composables/gfwText'
+import { splitIpListText } from '@/composables/ipListText'
 
 const { t } = useI18n()
 
@@ -57,16 +64,21 @@ function defaultGfw(): GfwConfig {
 }
 const cfg = reactive<GfwConfig>(defaultGfw())
 
-// 名单在界面上是每行一条的文本框，配置里是字符串数组：两个方向都在 listToText /
-// textToList 里转，不在模板里就地 split，好让"用户看到的"与"提交的"只有一处定义。
-const allowText = ref('')
-const denyText = ref('')
+// 两张名单的表格行（地址 + 备注 + 加入时间 + 来源）。
+//
+// 名单的增删**不**走「设置」页那个保存按钮：每一次添加 / 删除都直接调服务端的专用口子，
+// 读—改—写在配置写锁里完成（同「加入黑名单」）。原先的文本框 + 整体 PUT 有两个毛病：
+// 期间别处加的条目会被整张替换抹掉；以及改了名单却忘了点保存，看上去加了、实际没生效。
+const listNames: GfwListName[] = ['allow', 'deny']
+const entries = reactive<Record<GfwListName, GfwListEntry[]>>({ allow: [], deny: [] })
 
 // 额度上限与预设档位表都由后端下发：表单上的"最多 N 条""最大 M 分钟"以及各档位的数值，
 // 必须和服务端真正用的那一份同源。前端自己抄一份的代价是两边可以各改各的，
 // 而且没人会发现——界面上显示的档位数值与实际执行的可以完全不同。
 const limits = reactive<{
   maxIps: number
+  maxBatch: number
+  maxNoteRunes: number
   maxMemoryMB: number
   maxBanMinutes: number
   minWindowSeconds: number
@@ -77,6 +89,8 @@ const limits = reactive<{
   presets: GfwPreset[]
 }>({
   maxIps: 256,
+  maxBatch: 1024,
+  maxNoteRunes: 64,
   maxMemoryMB: 15,
   maxBanMinutes: 10080,
   minWindowSeconds: 1,
@@ -140,16 +154,17 @@ function onLevelChange(level: string | number | boolean | undefined) {
   cfg.banMinutes = p.banMinutes
 }
 
-function listToText(list: unknown): string {
-  return Array.isArray(list) ? list.join('\n') : ''
-}
-// 每行一条，去空行与首尾空白。条数不在这里截断：超限要让后端报出来，
-// 前端悄悄截掉等于把用户多填的那些无声丢掉。
-function textToList(text: string): string[] {
-  return text
-    .split('\n')
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0)
+// setEntries 用服务端回来的整份名单刷新表格，并同步 cfg 里的地址数组。
+//
+// 老版本的后端没有 allowEntries / denyEntries，只有地址数组：那时按"没有备注、时间不详"补齐，
+// 而不是让表格空着——空着会让人以为名单被清掉了。
+function setEntries(name: GfwListName, rows: GfwListEntry[] | undefined, ips?: string[]) {
+  const list = Array.isArray(rows)
+    ? rows
+    : (Array.isArray(ips) ? ips : []).map((ip) => ({ ip, note: '', addedAt: 0, source: '' }))
+  entries[name] = list
+  if (name === 'allow') cfg.allowIps = list.map((e) => e.ip)
+  else cfg.denyIps = list.map((e) => e.ip)
 }
 
 // 内存占用与上限（自动封禁页的度量卡用）。
@@ -177,11 +192,13 @@ async function load() {
     cfg.burstLimit = typeof c.burstLimit === 'number' ? c.burstLimit : 4
     cfg.banMinutes = typeof c.banMinutes === 'number' ? c.banMinutes : 120
     cfg.memoryMB = typeof c.memoryMB === 'number' ? c.memoryMB : 5
-    allowText.value = listToText(cfg.allowIps)
-    denyText.value = listToText(cfg.denyIps)
+    setEntries('allow', c.allowEntries, cfg.allowIps)
+    setEntries('deny', c.denyEntries, cfg.denyIps)
     if (res.limits) {
       const l = res.limits
       if (l.maxIps > 0) limits.maxIps = l.maxIps
+      if (l.maxBatch > 0) limits.maxBatch = l.maxBatch
+      if (l.maxNoteRunes > 0) limits.maxNoteRunes = l.maxNoteRunes
       if (l.maxMemoryMB > 0) limits.maxMemoryMB = l.maxMemoryMB
       if (l.maxBanMinutes > 0) limits.maxBanMinutes = l.maxBanMinutes
       if (l.minWindowSeconds > 0) limits.minWindowSeconds = l.minWindowSeconds
@@ -201,14 +218,15 @@ async function load() {
   }
 }
 
-// 保存服务防护配置。整份提交：后端按"缺省即沿用当前值"合并后，再规范化、校验、落盘。
+// 保存服务防护配置。后端按"缺省即沿用当前值"合并后，再规范化、校验、落盘。
 // 落盘会整体替换快照指针，inboundfw 的名单缓存据此自动失效，下一次判定即读到新值。
+//
+// **不带**两张名单：名单由白名单 / 黑名单页签逐条增删、当场落盘。这里带上的话，
+// 带的就是打开页面那一刻的旧名单，会把期间别处（另一个标签页、「加入黑名单」）加的条目整体抹掉。
 async function save() {
   const payload: GfwUpdateReq = {
     enabled: cfg.enabled,
     level: cfg.level,
-    allowIps: textToList(allowText.value),
-    denyIps: textToList(denyText.value),
     autoBan: cfg.autoBan,
     windowSeconds: cfg.windowSeconds,
     windowLimit: cfg.windowLimit,
@@ -221,7 +239,7 @@ async function save() {
   try {
     await actions.updateGlobalFirewall(payload)
     ElMessage.success(t('common.saved'))
-    // 重新拉一次：名单里写错的条目会被后端丢掉，不重拉的话用户还以为它存进去了。
+    // 重新拉一次：档位会被服务端按预设重写数值，不重拉的话表单上还是提交前的那组数。
     await load()
   } catch (e: any) {
     ElMessage.error(e?.message || t('common.saveFailed'))
@@ -236,11 +254,68 @@ async function loadBans() {
     const res = await actions.globalFirewallBans()
     bans.value = res.items || []
     banTotal.value = res.total ?? 0
+    if (typeof res.now === 'number' && res.now > 0) clockSkew = res.now - Math.floor(Date.now() / 1000)
   } catch {
     /* 只读展示，拉不到不该打断整页 */
   } finally {
     bansLoading.value = false
+    lastBansLoad = Date.now()
   }
+}
+
+// ---------- 「剩余」一列的倒计时 ----------
+//
+// 到期时间是服务端的钟，浏览器的钟可能快几分钟或慢几分钟：直接拿 Date.now() 去减，
+// 倒计时会整体偏掉。clockSkew 是每次拉名单时服务端时间与本机时间的差，计算剩余时先补上。
+let clockSkew = 0
+const nowSec = ref(Math.floor(Date.now() / 1000))
+let tickTimer: number | undefined
+let lastBansLoad = 0
+
+// 只在「自动封禁」页签可见时走秒：别的页签用不到它，后台每秒触发一次重渲染没有意义。
+function startTick() {
+  if (tickTimer !== undefined) return
+  nowSec.value = Math.floor(Date.now() / 1000) + clockSkew
+  tickTimer = window.setInterval(() => {
+    nowSec.value = Math.floor(Date.now() / 1000) + clockSkew
+    // 有条目走到 0 就重拉一次：到期的封禁服务端已经不算了，表格上不该还挂着它。
+    // 至少隔 5 秒：同一秒里到期好几条时只拉一次，服务端那边的清扫也有个落地的时间。
+    if (!bansLoading.value && Date.now() - lastBansLoad > 5000 && bans.value.some((b) => b.until <= nowSec.value)) {
+      loadBans()
+    }
+  }, 1000)
+}
+function stopTick() {
+  if (tickTimer !== undefined) window.clearInterval(tickTimer)
+  tickTimer = undefined
+}
+
+// remainText 剩余时长说成人话：天+小时 / 小时+分 / 分+秒 / 秒，只留两级——
+// "1 小时 52 分 7 秒"多出来的那一级只会让这一列每秒都在跳，读起来反而费劲。
+function remainText(until: number): string {
+  const left = until - nowSec.value
+  if (left <= 0) return t('gfw.banExpired')
+  const d = Math.floor(left / 86400)
+  const h = Math.floor((left % 86400) / 3600)
+  const m = Math.floor((left % 3600) / 60)
+  const s = left % 60
+  if (d > 0) return t('gfw.banRemainD', { d, h })
+  if (h > 0) return t('gfw.banRemainH', { h, m })
+  if (m > 0) return t('gfw.banRemainM', { m, s })
+  return t('gfw.banRemainS', { s })
+}
+
+// reasonText / triggerText 「触发原因」一列：信号 + 越过的那道线（"突发：3 秒内 4 次"）。
+// 触发数值是封禁那一刻记下的，不是现读的配置——之后改了档位，这里写的仍是当初那道线。
+function reasonText(b: FirewallBan): string {
+  if (b.reason === 'tls-handshake' || !b.reason) return t('gfw.banReasonTls')
+  return b.reason
+}
+function triggerText(b: FirewallBan): string {
+  const v = { s: b.triggerSeconds ?? 0, n: b.triggerLimit ?? 0 }
+  if (b.trigger === 'burst') return t('gfw.banTriggerBurst', v)
+  if (b.trigger === 'window') return t('gfw.banTriggerWindow', v)
+  return ''
 }
 
 async function unban(ip: string) {
@@ -274,58 +349,36 @@ async function clearBans() {
 
 // 「加入黑名单」= 把一条临时封禁升级成永久的拒绝名单条目。
 //
-// 走后端专用口子（POST /global-firewall/bans/deny）而不是"改 denyText 再点保存"：
-// 保存走的 PUT 是整体替换名单，而这个文本框里那份是打开页面时取的，期间别处新增的条目
-// 会被静默抹掉；而且服务端那条口子还会在同一次请求里解除对应的临时封禁，
+// 走后端专用口子（POST /global-firewall/bans/deny）而不是通用的名单添加口子：
+// 服务端那条口子会在同一次请求里解除对应的临时封禁、并给条目打上"来自自动封禁"的来源标记，
 // 不会留下"名单加上了、封禁还挂着"的中间态。
 const denying = ref(false)
 
-// denyDirty 「黑名单」页的文本框有没有未保存的编辑。
+// askDeny 一键升级前的确认，返回用户是否继续。
 //
-// 这条口子成功之后要用服务端返回的整份名单回填文本框（那才是真正落盘的内容），
-// 于是用户手打还没保存的那些行会被覆盖掉。比较的是**规范化后的行**而不是原始文本：
-// 否则光标在文本框里敲了个回车就算"有改动"，白弹一次确认。
-const denyDirty = computed(() => textToList(denyText.value).join('\n') !== listToText(cfg.denyIps))
-
-// askDeny 需要确认时弹确认框，返回用户是否继续。
-//
-// 单个升级且没有未保存编辑时**不弹**：与同一行的「解除封禁」同口径——一次点击对应一条记录，
-// 后果看得见、也能在黑名单页手工删回去，为它加一次确认只是给常用操作加摩擦。
+// 单个升级**不弹**：与同一行的「解除」同口径——一次点击对应一条记录，后果看得见、
+// 也能在黑名单页签里删回去，为它加一次确认只是给常用操作加摩擦。
 // 批量升级一定要确认：一次可能写进几十条永久条目，而共用出口 IP 的场合会连带把人关在门外。
-async function askDeny(all: boolean, n: number): Promise<boolean> {
-  const parts: string[] = []
-  if (all) parts.push(t('gfw.banDenyAllConfirm', { n }))
-  if (denyDirty.value) parts.push(t('gfw.banDenyDirty'))
-  if (parts.length === 0) return true
+// （原先这里还要提醒"黑名单页签有未保存的编辑会被覆盖"——名单改成逐条当场落盘之后，
+// 已经没有"未保存的名单"这回事了。）
+async function askDeny(n: number): Promise<boolean> {
   try {
-    // 用 vnode 而不是拼接字符串：两段话之间要有真正的段间距，
-    // 而 el-message-box 的纯文本模式会把换行压成一个空格。也不用 HTML 字符串——
-    // 那需要 dangerouslyUseHTMLString，为两行静态文案开这个口子不值当。
-    await ElMessageBox.confirm(
-      h(
-        'div',
-        { style: 'display:flex;flex-direction:column;gap:8px' },
-        parts.map((s) => h('p', { style: 'margin:0' }, s)),
-      ),
-      '',
-      {
-        confirmButtonText: t('common.confirm'),
-        cancelButtonText: t('common.cancel'),
-        type: 'warning',
-      },
-    )
+    await ElMessageBox.confirm(t('gfw.banDenyAllConfirm', { n }), '', {
+      confirmButtonText: t('common.confirm'),
+      cancelButtonText: t('common.cancel'),
+      type: 'warning',
+    })
     return true
   } catch {
     return false
   }
 }
-// applyDenyResult 回填服务端返回的整份名单，并把结果说清楚。
+// applyDenyResult 用服务端返回的整份黑名单刷新表格，并把结果说清楚。
 //
-// 只动 denyIps / denyText 两处，**不**整页 load()：用户可能正在设置页改着档位和阈值，
+// 只动黑名单这一张表，**不**整页 load()：用户可能正在设置页改着档位和阈值，
 // 一次 load() 会把那些还没保存的改动全部冲掉——为了刷新一张名单而丢掉别处的输入不划算。
 function applyDenyResult(res: GfwDenyResp) {
-  if (Array.isArray(res.denyIps)) cfg.denyIps = res.denyIps
-  denyText.value = listToText(cfg.denyIps)
+  setEntries('deny', res.denyEntries, res.denyIps)
   const stat = {
     added: res.added ?? 0,
     skipped: res.skipped ?? 0,
@@ -340,7 +393,6 @@ function applyDenyResult(res: GfwDenyResp) {
 // denyOne 单个加入黑名单。
 async function denyOne(ip: string) {
   if (denying.value) return
-  if (!(await askDeny(false, 1))) return
   denying.value = true
   try {
     applyDenyResult(await actions.denyGlobalFirewallBans({ ip }))
@@ -357,7 +409,7 @@ async function denyOne(ip: string) {
 // banTotal 而不是 bans.length——说的数与实际发生的必须是一回事。
 async function denyAll() {
   if (denying.value || bans.value.length === 0) return
-  if (!(await askDeny(true, banTotal.value))) return
+  if (!(await askDeny(banTotal.value))) return
   denying.value = true
   try {
     applyDenyResult(await actions.denyGlobalFirewallBans({ all: true }))
@@ -369,16 +421,187 @@ async function denyAll() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 白名单 / 黑名单：表格、删除、批量添加
+// ---------------------------------------------------------------------------
+
+// 各表当前勾选的行。删除之后服务端回来的是新名单，勾选要跟着清掉（见 removeEntries）。
+const selected = reactive<Record<GfwListName, GfwListEntry[]>>({ allow: [], deny: [] })
+const tableRefs: Partial<Record<GfwListName, { clearSelection: () => void }>> = {}
+const listBusy = ref(false)
+
+function listLabel(name: GfwListName): string {
+  return t(name === 'allow' ? 'gfw.tabAllow' : 'gfw.tabDeny')
+}
+
+// removeEntries 删除几条，或 all=true 清空整张表。
+//
+// 只删一条时不确认：与「解除」同口径，一次点击对应一行，删错了重新添加即可。
+// 删多条、清空要确认——尤其是黑名单，一次清空会让一批来源当场重新获得访问权。
+async function removeEntries(name: GfwListName, ips: string[] | 'all') {
+  if (listBusy.value) return
+  const all = ips === 'all'
+  const n = all ? entries[name].length : ips.length
+  if (n === 0) return
+  if (n > 1 || all) {
+    const msg = all
+      ? t(name === 'allow' ? 'gfw.listDeleteAllConfirmAllow' : 'gfw.listDeleteAllConfirmDeny', { n })
+      : t('gfw.listDeleteSelectedConfirm', { n, list: listLabel(name) })
+    try {
+      await ElMessageBox.confirm(msg, '', {
+        confirmButtonText: t('common.confirm'),
+        cancelButtonText: t('common.cancel'),
+        type: 'warning',
+      })
+    } catch {
+      return
+    }
+  }
+  listBusy.value = true
+  try {
+    const res = await actions.removeGlobalFirewallList(all ? { list: name, all: true } : { list: name, ips })
+    setEntries(name, res.entries)
+    tableRefs[name]?.clearSelection()
+    selected[name] = []
+    ElMessage.success(t('gfw.listDeleted', { n: res.removed ?? 0 }))
+  } catch (e: any) {
+    ElMessage.error(e?.message || t('common.saveFailed'))
+  } finally {
+    listBusy.value = false
+  }
+}
+
+// ---------- 批量添加对话框 ----------
+//
+// 用户可以一次贴进一大段（每行一个、逗号分隔、甚至整段日志），前端负责拆，服务端负责判：
+// 拆出来的每一条连同备注发去 dryRun，回来的分拣结果（可添加 / 已在名单 / 重复 / 无效 / 超额）
+// 就是预览。真添加走同一个接口、同一个分拣函数，于是"预览说加 3 条"与实际结果不会对不上。
+const addOpen = ref(false)
+const addList = ref<GfwListName>('allow')
+const addText = ref('')
+const addNote = ref('')
+const adding = ref(false)
+const preview = ref<GfwAddPlan | null>(null)
+const previewErr = ref('')
+const checking = ref(false)
+let previewSeq = 0
+let previewTimer: number | undefined
+
+const split = computed(() => splitIpListText(addText.value))
+// 行内「# 备注」优先于对话框里那个公共备注：一行一行写清楚的，比统一填的那句更具体。
+const addItems = computed(() =>
+  split.value.items.map((it) => ({ ip: it.ip, note: it.note || addNote.value.trim() })),
+)
+const tooMany = computed(() => addItems.value.length > limits.maxBatch)
+const canAdd = computed(
+  () => !checking.value && !adding.value && !previewErr.value && !!preview.value && preview.value.added.length > 0,
+)
+// 无效条目最多列出这么多个，剩下的只报个数：贴了整段日志时，几百个红字只会把对话框撑爆。
+const INVALID_SHOW = 20
+
+// 「详细说明」的各条，顺序即显示顺序。
+const explainKeys = [
+  'gfw.explainWhat',
+  'gfw.explainModules',
+  'gfw.explainVsPanel',
+  'gfw.explainDefends',
+  'gfw.explainNotDefends',
+  'gfw.explainOrder',
+]
+
+function openAdd(name: GfwListName) {
+  addList.value = name
+  addText.value = ''
+  addNote.value = ''
+  preview.value = null
+  previewErr.value = ''
+  addOpen.value = true
+}
+
+// 输入一变就先把按钮锁住（checking=true），再等 250ms 没有新输入才真的去问服务端。
+// 不先锁的话，从"改了输入"到"新预览回来"之间，按钮上显示的还是上一版的条数，点下去加的却是新的。
+watch([addText, addNote], () => {
+  if (!addOpen.value) return
+  window.clearTimeout(previewTimer)
+  checking.value = true
+  previewTimer = window.setTimeout(runPreview, 250)
+})
+
+async function runPreview() {
+  const seq = ++previewSeq
+  const items = addItems.value
+  if (items.length === 0 || tooMany.value) {
+    preview.value = null
+    previewErr.value = tooMany.value ? t('gfw.addTooMany', { max: limits.maxBatch, n: items.length }) : ''
+    checking.value = false
+    return
+  }
+  try {
+    const res = await actions.addGlobalFirewallList({ list: addList.value, items, dryRun: true })
+    if (seq !== previewSeq) return // 已经有更新的一轮在路上，这一轮的结果作废
+    preview.value = res.plan
+    previewErr.value = ''
+  } catch (e: any) {
+    if (seq !== previewSeq) return
+    preview.value = null
+    previewErr.value = e?.message || t('common.loadFailed')
+  } finally {
+    if (seq === previewSeq) checking.value = false
+  }
+}
+
+async function confirmAdd() {
+  if (!canAdd.value) return
+  const name = addList.value
+  adding.value = true
+  try {
+    const res = await actions.addGlobalFirewallList({ list: name, items: addItems.value })
+    setEntries(name, res.entries)
+    const p = res.plan
+    const parts = [t('gfw.addDone', { n: p.added.length })]
+    if (p.existing.length) parts.push(t('gfw.addPartExisting', { n: p.existing.length }))
+    if (p.capped.length) parts.push(t('gfw.addPartCapped', { n: p.capped.length, max: res.maxIps || limits.maxIps }))
+    if (p.invalid.length) {
+      // 写错的那几条留在输入框里，改好可以直接再点一次添加；加进去了的已经从输入框里拿掉。
+      parts.push(t('gfw.addPartInvalid', { n: p.invalid.length }))
+      addText.value = p.invalid.join('\n')
+    } else {
+      addOpen.value = false
+    }
+    const msg = parts.join(t('gfw.addPartSep'))
+    if (p.invalid.length || p.capped.length) ElMessage.warning(msg)
+    else ElMessage.success(msg)
+  } catch (e: any) {
+    ElMessage.error(e?.message || t('common.saveFailed'))
+  } finally {
+    adding.value = false
+  }
+}
+
 // 切到「自动封禁」才去拉封禁名单：它是内存里随时在变的东西，要的是"打开时看到当下"，
-// 而不是进页面时抓的那一眼。
+// 而不是进页面时抓的那一眼。倒计时也只在这个页签上走。
 watch(activeTab, (tab) => {
-  if (tab === 'bans') loadBans()
+  if (tab === 'bans') {
+    loadBans()
+    startTick()
+  } else {
+    stopTick()
+  }
 })
 
 // keep-alive 下 onActivated 首次挂载时也会触发，因此只挂它一个——与其余各模块页一致
 // （Overview / WebServices / Certs … 都只写 onActivated）。再加一个 onMounted 的后果是
 // 每次进页面都把 /api/global-firewall 与 /bans 各请求两遍。
-onActivated(load)
+onActivated(() => {
+  load()
+  if (activeTab.value === 'bans') startTick()
+})
+// 离开页面（keep-alive 只是隐藏、不销毁）时停表：否则这个页面在后台每秒重渲染一次。
+onDeactivated(stopTick)
+onBeforeUnmount(() => {
+  stopTick()
+  window.clearTimeout(previewTimer)
+})
 </script>
 
 <template>
@@ -527,48 +750,63 @@ onActivated(load)
              要么得为它单独再拉一次。设置页因此不再需要一条分隔线（下方还有全局的那条）。 -->
       </div>
 
-      <!-- 白名单 -->
-      <div v-show="activeTab === 'allow'">
-        <el-form :label-width="labelWidth" :label-position="labelPos">
-          <el-form-item :label="t('gfw.allowIps')">
-            <div class="field">
-              <el-input
-                v-model="allowText"
-                type="textarea"
-                :rows="8"
-                :placeholder="t('gfw.ipsPlaceholder')"
-                style="width: 440px; max-width: 100%"
-              />
-              <p class="field-hint">{{ t('gfw.allowHint', { max: limits.maxIps }) }}</p>
-            </div>
-          </el-form-item>
-        </el-form>
-        <div class="save-row" :style="{ paddingLeft: contentIndent }">
-          <el-button type="primary" :loading="saving" @click="save">{{ t('common.save') }}</el-button>
-          <p class="field-hint save-hint">{{ t('gfw.saveHint') }}</p>
+      <!-- 白名单 / 黑名单：两张表结构完全相同，用同一段模板按名单名渲染。
+           增删当场落盘（见 removeEntries / confirmAdd），所以这两页没有保存按钮。 -->
+      <div v-for="name in listNames" v-show="activeTab === name" :key="name">
+        <div class="list-bar">
+          <el-button :icon="Plus" @click="openAdd(name)">{{ t('gfw.listAdd') }}</el-button>
+          <el-button
+            type="danger"
+            plain
+            :disabled="selected[name].length === 0 || listBusy"
+            @click="removeEntries(name, selected[name].map((e) => e.ip))"
+          >
+            {{ t('gfw.listDeleteSelected', { n: selected[name].length }) }}
+          </el-button>
+          <el-button type="danger" :disabled="entries[name].length === 0 || listBusy" @click="removeEntries(name, 'all')">
+            {{ t('gfw.listDeleteAll') }}
+          </el-button>
+          <span class="field-hint list-count">{{ t('gfw.listCount', { n: entries[name].length, max: limits.maxIps }) }}</span>
         </div>
-      </div>
-
-      <!-- 黑名单 -->
-      <div v-show="activeTab === 'deny'">
-        <el-form :label-width="labelWidth" :label-position="labelPos">
-          <el-form-item :label="t('gfw.denyIps')">
-            <div class="field">
-              <el-input
-                v-model="denyText"
-                type="textarea"
-                :rows="8"
-                :placeholder="t('gfw.ipsPlaceholder')"
-                style="width: 440px; max-width: 100%"
-              />
-              <p class="field-hint">{{ t('gfw.denyHint') }}</p>
-            </div>
-          </el-form-item>
-        </el-form>
-        <div class="save-row" :style="{ paddingLeft: contentIndent }">
-          <el-button type="primary" :loading="saving" @click="save">{{ t('common.save') }}</el-button>
-          <p class="field-hint save-hint">{{ t('gfw.saveHint') }}</p>
-        </div>
+        <el-table
+          :ref="(el: any) => (tableRefs[name] = el ?? undefined)"
+          :data="entries[name]"
+          row-key="ip"
+          class="gfw-table"
+          :empty-text="t(name === 'allow' ? 'gfw.listEmptyAllow' : 'gfw.listEmptyDeny')"
+          @selection-change="(rows: GfwListEntry[]) => (selected[name] = rows)"
+        >
+          <el-table-column type="selection" width="44" />
+          <el-table-column :label="t('gfw.listColIp')" min-width="190">
+            <template #default="{ row }">
+              <span class="mono">{{ row.ip }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column :label="t('gfw.listColNote')" min-width="170">
+            <template #default="{ row }">
+              <span v-if="row.note">{{ row.note }}</span>
+              <span v-else-if="row.source === 'autoban'" class="muted">{{ t('gfw.listFromAutoBan') }}</span>
+              <span v-else-if="row.source === 'legacy'" class="muted">{{ t('gfw.listLegacy') }}</span>
+              <span v-else class="muted">—</span>
+            </template>
+          </el-table-column>
+          <el-table-column :label="t('gfw.listColAddedAt')" min-width="170">
+            <template #default="{ row }">
+              <!-- 升级前就在名单里的条目：时间是升级那一刻补的（真实时间无从得知），灰显以示区别。 -->
+              <span :class="{ muted: !row.addedAt || row.source === 'legacy' }">{{ fmtTime(row.addedAt) }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column :label="t('gfw.listColAction')" width="90">
+            <template #default="{ row }">
+              <el-button link type="primary" :disabled="listBusy" @click="removeEntries(name, [row.ip])">
+                {{ t('gfw.listDelete') }}
+              </el-button>
+            </template>
+          </el-table-column>
+        </el-table>
+        <p class="field-hint list-hint">
+          <RichText :text="t(name === 'allow' ? 'gfw.allowHint' : 'gfw.denyHint', { max: limits.maxIps })" />
+        </p>
       </div>
 
       <!-- 自动封禁 -->
@@ -592,62 +830,157 @@ onActivated(load)
             <template v-if="banTotal > bans.length">{{ t('gfw.banTruncated', { n: bans.length }) }}</template>
           </span>
         </div>
-        <p class="field-hint" style="margin: 0 0 12px">{{ t('gfw.banDenyHint', { max: limits.maxIps }) }}</p>
-        <el-empty
-          v-if="!bansLoading && bans.length === 0"
-          :description="t('gfw.banEmpty')"
-          :image-size="60"
-        />
-        <div v-else class="ban-list">
-          <div v-for="b in bans" :key="b.ip" class="ban-row">
-            <span class="ban-ip">{{ b.ip }}</span>
-            <span class="field-hint">{{ t('gfw.banColBannedAt') }} {{ fmtTime(b.bannedAt) }}</span>
-            <el-tag v-if="b.rounds > 1" size="small" type="warning" disable-transitions>
-              {{ t('gfw.banColCount') }} {{ b.rounds }}
-            </el-tag>
-            <span class="field-hint">{{ t('gfw.banColUntil') }} {{ fmtTime(b.until) }}</span>
-            <!-- 行内两个动作按同一条理由排序：升级（不可逆）在前，解除在后，
-                 于是最右边那个是"放行"而不是"永久封死"。 -->
-            <el-button link type="warning" :disabled="denying" @click="denyOne(b.ip)">
-              {{ t('gfw.banDeny') }}
-            </el-button>
-            <el-button link type="primary" @click="unban(b.ip)">{{ t('gfw.banUnban') }}</el-button>
-          </div>
-        </div>
+        <p class="field-hint" style="margin: 0 0 12px">
+          <RichText :text="t('gfw.banDenyHint', { max: limits.maxIps })" />
+        </p>
+        <el-table :data="bans" row-key="ip" class="gfw-table" :empty-text="t('gfw.banEmpty')">
+          <el-table-column :label="t('gfw.banColIp')" min-width="150">
+            <template #default="{ row }">
+              <span class="mono">{{ row.ip }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column :label="t('gfw.banColReason')" min-width="200">
+            <template #default="{ row }">
+              <div class="reason">
+                <span>{{ reasonText(row) }}</span>
+                <span v-if="triggerText(row)" class="muted">{{ triggerText(row) }}</span>
+              </div>
+            </template>
+          </el-table-column>
+          <el-table-column :label="t('gfw.banColRounds')" min-width="90">
+            <template #default="{ row }">
+              <!-- 累计被封 ≥2 轮：解封后又来，标橙，好和"误伤一次"分开。 -->
+              <el-tag v-if="row.rounds > 1" size="small" type="warning" disable-transitions>{{ row.rounds }}</el-tag>
+              <span v-else>{{ row.rounds }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column :label="t('gfw.banColBannedAt')" min-width="170">
+            <template #default="{ row }">{{ fmtTime(row.bannedAt) }}</template>
+          </el-table-column>
+          <el-table-column :label="t('gfw.banColUntil')" min-width="170">
+            <template #default="{ row }">{{ fmtTime(row.until) }}</template>
+          </el-table-column>
+          <el-table-column :label="t('gfw.banColRemain')" min-width="110">
+            <template #default="{ row }">{{ remainText(row.until) }}</template>
+          </el-table-column>
+          <el-table-column :label="t('gfw.banColAction')" :width="narrow ? 96 : 170">
+            <template #default="{ row }">
+              <!-- 行内两个动作按同一条理由排序：升级（不可逆）在前，解除在后，
+                   于是最右边那个是"放行"而不是"永久封死"。窄屏收进「更多」。 -->
+              <RowActions>
+                <el-button link type="warning" :disabled="denying" @click="denyOne(row.ip)">
+                  {{ t('gfw.banDeny') }}
+                </el-button>
+                <el-button link type="primary" @click="unban(row.ip)">{{ t('gfw.banUnban') }}</el-button>
+              </RowActions>
+            </template>
+          </el-table-column>
+        </el-table>
+        <p class="field-hint list-hint">
+          <RichText :text="t('gfw.banTableHint')" />
+        </p>
 
-        <!-- 来源自检：从设置页移来。它念的就是本页这份实时封禁数据——
-             「服务防护确实看到了真实来源 IP 并已在拦截」这个信号，和名单放在一起才有对照。 -->
+        <!-- 来源自检：它念的就是本页这份实时封禁数据——
+             「服务防护确实看到了真实来源 IP 并已在拦截」这个信号，和名单放在一起才有对照。
+             原先这里还列着"最近被拦截的 5 个来源"，名单改成表格之后就在正上方，不再重复列一遍。 -->
         <el-divider />
         <div class="selfcheck">
           <div class="sc-title">{{ t('gfw.selfCheck') }}</div>
-          <p class="field-hint">{{ t('gfw.selfCheckHint') }}</p>
-          <template v-if="banTotal > 0">
-            <p class="field-hint">{{ t('gfw.selfCheckActive', { n: banTotal }) }}</p>
-            <div class="sc-list">
-              <div v-for="b in bans.slice(0, 5)" :key="b.ip" class="sc-item">
-                <span class="sc-ip">{{ b.ip }}</span>
-                <span class="field-hint">{{ t('gfw.banColBannedAt') }} {{ fmtTime(b.bannedAt) }}</span>
-              </div>
-            </div>
-          </template>
-          <p v-else class="field-hint">{{ t('gfw.selfCheckEmpty') }}</p>
+          <p class="field-hint"><RichText :text="t('gfw.selfCheckHint')" /></p>
+          <p v-if="banTotal > 0" class="field-hint"><RichText :text="t('gfw.selfCheckActive', { n: banTotal })" /></p>
+          <p v-else class="field-hint"><RichText :text="t('gfw.selfCheckEmpty')" /></p>
         </div>
       </div>
 
-      <!-- 详细说明：始终可见，与所属标签页无关（与 mockup 一致，放在标签页内容之外）。 -->
+      <!-- 详细说明：始终可见，与所属标签页无关（放在标签页内容之外）。
+           关键词用 RichText 的标记上色（[ok:管] [no:不管] [b:…]），文案仍在语言包里。 -->
       <el-divider />
       <div class="callout">
         <h4>{{ t('gfw.explainTitle') }}</h4>
         <ul>
-          <li>{{ t('gfw.explainWhat') }}</li>
-          <li>{{ t('gfw.explainModules') }}</li>
-          <li>{{ t('gfw.explainVsPanel') }}</li>
-          <li>{{ t('gfw.explainDefends') }}</li>
-          <li>{{ t('gfw.explainNotDefends') }}</li>
-          <li>{{ t('gfw.explainOrder') }}</li>
+          <li v-for="k in explainKeys" :key="k"><RichText :text="t(k)" /></li>
         </ul>
       </div>
     </div>
+
+    <!-- 批量添加对话框 -->
+    <el-dialog
+      v-model="addOpen"
+      :title="t(addList === 'allow' ? 'gfw.addTitleAllow' : 'gfw.addTitleDeny')"
+      width="min(580px, 94vw)"
+      append-to-body
+      :close-on-click-modal="false"
+    >
+      <el-form label-position="top" @submit.prevent>
+        <el-form-item :label="t('gfw.addTextLabel')">
+          <div class="field">
+            <el-input
+              v-model="addText"
+              type="textarea"
+              :rows="8"
+              :placeholder="t('gfw.addTextPlaceholder')"
+              spellcheck="false"
+            />
+            <p class="field-hint"><RichText :text="t('gfw.addTextHint', { max: limits.maxBatch })" /></p>
+          </div>
+        </el-form-item>
+        <el-form-item :label="t('gfw.addNoteLabel')">
+          <div class="field">
+            <el-input
+              v-model="addNote"
+              :maxlength="limits.maxNoteRunes"
+              show-word-limit
+              :placeholder="t('gfw.addNotePlaceholder')"
+            />
+          </div>
+        </el-form-item>
+      </el-form>
+
+      <!-- 预览：服务端 dryRun 的分拣结果。 -->
+      <div class="add-preview">
+        <span v-if="addItems.length === 0" class="field-hint">{{ t('gfw.addPreviewEmpty') }}</span>
+        <span v-else-if="previewErr" class="err">{{ previewErr }}</span>
+        <template v-else>
+          <div class="stats">
+            <span class="field-hint">{{ t('gfw.addPreviewTotal', { n: addItems.length }) }}</span>
+            <template v-if="preview && !checking">
+              <el-tag size="small" type="success" disable-transitions>{{ t('gfw.addStatAdd', { n: preview.added.length }) }}</el-tag>
+              <el-tag v-if="preview.existing.length" size="small" type="info" disable-transitions>
+                {{ t('gfw.addStatExisting', { n: preview.existing.length }) }}
+              </el-tag>
+              <el-tag v-if="preview.duplicate.length" size="small" type="info" disable-transitions>
+                {{ t('gfw.addStatDuplicate', { n: preview.duplicate.length }) }}
+              </el-tag>
+              <el-tag v-if="preview.invalid.length" size="small" type="danger" disable-transitions>
+                {{ t('gfw.addStatInvalid', { n: preview.invalid.length }) }}
+              </el-tag>
+              <el-tag v-if="preview.capped.length" size="small" type="warning" disable-transitions>
+                {{ t('gfw.addStatCapped', { n: preview.capped.length }) }}
+              </el-tag>
+            </template>
+            <span v-else class="field-hint">{{ t('gfw.addPreviewChecking') }}</span>
+            <span v-if="split.ignored" class="field-hint">{{ t('gfw.addStatIgnored', { n: split.ignored }) }}</span>
+          </div>
+          <p v-if="preview && !checking && preview.invalid.length" class="field-hint invalid-line">
+            {{ t('gfw.addInvalidList') }}
+            <span class="mono err">{{ preview.invalid.slice(0, INVALID_SHOW).join('、') }}</span>
+            <template v-if="preview.invalid.length > INVALID_SHOW">
+              {{ t('gfw.addInvalidMore', { n: preview.invalid.length - INVALID_SHOW }) }}
+            </template>
+          </p>
+          <p v-if="preview && !checking && preview.capped.length" class="field-hint">
+            {{ t('gfw.addCappedHint', { max: limits.maxIps }) }}
+          </p>
+        </template>
+      </div>
+
+      <template #footer>
+        <el-button @click="addOpen = false">{{ t('common.cancel') }}</el-button>
+        <el-button type="primary" :loading="adding" :disabled="!canAdd" @click="confirmAdd">
+          {{ t('gfw.addConfirm', { n: preview && !checking ? preview.added.length : 0 }) }}
+        </el-button>
+      </template>
+    </el-dialog>
   </PageCard>
 </template>
 
@@ -722,22 +1055,6 @@ onActivated(load)
   font-weight: 600;
   margin-bottom: 4px;
 }
-.sc-list {
-  margin-top: 8px;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-.sc-item {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  font-size: 13px;
-}
-.sc-ip {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  color: var(--mt-text);
-}
 .metrics {
   display: flex;
   gap: 12px;
@@ -767,24 +1084,63 @@ onActivated(load)
   gap: 10px;
   flex-wrap: wrap;
 }
-.ban-list {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-.ban-row {
+/* 名单页签的工具条：添加 / 删除所选 / 全部删除，条数靠右。 */
+.list-bar {
   display: flex;
   align-items: center;
-  gap: 14px;
+  gap: 10px;
   flex-wrap: wrap;
-  padding: 8px 12px;
-  border: 1px solid var(--mt-border, #ebeef5);
-  border-radius: var(--mt-card-radius, 14px);
+  margin: 4px 0 14px;
 }
-.ban-ip {
+.list-bar .el-button + .el-button {
+  margin-left: 0; /* 间距由 gap 管，el-button 相邻自带的左外边距会让间距不匀 */
+}
+.list-count {
+  margin-left: auto;
+}
+.list-hint {
+  margin: 10px 0 0;
+}
+/* 表格：与截图一致的浅灰表头、无斑马纹。表头底色取文字色的浅调而不是写死的灰，
+ * 深色模式下才不会是一条亮条。 */
+.gfw-table :deep(th.el-table__cell) {
+  background: color-mix(in srgb, var(--mt-text) 5%, transparent);
+  color: var(--mt-text-soft);
+  font-weight: 500;
+}
+.mono {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   color: var(--mt-text);
-  font-weight: 600;
+}
+.muted {
+  color: var(--mt-text-subtle, #909399);
+}
+/* 触发原因：信号与阈值上下两行，阈值是补充信息、字小一号。 */
+.reason {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.5;
+}
+.reason .muted {
+  font-size: 12px;
+}
+/* 添加对话框里的预览区。 */
+.add-preview {
+  min-height: 24px;
+}
+.add-preview .stats {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.add-preview .invalid-line {
+  margin: 8px 0 0;
+  word-break: break-all;
+}
+.err {
+  color: var(--el-color-danger, #f56c6c);
+  font-size: 12px;
 }
 /* 详细说明卡片：与 mockup 一致的蓝色提示框。 */
 .callout {

@@ -92,6 +92,10 @@ jobs:
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: '1.27'
+          # check-latest：不写的话 setup-go 会先用 runner 缓存里任意一个 1.27.x，
+          # 而缓存可能落后好几个补丁版（2026-10 时 1.27.0→1.27.3 之间修了 14 条标准库漏洞）。
+          # 发布门禁要扫的是"真正会用来编译的那一版"，这里与下面编译作业保持一致。
+          check-latest: true
           cache-dependency-path: go.sum
 
       - name: 确保 embed 占位文件存在
@@ -123,7 +127,7 @@ jobs:
           #
           # 扫描器版本钉死（GOVULNCHECK_VERSION）：漏洞库是活的，工具链不该是。
           # 报到标准库时，绝大多数情况升一个 Go 补丁版就没了——上面 setup-go 写的是 '1.27'
-          # （取该线最新补丁），所以通常重跑一次就自愈。
+          # 并开了 check-latest（取该线最新补丁），所以通常重跑一次就自愈。
           go run "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}" ./...
 
   # --------------------------------------------------------------------------
@@ -194,9 +198,12 @@ jobs:
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           # Go 官方只支持最近两个大版本，用已结束维护的版本构建等于链接进一个不再收补丁的标准库。
-          # 这里取当前稳定线：go.mod 的 go 指令（1.26.0，由 x/crypto v0.56.0 的下限决定）是编译器
+          # 这里取当前稳定线：go.mod 的 go 指令（1.26.0，由 x/crypto v0.58.0 的下限决定）是编译器
           # 版本**下限**而非上限，用 1.27 构建合法，且与 Dockerfile 的 golang:1.27-alpine 一致。
           go-version: '1.27'
+          # 必须取该线**最新**补丁：发出去的二进制里链接的就是这一版标准库。
+          # 不加 check-latest 时 setup-go 优先用 runner 缓存里的旧补丁版（见上面门禁作业的说明）。
+          check-latest: true
           cache-dependency-path: go.sum
 
       - name: 校验依赖清单

@@ -369,7 +369,28 @@ const (
 	MaxGlobalFirewallWindowSeconds = 3600
 	MinGlobalFirewallLimit         = 1
 	MaxGlobalFirewallLimit         = 100000
+
+	// MaxIPListNoteRunes 名单条目备注的最大字符数（按字符而不是字节数，中英文同一个上限）。
+	// 备注只是给人看的一句话（"办公网""某某的 NAS"），表格里一列放得下的长度就够了。
+	MaxIPListNoteRunes = 64
+
+	// IPListSourceAutoBan 名单条目的来源标记：从「自动封禁」一键升级进拒绝名单的。
+	// 空值表示手工添加。界面据此在没有备注的条目上注明来历，免得一排地址看不出是谁加的。
+	IPListSourceAutoBan = "autoban"
+	// IPListSourceLegacy 名单条目的来源标记：升级到 v13 之前就已经在名单里的条目。
+	// 它们的加入时间是**升级那一刻**补的（真实时间无从得知），界面据此注明"升级前已有"，
+	// 免得把补出来的时间当成真的加入时间。
+	IPListSourceLegacy = "legacy"
 )
+
+// IPListMeta 名单里一条地址的附属信息（备注、加入时间、来源），只用于展示。
+type IPListMeta struct {
+	Note string `json:"note,omitempty"`
+	// AddedAt 加入时间（Unix 秒）。0 表示不详：这一列上线之前就在名单里的条目没有记录，
+	// 不去补一个"现在"——那等于编造一个时间。
+	AddedAt int64  `json:"addedAt,omitempty"`
+	Source  string `json:"source,omitempty"`
+}
 
 // GlobalFirewall 服务防护（连接层）：保护 Web 服务与消息路由的入站连接，
 // 与面板入站防护是两套独立机制（后者只管面板端口，见 PanelFirewall 的说明）。
@@ -394,6 +415,17 @@ type GlobalFirewall struct {
 
 	AllowIPs []string `json:"allowIps"` // 允许名单：命中即放行，并跳过自动封禁计数。
 	DenyIPs  []string `json:"denyIps"`  // 拒绝名单：命中即拒绝，优先于其他一切规则。
+
+	// AllowMeta / DenyMeta 两张名单里各条目的备注与加入时间，键是条目原文
+	// （与 AllowIPs / DenyIPs 里的字符串逐字相同）。
+	//
+	// 纯展示用的附属信息：判定（internal/inboundfw）只读上面两张名单，这里缺一条、多一条
+	// 都不影响拦截。分开存而不是把名单改成结构体数组，是为了不动名单本身的形状——
+	// 它被判定、导入导出、业务页状态条与旧配置文件共用，改形状就得多一次配置迁移，
+	// 换来的只是界面上多两列。规范化会丢掉名单里已经没有的键，并把空表收成 nil
+	// （clone 走 JSON 往返，omitempty 下空 map 与 nil 必须是同一个值，见 normalizeIPListMeta）。
+	AllowMeta map[string]IPListMeta `json:"allowMeta,omitempty"`
+	DenyMeta  map[string]IPListMeta `json:"denyMeta,omitempty"`
 
 	// AutoBan 是否在来源持续触发握手异常时自动拉黑（带 TTL）。
 	AutoBan bool `json:"autoBan"`

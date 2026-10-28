@@ -172,7 +172,7 @@ Per-platform install:
 
 - **Linux** (Debian/Ubuntu): `sudo apt install golang-go nodejs npm make`; install Docker via the official script or your distro's repository.
 - **macOS**: `brew install go node` (`make` ships with the Xcode Command Line Tools); Docker via Docker Desktop.
-- **Windows 10**: install [Go](https://go.dev/dl/), [Node.js](https://nodejs.org/) (bundles npm), and [Git for Windows](https://git-scm.com/) (bundles bash and tar). Windows 10 ships `tar` (bsdtar) out of the box. Use `package.bat` for packaging (equivalent to `make package`); Docker Desktop is optional.
+- **Windows 10**: install [Go](https://go.dev/dl/), [Node.js](https://nodejs.org/) (bundles npm), and [Git for Windows](https://git-scm.com/) (bundles bash and tar). Windows 10 ships `tar` (bsdtar) out of the box. Use `本地打包更新包.bat` for packaging (equivalent to `make package`; needs the bash that comes with Git for Windows); Docker Desktop is optional.
 
 > The repo is a Go-backend + Vue-frontend monorepo; the final artifact is a **single static binary** with the frontend embedded. `node_modules` is build-time only and never shipped.
 
@@ -181,7 +181,7 @@ Per-platform install:
 mantou's self-update packages are signed with **Ed25519** to prevent tampering. The first packaging run generates the key pair automatically; you can also do it manually:
 
 ```bash
-# Generate manually (or run `make package` / `package.bat`, which auto-generates)
+# Generate manually (or run `make package` / `本地打包更新包.bat`, which auto-generates)
 go run ./cmd/updsign gen
 # Output: private key saved to update-signing.key; the public key (base64) is printed
 ```
@@ -221,18 +221,33 @@ mantou-Ver 1.0.0-linux-arm64.tar.gz
 
 > Version / build time are injected at build time; the first run generates the signing key and prompts you to configure the public key.
 
-### 4. Package with package.bat (Windows)
+### 4. Package with 本地打包更新包.bat (Windows)
 
-Open CMD or PowerShell in the project root:
+> **Two scripts on Windows, one job each, neither calls the other:**
+>
+> | Script | What it does | Touches GitHub? |
+> |---|---|---|
+> | `本地打包更新包.bat` ("build update package locally") | asks for a version → compiles and signs on this machine → writes the Linux self-update packages `mantou-Ver_x.y.z-linux-<arch>.tar.gz` | No |
+> | `发布到GitHub.bat` ("publish to GitHub") | asks for a version → commits, tags and pushes to GitHub; Actions then builds the images / binaries / Release | Yes |
+>
+> Both .bat files are thin shells that locate Git Bash and run `package.sh` / `release.sh` (all logic and messages live in the .sh files).
+> cmd mis-reads batch files that contain Chinese text (lines get split in the wrong places); bash does not — so keep both .bat files plain ASCII.
+
+**Double-click `本地打包更新包.bat`**, or run it from CMD / PowerShell in the project root:
 
 ```bat
-package.bat            :: build linux/amd64 + linux/arm64
-package.bat arm64      :: build only the given arch(es), e.g. "amd64" or "arm64"
+本地打包更新包.bat                 :: asks for the version (Enter keeps the default), then builds linux/amd64 + linux/arm64
+本地打包更新包.bat 1.2.0           :: version given, no question asked
+本地打包更新包.bat 1.2.0 arm64     :: version given, arm64 only
+本地打包更新包.bat arm64           :: arm64 only, version asked interactively
 ```
 
-Output matches `make package` (the Windows script replaces the space in the version with an underscore, e.g. `mantou-Ver_1.0.0-linux-amd64.tar.gz`). The first run also generates the key pair and prints the public key.
+- **Version**: `1.2.0` / `v1.2.0` / `Ver 1.2.0` are all accepted and normalised to `Ver 1.2.0` (same rules as the release script). The default is the version last published with `发布到GitHub.bat`, so press Enter to package that same version; if you type a different one, the script reminds you to publish with the same number.
+- Before compiling it prints a summary: version, architectures, **the Go version actually used**, and the output file names.
+- Output matches `make package`, with the space in the version replaced by an underscore, e.g. `mantou-Ver_1.0.0-linux-amd64.tar.gz`; `mantou` inside is mode 0755, so it runs right after extraction. The first run also generates the key pair and prints the public key.
+- When double-clicked, the window waits for a key press at the end instead of vanishing; run from a terminal it does not.
 
-Prerequisites: `go`, `npm`, and `tar` (built into Win10+) must be on PATH; the script defaults to the China Go module proxy `goproxy.cn`.
+Prerequisites: `go` and `npm` on PATH, plus Git for Windows (provides bash and tar). The script defaults to the China Go module proxy `goproxy.cn` and forces the locally installed Go (no automatic toolchain download). In Git Bash / Linux you can also run `bash package.sh` directly.
 
 ### 5. Build with Docker
 
@@ -318,16 +333,16 @@ GitHub repo → **Settings → Secrets and variables → Actions** → **New rep
 
 Use the one-click release script (it commits → tags → pushes and resolves same-name tag conflicts automatically). Pick the command for your environment:
 
-**① Windows Command Prompt (cmd) or PowerShell** — use `release.bat`:
+**① Windows Command Prompt (cmd) or PowerShell** — use `发布到GitHub.bat` (double-clicking works too, but the window closes as soon as it finishes, so run it from a terminal to see the final output):
 
 ```bat
 cd /d F:\your-project\mantou
-release.bat 1.2.0
+发布到GitHub.bat 1.2.0
 rem or without an argument, to be prompted for the version:
-release.bat
+发布到GitHub.bat
 ```
 
-> Note: do **not** type `bash release.sh` directly in Windows cmd/PowerShell — cmd's `bash` points to WSL and fails with `/bin/bash` not found unless a WSL distro is installed. `release.bat` locates Git Bash automatically and runs `release.sh`, so prefer it.
+> Note: do **not** type `bash release.sh` directly in Windows cmd/PowerShell — cmd's `bash` points to WSL and fails with `/bin/bash` not found unless a WSL distro is installed. `发布到GitHub.bat` locates Git Bash automatically and runs `release.sh`, so prefer it. It only publishes and does **not** package locally; use `本地打包更新包.bat` for that (section 4 above).
 
 **② Windows Git Bash / Linux / macOS** — use `release.sh`:
 
@@ -344,7 +359,7 @@ bash release.sh             # no argument → prompted for the version
 
 **Version note**: `1.2.0`, `v1.2.0`, or `Ver 1.2.0` are all accepted; the script normalizes them to app version `Ver 1.2.0` and git tag `v1.2.0`.
 
-**What the script does**: validates the version → runs `git init` if needed → configures remote `origin` → detects an existing local or remote tag of the same name (prompts to delete) → syncs the app version into `package.bat` / `Makefile` → commits and pushes the branch and tag.
+**What the script does**: validates the version → runs `git init` if needed → configures remote `origin` → detects an existing local or remote tag of the same name (prompts to delete) → syncs the app version into `package.sh` (the local packaging default) / `Makefile` → commits and pushes the branch and tag.
 
 Option 2: manually (without the script):
 

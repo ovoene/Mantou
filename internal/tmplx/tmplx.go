@@ -202,10 +202,11 @@ var funcMap = template.FuncMap{
 	"contains":  func(sub, v any) bool { return strings.Contains(toStr(v), toStr(sub)) },
 	"hasPrefix": func(p, v any) bool { return strings.HasPrefix(toStr(v), toStr(p)) },
 	"hasSuffix": func(s, v any) bool { return strings.HasSuffix(toStr(v), toStr(s)) },
-	"replace":   func(old, new, v any) string { return strings.ReplaceAll(toStr(v), toStr(old), toStr(new)) },
-	"truncate":  tplTruncate, // {{truncate 100 .描述}}
-	"str":       toStr,       // 显式转字符串（比较数字与字符串时有用）
-	"pad":       tplPad,      // {{pad 8 .编号}} 右侧补空格，用于对齐
+	"replace":   tplReplace,
+
+	"truncate": tplTruncate, // {{truncate 100 .描述}}
+	"str":      toStr,       // 显式转字符串（比较数字与字符串时有用）
+	"pad":      tplPad,      // {{pad 8 .编号}} 右侧补空格，用于对齐
 
 	// ---- 集合 ----
 	"join":  tplJoin, // {{join "、" .收件人}}
@@ -407,16 +408,71 @@ func tplPad(n int, v any) string {
 }
 
 // tplJoin 用 sep 连接集合的各元素（元素各自走 toStr）。
+//
+// 边拼边判长度，写过 MaxRenderBytes 就停，理由同 tplPad / tplReplace：结果体积是
+// "条数 × 分隔符长度"，条数来自外部推来的载荷，strings.Join 会先把整段在内存里拼好，
+// 而 capWriter 只截写出去的那部分。多拼出来的那一截反正写不出去，可见结果不变。
 func tplJoin(sep string, v any) string {
 	items, ok := toSlice(v)
 	if !ok {
 		return toStr(v)
 	}
-	parts := make([]string, 0, len(items))
-	for _, it := range items {
-		parts = append(parts, toStr(it))
+	var b strings.Builder
+	for i, it := range items {
+		if i > 0 {
+			b.WriteString(sep)
+		}
+		b.WriteString(toStr(it))
+		if b.Len() > MaxRenderBytes {
+			break
+		}
 	}
-	return strings.Join(parts, sep)
+	return b.String()
+}
+
+// tplReplace 把 v 里的 old 全部换成 new，语义与 strings.ReplaceAll 相同（old 为空时在每个字符前后插入 new），
+// 但结果一写过 MaxRenderBytes 就停。
+//
+// 不直接调 strings.ReplaceAll：结果体积是"命中次数 × new 的长度"，而命中次数由外部推来的载荷决定。
+// 模板里一句 {{replace "\n" "<br/>…一段 HTML…" .body.text}}，对方推 1 MB 的换行符过来，
+// ReplaceAll 就要先分配几百 MB 再交给 capWriter 截成 64 KB——入站接收器上一条请求就能把小设备撑爆。
+// 停在上限之后的那部分本来就写不出去，可见结果与之前完全相同（TestReplaceMatchesStdlib 对照）。
+func tplReplace(old, new, v any) string {
+	return replaceCapped(toStr(v), toStr(old), toStr(new), MaxRenderBytes)
+}
+
+func replaceCapped(s, old, new string, limit int) string {
+	// 体积不会超限时直接走标准库：绝大多数调用落在这一支，结果逐字节相同。
+	n := strings.Count(s, old) // old 为空时等于字符数 + 1，正是 ReplaceAll 插入的次数
+	if n == 0 {
+		return s
+	}
+	if len(new) <= len(old) || len(s)+n*(len(new)-len(old)) <= limit {
+		return strings.ReplaceAll(s, old, new)
+	}
+	var b strings.Builder
+	if old == "" {
+		b.WriteString(new)
+		for _, r := range s {
+			if b.Len() > limit {
+				break
+			}
+			b.WriteRune(r)
+			b.WriteString(new)
+		}
+		return b.String()
+	}
+	for b.Len() <= limit {
+		i := strings.Index(s, old)
+		if i < 0 {
+			b.WriteString(s)
+			break
+		}
+		b.WriteString(s[:i])
+		b.WriteString(new)
+		s = s[i+len(old):]
+	}
+	return b.String()
 }
 
 func tplFirst(v any) any {

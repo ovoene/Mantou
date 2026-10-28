@@ -319,6 +319,9 @@ func (s *Server) registerRoutes(r *gin.Engine) {
 			// 把封禁来源升级成拒绝名单：读—改—写整段在配置写锁内完成，前端拿一份可能已过期的
 			// denyIps 追加后整体 PUT 回来会静默抹掉别处新增的条目（见 handleDenyGlobalFirewallBans）。
 			authed.POST("/global-firewall/bans/deny", s.handleDenyGlobalFirewallBans)
+			// 白名单 / 黑名单逐条增删：同上一条的理由，读—改—写在配置写锁内完成。
+			authed.POST("/global-firewall/lists/add", s.handleAddGlobalFirewallList)
+			authed.POST("/global-firewall/lists/remove", s.handleRemoveGlobalFirewallList)
 
 			authed.POST("/settings/restart-now", s.handleRestartNow)
 

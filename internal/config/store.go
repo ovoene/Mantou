@@ -22,7 +22,7 @@ import (
 )
 
 // CurrentVersion 是当前配置结构版本，用于将来做迁移。
-const CurrentVersion = 12
+const CurrentVersion = 13
 
 // Manager 负责配置的加载、持久化与线程安全访问。
 type Manager struct {
@@ -126,6 +126,8 @@ func (m *Manager) Load() error {
 	if err := json.Unmarshal(data, cfg); err != nil {
 		return fmt.Errorf("解析配置失败: %w", err)
 	}
+	// 文件里的版本号：低于当前版本说明这次加载做了升级迁移，结果要回写一次（见下）。
+	fromVersion := cfg.Version
 	migrate(cfg)
 	// 敏感字段解密：必须在此处完成，之后内存中的配置一律是明文（见 secret.go）。
 	if err := m.openSecretsLocked(cfg); err != nil {
@@ -147,6 +149,19 @@ func (m *Manager) Load() error {
 	}
 	m.rev++
 	m.publishLocked()
+	// v13 迁移确实给名单条目补了加入时间时，把结果回写一次。
+	//
+	// Load 原则上只读（"只加载不该在磁盘上留下任何东西"，见 secret_test 的明文配置用例），
+	// 别的迁移都靠"下一次改配置时顺带落盘"。唯独 v13 补的是**时间**：不回写的话，
+	// 每次重启都会补一个新的"现在"，表格里那列加入时间就跟着重启时间一起漂。
+	// 所以只在"从 v13 之前升上来、且名单里真有被补过的条目"时写——名单为空的配置
+	// 照旧不碰磁盘。写失败不阻断启动：迁移结果仍在内存里生效，代价只是下次启动再补一遍。
+	if fromVersion < 13 && hasLegacyIPListMeta(&m.cfg.GlobalFirewall) {
+		if err := m.saveLocked(); err != nil {
+			logx.L().Warn("服务防护名单的升级迁移结果回写失败，下次启动会重新迁移",
+				"from", fromVersion, "to", CurrentVersion, "err", err.Error())
+		}
+	}
 	return nil
 }
 
@@ -841,6 +856,25 @@ func migrate(c *Config) {
 		if c.Update.AllowUnsignedUpdate && c.Update.AllowUnsignedSince <= 0 {
 			c.Update.AllowUnsignedSince = time.Now().Unix()
 		}
+	}
+	if c.Version < 13 {
+		// v13 升级：服务防护的白名单 / 黑名单从"只有地址"变成表格（地址 + 备注 + 加入时间），
+		// 附属信息存在 globalFirewall.allowMeta / denyMeta 里（见 GlobalFirewall 的说明）。
+		//
+		// 名单本身（allowIps / denyIps）的格式**一点没变**：旧配置原样读得进来，判定照旧，
+		// 降级回旧版本也只是丢掉附属信息。这一块做的是把已有条目整理进新格式——
+		// 每一条补一个加入时间并标为"升级前已有"（IPListSourceLegacy），表格里就不会是一排"—"。
+		//
+		// 加入时间只能取"现在"：旧格式里没有这个信息。正因为它是补出来的，才要带上 legacy 标记，
+		// 让界面注明"升级前已有"，而不是让人把升级那天当成这些地址真正加进来的日子。
+		// 已经有附属信息的条目不动（幂等：同一份配置再跑一遍这一块不会改写任何时间）。
+		//
+		// 补出来的时间必须**落盘**，否则每次重启都会重新补一个"现在"——
+		// 这件事由 Load 负责（版本有提升时回写一次，见 Load）。
+		now := time.Now().Unix()
+		g := &c.GlobalFirewall
+		g.AllowMeta = fillLegacyIPListMeta(g.AllowIPs, g.AllowMeta, now)
+		g.DenyMeta = fillLegacyIPListMeta(g.DenyIPs, g.DenyMeta, now)
 	}
 	if c.Version < CurrentVersion {
 		c.Version = CurrentVersion

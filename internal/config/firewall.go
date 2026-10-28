@@ -84,6 +84,16 @@ func normalizePanelFirewall(f *PanelFirewall) {
 	f.DenyIPs = normalizeIPList(f.DenyIPs)
 }
 
+// ValidIPListEntry 判断一条名单条目（已去首尾空白）能不能被匹配器认出来：
+// 单个 IP、CIDR 或「起-止」范围。
+//
+// 名单整理（normalizeIPList）与接口层的逐条添加共用这一个判断，于是"添加时报无效的"
+// 与"保存时被丢掉的"必然是同一批——两处各写一份的话，就会出现添加时说成功、
+// 下一次规范化却把它悄悄删掉的情形。
+func ValidIPListEntry(s string) bool {
+	return s != "" && len(ipx.ParseCIDRs([]string{s})) > 0
+}
+
 // normalizeIPList 去空白、去重、丢掉解析不出来的条目、截断到 MaxFirewallIPs。
 //
 // **丢掉写错的条目**是刻意的，与 restart 的日期同理，但这里的代价更高所以更值得做：
@@ -104,7 +114,7 @@ func normalizeIPList(items []string) []string {
 		if s == "" || seen[s] {
 			continue
 		}
-		if len(ipx.ParseCIDRs([]string{s})) == 0 {
+		if !ValidIPListEntry(s) {
 			continue
 		}
 		seen[s] = true

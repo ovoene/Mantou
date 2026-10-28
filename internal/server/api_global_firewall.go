@@ -5,6 +5,8 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 
@@ -49,6 +51,7 @@ func (s *Server) handleGetGlobalFirewall(c *gin.Context) {
 			"items": bans,
 			"total": banCount,
 			"limit": gfwBanListLimit,
+			"now":   time.Now().Unix(),
 		},
 		"memory": gin.H{
 			// 每条记录的实测近似开销集中在 config.BanEntryBytes，不在这里另写一个数——
@@ -58,7 +61,11 @@ func (s *Server) handleGetGlobalFirewall(c *gin.Context) {
 			"limitMB":   cfg.MemoryMB,
 		},
 		"limits": gin.H{
-			"maxIps":           config.GlobalFirewallMaxIPs,
+			"maxIps": config.GlobalFirewallMaxIPs,
+			// 名单添加对话框的两道上限：一次最多贴多少条、备注最多几个字。
+			// 由这里下发而不是前端各写一个数，理由同 presets。
+			"maxBatch":         gfwListMaxBatch,
+			"maxNoteRunes":     config.MaxIPListNoteRunes,
 			"maxMemoryMB":      config.MaxGlobalFirewallMemoryMB,
 			"maxBanMinutes":    config.MaxGlobalFirewallBanMinutes,
 			"minWindowSeconds": config.MinGlobalFirewallWindowSeconds,
@@ -112,6 +119,15 @@ func (s *Server) handleUpdateGlobalFirewall(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, verr.Error())
 		return
 	}
+	// 整体替换名单时，替换进来的新条目也要有加入时间；已在名单里的条目保留原有的备注与时间。
+	// 界面已改走 /lists/add 与 /lists/remove，这里照顾的是直接调 PUT 的脚本。
+	now := time.Now().Unix()
+	if req.AllowIPs != nil {
+		next.AllowMeta = stampNewListEntries(next.AllowIPs, cur.AllowIPs, cur.AllowMeta, now)
+	}
+	if req.DenyIPs != nil {
+		next.DenyMeta = stampNewListEntries(next.DenyIPs, cur.DenyIPs, cur.DenyMeta, now)
+	}
 	config.NormalizeGlobalFirewall(&next)
 
 	if err := s.deps.Config.Update(func(cfg *config.Config) {
@@ -144,6 +160,9 @@ func (s *Server) handleGetGlobalFirewallBans(c *gin.Context) {
 		"items": items,
 		"total": total,
 		"limit": gfwBanListLimit,
+		// now 服务端当前时间（Unix 秒）。界面的「剩余」一列按它与浏览器时钟的差值校正：
+		// 到期时间是服务端的钟，拿一台慢了几分钟的电脑去减，倒计时就整体偏几分钟。
+		"now": time.Now().Unix(),
 	})
 }
 
@@ -230,6 +249,7 @@ func (s *Server) handleDenyGlobalFirewallBans(c *gin.Context) {
 	var capped bool
 	var applied []string
 	var denyList []string
+	var denyEntries []gfwListEntry
 	if err := s.deps.Config.Update(func(cfg *config.Config) {
 		// 每次进来都从当前值重算：Update 可能因写盘失败而整份丢弃，闭包外的计数器
 		// 不能跨调用累加（gin 一个请求只调一次，这里是防御性写法，也让本函数可重入）。
@@ -243,6 +263,13 @@ func (s *Server) handleDenyGlobalFirewallBans(c *gin.Context) {
 		}
 		next := make([]string, len(cur), len(cur)+len(targets))
 		copy(next, cur)
+		// cfg 是 Update 交来的深拷贝，就地写它的 map 不会碰到正在被读的快照；
+		// 但它可能是 nil，先补上。
+		meta := cfg.GlobalFirewall.DenyMeta
+		if meta == nil {
+			meta = make(map[string]config.IPListMeta, len(targets))
+		}
+		now := time.Now().Unix()
 		for _, ip := range targets {
 			if seen[ip] {
 				skipped++
@@ -255,14 +282,18 @@ func (s *Server) handleDenyGlobalFirewallBans(c *gin.Context) {
 			}
 			seen[ip] = true
 			next = append(next, ip)
+			// 记下来历：一键升级进来的条目没有备注，界面上靠这个标记注明"来自自动封禁"。
+			meta[ip] = config.IPListMeta{AddedAt: now, Source: config.IPListSourceAutoBan}
 			applied = append(applied, ip)
 			added++
 		}
 		cfg.GlobalFirewall.DenyIPs = next
+		cfg.GlobalFirewall.DenyMeta = meta
 		// 与保存表单同一套规范化：写法不合法的条目丢掉、去重、按上限截断，
 		// 于是"这条口子写进去的"与"加载后跑的"永远是同一份值。
 		config.NormalizeGlobalFirewall(&cfg.GlobalFirewall)
 		denyList = append([]string{}, cfg.GlobalFirewall.DenyIPs...)
+		denyEntries = gfwListEntries(cfg.GlobalFirewall.DenyIPs, cfg.GlobalFirewall.DenyMeta)
 	}); err != nil {
 		respondError(c, http.StatusInternalServerError, "保存配置失败")
 		return
@@ -288,9 +319,279 @@ func (s *Server) handleDenyGlobalFirewallBans(c *gin.Context) {
 		"capped":   capped,
 		"maxIps":   config.GlobalFirewallMaxIPs,
 		"unbanned": unbanned,
-		// 回传整份名单：前端据此刷新「黑名单」页的文本框，不必自己猜服务端规范化后的结果。
-		"denyIps": denyList,
+		// 回传整份名单：前端据此刷新「黑名单」页的表格，不必自己猜服务端规范化后的结果。
+		"denyIps":     denyList,
+		"denyEntries": denyEntries,
 	})
+}
+
+// ---------------------------------------------------------------------------
+// 白名单 / 黑名单的逐条增删
+// ---------------------------------------------------------------------------
+
+// gfwListMaxBatch 一次添加最多带多少条。
+//
+// 名单本身封顶 GlobalFirewallMaxIPs 条，一次贴进来上千条只可能是贴错了东西（整份日志），
+// 在逐条解析之前就挡掉，免得为一次误操作跑上万次地址解析、再回一个几百 KB 的"无效"清单。
+const gfwListMaxBatch = 1024
+
+// gfwListMaxTokenLen 单条地址的最大长度。最长的合法写法是两个完整 IPv6 地址组成的范围
+// （约 79 字符），给到 128 已经很宽；超过的直接算无效，也不原样回显整段。
+const gfwListMaxTokenLen = 128
+
+// gfwListItem 添加请求里的一条：地址 + 备注（备注可空）。
+type gfwListItem struct {
+	IP   string `json:"ip"`
+	Note string `json:"note"`
+}
+
+// gfwListEntry 名单里一条地址连同它的附属信息，界面表格的一行。
+type gfwListEntry struct {
+	IP      string `json:"ip"`
+	Note    string `json:"note"`
+	AddedAt int64  `json:"addedAt"`
+	Source  string `json:"source"`
+}
+
+// gfwListEntries 把名单与附属信息拼成表格行，顺序与名单一致。总是返回非 nil 切片，
+// 好让空名单在 JSON 里是 [] 而不是 null（前端按数组用）。
+func gfwListEntries(list []string, meta map[string]config.IPListMeta) []gfwListEntry {
+	out := make([]gfwListEntry, 0, len(list))
+	for _, ip := range list {
+		m := meta[ip]
+		out = append(out, gfwListEntry{IP: ip, Note: m.Note, AddedAt: m.AddedAt, Source: m.Source})
+	}
+	return out
+}
+
+// stampNewListEntries 给"整体替换"进来的名单补附属信息：原本就在的条目沿用旧记录，
+// 新出现的条目记下加入时间。返回一张新表，不改 curMeta（它来自配置快照）。
+func stampNewListEntries(next, cur []string, curMeta map[string]config.IPListMeta, now int64) map[string]config.IPListMeta {
+	had := make(map[string]bool, len(cur))
+	for _, s := range cur {
+		had[s] = true
+	}
+	out := make(map[string]config.IPListMeta, len(next))
+	for _, raw := range next {
+		s := strings.TrimSpace(raw)
+		if had[s] {
+			if m, ok := curMeta[s]; ok {
+				out[s] = m
+			}
+			continue
+		}
+		out[s] = config.IPListMeta{AddedAt: now}
+	}
+	return out // 名单里没有的键、全零的记录交给规范化剪掉
+}
+
+// gfwListRef 按名称取配置里的那一张名单与它的附属信息（allow / deny）；名称不认得时 ok=false。
+func gfwListRef(g *config.GlobalFirewall, name string) (list *[]string, meta *map[string]config.IPListMeta, ok bool) {
+	switch name {
+	case "allow":
+		return &g.AllowIPs, &g.AllowMeta, true
+	case "deny":
+		return &g.DenyIPs, &g.DenyMeta, true
+	}
+	return nil, nil, false
+}
+
+// gfwAddPlan 一次添加的分拣结果。每个地址只会落进其中一类。
+type gfwAddPlan struct {
+	Added     []string `json:"added"`     // 新增（dryRun 时是"将新增"）
+	Existing  []string `json:"existing"`  // 本来就在名单里
+	Duplicate []string `json:"duplicate"` // 同一批里第二次及以后出现
+	Invalid   []string `json:"invalid"`   // 写法认不出来
+	Capped    []string `json:"capped"`    // 名单已满，没能加进去
+}
+
+// planListAdd 把一批待添加的条目分拣成 新增 / 已存在 / 重复 / 无效 / 超额 五类，
+// 并返回加完之后的名单与附属信息。纯函数：不读不写配置，dryRun 与真添加共用它，
+// 于是"预览说会加 3 条"与"点了添加实际加了 3 条"不可能对不上。
+//
+// 已存在的条目**不改**它的备注：同一个地址再贴一次多半是没注意到它已经在了，
+// 拿这次顺手填的备注覆盖掉原来那句，比留着旧的更容易丢信息。
+func planListAdd(cur []string, curMeta map[string]config.IPListMeta, items []gfwListItem, now int64) (gfwAddPlan, []string, map[string]config.IPListMeta) {
+	p := gfwAddPlan{
+		Added: []string{}, Existing: []string{}, Duplicate: []string{},
+		Invalid: []string{}, Capped: []string{},
+	}
+	inList := make(map[string]bool, len(cur))
+	for _, s := range cur {
+		inList[s] = true
+	}
+	next := append(make([]string, 0, len(cur)+len(items)), cur...)
+	meta := make(map[string]config.IPListMeta, len(curMeta)+len(items))
+	for k, v := range curMeta {
+		meta[k] = v
+	}
+	inBatch := make(map[string]bool, len(items))
+	for _, it := range items {
+		ip := strings.TrimSpace(it.IP)
+		if ip == "" {
+			continue
+		}
+		if len(ip) > gfwListMaxTokenLen {
+			// 按字符截断：按字节切可能切在一个多字节字符中间，回显出一个乱码尾巴。
+			p.Invalid = append(p.Invalid, string([]rune(ip)[:32])+"…")
+			continue
+		}
+		if !config.ValidIPListEntry(ip) {
+			p.Invalid = append(p.Invalid, ip)
+			continue
+		}
+		if inBatch[ip] {
+			p.Duplicate = append(p.Duplicate, ip)
+			continue
+		}
+		inBatch[ip] = true
+		if inList[ip] {
+			p.Existing = append(p.Existing, ip)
+			continue
+		}
+		if len(next) >= config.GlobalFirewallMaxIPs {
+			p.Capped = append(p.Capped, ip)
+			continue
+		}
+		next = append(next, ip)
+		meta[ip] = config.IPListMeta{Note: config.CleanIPListNote(it.Note), AddedAt: now}
+		p.Added = append(p.Added, ip)
+	}
+	return p, next, meta
+}
+
+// handleAddGlobalFirewallList 往白名单或黑名单里批量添加地址（POST /global-firewall/lists/add）。
+//
+// 与 /bans/deny 同一条理由走专用口子而不是"前端改好整张名单再 PUT"：读—改—写整段在
+// 配置写锁里完成，别的标签页 / 管理员同时加的条目不会被一次整体替换静默抹掉。
+//
+// dryRun=true 只分拣、不落盘：界面在用户粘贴时拿它做实时预览（几条有效、几条已在名单、
+// 哪几条写错了），判断用的是与真添加同一个函数，因此预览与结果不会各说各话。
+// 批里一条有效的都没有时也照常回 200：分拣结果本身就是要给用户看的答案。
+func (s *Server) handleAddGlobalFirewallList(c *gin.Context) {
+	var req struct {
+		List   string        `json:"list"`
+		Items  []gfwListItem `json:"items"`
+		DryRun bool          `json:"dryRun"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		respondError(c, http.StatusBadRequest, "请求参数无效")
+		return
+	}
+	if _, _, ok := gfwListRef(&config.GlobalFirewall{}, req.List); !ok {
+		respondError(c, http.StatusBadRequest, "名单类型无效")
+		return
+	}
+	if len(req.Items) == 0 {
+		respondError(c, http.StatusBadRequest, "请填写要添加的地址")
+		return
+	}
+	if len(req.Items) > gfwListMaxBatch {
+		respondError(c, http.StatusBadRequest, fmt.Sprintf("一次最多添加 %d 条", gfwListMaxBatch))
+		return
+	}
+	// 备注超长直接报错而不是截断：截断后存进去的那句话和用户填的不一样，而他看不出来。
+	for _, it := range req.Items {
+		if utf8.RuneCountInString(strings.TrimSpace(it.Note)) > config.MaxIPListNoteRunes {
+			respondError(c, http.StatusBadRequest, fmt.Sprintf("备注最多 %d 个字", config.MaxIPListNoteRunes))
+			return
+		}
+	}
+
+	now := time.Now().Unix()
+	if req.DryRun {
+		g := s.deps.Config.Snapshot().GlobalFirewall
+		list, meta, _ := gfwListRef(&g, req.List)
+		plan, _, _ := planListAdd(*list, *meta, req.Items, now)
+		respondOK(c, gin.H{
+			"ok": true, "list": req.List, "dryRun": true, "maxIps": config.GlobalFirewallMaxIPs,
+			"plan": plan, "entries": gfwListEntries(*list, *meta),
+		})
+		return
+	}
+
+	var plan gfwAddPlan
+	var entries []gfwListEntry
+	if err := s.deps.Config.Update(func(cfg *config.Config) {
+		g := &cfg.GlobalFirewall
+		list, meta, _ := gfwListRef(g, req.List)
+		var next []string
+		var nextMeta map[string]config.IPListMeta
+		plan, next, nextMeta = planListAdd(*list, *meta, req.Items, now)
+		*list, *meta = next, nextMeta
+		config.NormalizeGlobalFirewall(g)
+		list, meta, _ = gfwListRef(g, req.List)
+		entries = gfwListEntries(*list, *meta)
+	}); err != nil {
+		respondError(c, http.StatusInternalServerError, "保存配置失败")
+		return
+	}
+	s.deps.Log.Info("服务防护名单已添加",
+		"list", req.List, "added", len(plan.Added), "existing", len(plan.Existing),
+		"invalid", len(plan.Invalid), "capped", len(plan.Capped), "total", len(entries))
+	respondOK(c, gin.H{
+		"ok": true, "list": req.List, "dryRun": false, "maxIps": config.GlobalFirewallMaxIPs,
+		"plan": plan, "entries": entries,
+	})
+}
+
+// handleRemoveGlobalFirewallList 从白名单或黑名单里删除地址（POST /global-firewall/lists/remove）。
+// 带 ips 删除这几条；all=true 清空整张名单。两者都没带时报错，免得一个空请求被理解成"全删"。
+//
+// 用 POST 而不是 DELETE：要带请求体（一批地址），而 DELETE 带体在不少代理与客户端上
+// 行为不一；与 /bans/clear 同口径。
+func (s *Server) handleRemoveGlobalFirewallList(c *gin.Context) {
+	var req struct {
+		List string   `json:"list"`
+		IPs  []string `json:"ips"`
+		All  bool     `json:"all"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		respondError(c, http.StatusBadRequest, "请求参数无效")
+		return
+	}
+	if _, _, ok := gfwListRef(&config.GlobalFirewall{}, req.List); !ok {
+		respondError(c, http.StatusBadRequest, "名单类型无效")
+		return
+	}
+	if !req.All && len(req.IPs) == 0 {
+		respondError(c, http.StatusBadRequest, "请指定要删除的地址")
+		return
+	}
+	if len(req.IPs) > config.GlobalFirewallMaxIPs {
+		respondError(c, http.StatusBadRequest, fmt.Sprintf("名单最多 %d 条", config.GlobalFirewallMaxIPs))
+		return
+	}
+	drop := make(map[string]bool, len(req.IPs))
+	for _, ip := range req.IPs {
+		drop[strings.TrimSpace(ip)] = true
+	}
+
+	removed := 0
+	var entries []gfwListEntry
+	if err := s.deps.Config.Update(func(cfg *config.Config) {
+		g := &cfg.GlobalFirewall
+		list, _, _ := gfwListRef(g, req.List)
+		removed = 0
+		keep := make([]string, 0, len(*list))
+		for _, ip := range *list {
+			if req.All || drop[ip] {
+				removed++
+				continue
+			}
+			keep = append(keep, ip)
+		}
+		*list = keep
+		config.NormalizeGlobalFirewall(g) // 顺带剪掉被删条目的附属信息
+		list, meta, _ := gfwListRef(g, req.List)
+		entries = gfwListEntries(*list, *meta)
+	}); err != nil {
+		respondError(c, http.StatusInternalServerError, "保存配置失败")
+		return
+	}
+	s.deps.Log.Info("服务防护名单已删除",
+		"list", req.List, "all", req.All, "removed", removed, "total", len(entries))
+	respondOK(c, gin.H{"ok": true, "list": req.List, "removed": removed, "entries": entries})
 }
 
 // globalFirewallReq 服务防护的提交体。
@@ -375,10 +676,14 @@ func firewallGlobalConfig(gf config.GlobalFirewall) gin.H {
 		deny = []string{}
 	}
 	return gin.H{
-		"enabled":       gf.Enabled,
-		"level":         gf.Level,
-		"allowIps":      allow,
-		"denyIps":       deny,
+		"enabled":  gf.Enabled,
+		"level":    gf.Level,
+		"allowIps": allow,
+		"denyIps":  deny,
+		// 表格用的整行（地址 + 备注 + 加入时间 + 来源）。allowIps / denyIps 仍保留：
+		// 业务页的只读状态条只要条数，没必要为它改形状。
+		"allowEntries":  gfwListEntries(gf.AllowIPs, gf.AllowMeta),
+		"denyEntries":   gfwListEntries(gf.DenyIPs, gf.DenyMeta),
 		"autoBan":       gf.AutoBan,
 		"windowSeconds": gf.WindowSeconds,
 		"windowLimit":   gf.WindowLimit,

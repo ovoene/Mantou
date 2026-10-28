@@ -1,6 +1,10 @@
 package config
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+	"unicode"
+)
 
 // 本文件是「服务防护（连接层）」这份设置的数据层规则：取值边界、名单整理、以及一份设置是否可用。
 //
@@ -12,7 +16,7 @@ import "fmt"
 // BanEntriesForMemoryMB 由内存上限（MB）折算封禁表条目上限，面板入站防护与服务防护用同一份换算。
 //
 // 封禁表的键是**攻击者选的**地址，一个 IPv6 /64 就能提供 1.8e19 个来源，无上限等于把内存分配权交给对方。
-// 一条记录的实际开销约 176 字节（entry 结构体 136 + map 桶里的键 16 + 指针 8 + 展示用 IP 字符串的底层数组），
+// 一条记录的实际开销约 184 字节（entry 结构体 144 + map 桶里的键 16 + 指针 8 + 展示用 IP 字符串的底层数组），
 // 留一点余量按 192 字节/条折算，于是：
 //
 //	n = mb * 1024 * 1024 / 192
@@ -45,7 +49,7 @@ func BanEntriesForMemoryMB(mb int) int {
 // 与 BanEntriesForMemoryMB 的 192 分开写：那个是**折算容量**用的（含余量，宁可少装几条），
 // 这个是**报告实际占用**用的，取实测值。两个数各有用途，混用会让界面上的"已用"
 // 永远等于"上限 × 占比"，看不出真实水位。
-const BanEntryBytes = 176
+const BanEntryBytes = 184
 
 // defaultGlobalFirewall 全新安装的初值：**关闭**，均衡档，自动封禁开启。
 //
@@ -151,6 +155,110 @@ func normalizeGlobalFirewall(g *GlobalFirewall) {
 	}
 	g.AllowIPs = normalizeIPList(g.AllowIPs)
 	g.DenyIPs = normalizeIPList(g.DenyIPs)
+	// 附属信息跟着名单走：必须排在名单规范化**之后**，按整理好的名单剪枝。
+	g.AllowMeta = normalizeIPListMeta(g.AllowMeta, g.AllowIPs)
+	g.DenyMeta = normalizeIPListMeta(g.DenyMeta, g.DenyIPs)
+}
+
+// normalizeIPListMeta 按名单整理附属信息：名单里已经没有的键丢掉，备注清洗并截断，
+// 认不出的来源标记清空，整条都是零值的记录不留。
+//
+// 总是返回一张**新**表（或 nil），不在入参上改：调用方手里的 meta 可能直接取自配置快照，
+// 就地改等于改了正在被并发读的那一份。
+//
+// 空表收成 nil 不是洁癖：clone 用 JSON 往返做深拷贝，omitempty 会把空 map 丢掉，
+// 读回来就成了 nil——留着空 map 的话，同一份配置克隆前后不再 DeepEqual，
+// 规范化也不再幂等。
+func normalizeIPListMeta(meta map[string]IPListMeta, list []string) map[string]IPListMeta {
+	if len(meta) == 0 || len(list) == 0 {
+		return nil
+	}
+	out := make(map[string]IPListMeta, len(meta))
+	for _, s := range list {
+		m, ok := meta[s]
+		if !ok {
+			continue
+		}
+		m.Note = CleanIPListNote(m.Note)
+		if m.AddedAt < 0 {
+			m.AddedAt = 0
+		}
+		if m.Source != IPListSourceAutoBan && m.Source != IPListSourceLegacy {
+			m.Source = ""
+		}
+		if m == (IPListMeta{}) {
+			continue
+		}
+		out[s] = m
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// fillLegacyIPListMeta 给名单里**还没有**附属信息的条目补一条"升级前已有"的记录
+// （加入时间取 now、来源标 legacy），已有记录的条目原样不动。返回一张新表，不改入参。
+//
+// 只给 v13 迁移用（见 store.go 的 migrate）：升级之前的名单只有地址，没有备注与时间；
+// 迁移把它们整理进新格式，表格里每一行就都有完整的四列，而不是一排"—"。
+// 键取去首尾空白后的原文，与 normalizeIPList 整理出来的条目逐字相同；写法无效的条目
+// 也会先补上，随后的规范化会连条目带记录一起丢掉。
+func fillLegacyIPListMeta(list []string, meta map[string]IPListMeta, now int64) map[string]IPListMeta {
+	out := make(map[string]IPListMeta, len(list))
+	for k, v := range meta {
+		out[k] = v
+	}
+	for _, raw := range list {
+		s := strings.TrimSpace(raw)
+		if s == "" {
+			continue
+		}
+		if _, ok := out[s]; ok {
+			continue
+		}
+		out[s] = IPListMeta{AddedAt: now, Source: IPListSourceLegacy}
+	}
+	return out // 空表收成 nil 由随后的规范化负责
+}
+
+// hasLegacyIPListMeta 两张名单里是否有 v13 迁移补出来的记录（Load 据此决定要不要回写一次）。
+func hasLegacyIPListMeta(g *GlobalFirewall) bool {
+	for _, meta := range []map[string]IPListMeta{g.AllowMeta, g.DenyMeta} {
+		for _, m := range meta {
+			if m.Source == IPListSourceLegacy {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// CleanIPListNote 整理一条名单备注：去掉控制字符（含换行、制表、Unicode 的行/段分隔符
+// 与双向文本控制符），首尾去空白，按字符截到 MaxIPListNoteRunes。
+//
+// 去控制字符是因为备注会原样进日志与导出文件：一个嵌进来的换行能在日志里伪造出一行
+// 看上去正常的记录；双向控制符（U+202A–202E、U+2066–2069）则能让表格里显示的文字
+// 与实际存的顺序不同。接口层对超长备注直接报错（见 server 的名单接口），这里的截断
+// 只给"手改配置文件 / 导入"这两条不经接口的路兜底。
+func CleanIPListNote(s string) string {
+	if s == "" {
+		return ""
+	}
+	var b strings.Builder
+	n := 0
+	for _, r := range strings.TrimSpace(s) {
+		if unicode.IsControl(r) || r == 0x2028 || r == 0x2029 || // 行分隔符、段分隔符
+			(r >= 0x202a && r <= 0x202e) || (r >= 0x2066 && r <= 0x2069) { // 双向文本控制符
+			continue
+		}
+		if n >= MaxIPListNoteRunes {
+			break
+		}
+		b.WriteRune(r)
+		n++
+	}
+	return strings.TrimSpace(b.String())
 }
 
 // Valid 判断这份设置是否"能真的跑起来"。关闭状态一律放过——关着的防火墙填成什么样都不影响行为，
